@@ -119,12 +119,18 @@ class GameBoard:
             resource = resources.pop(0)
             number = None if resource == ResourceType.DESERT else numbers.pop(0)
             self.tiles.append(HexTile(x, y, resource, number))
-        
+
         # 2つ目のリング（オプション）- 本格的なカタンにはもう一つ外側のリングがあります
-        radius = HEX_RADIUS * 3.5
         for i in range(12):
             angle_deg = 30 * i
             angle_rad = math.pi / 180 * angle_deg
+                # 角度が60°の倍数なら半径を変える
+            if angle_deg % 60 == 0:
+                # たとえば「ちょうど良い」値を別途指定
+                radius = HEX_RADIUS * 3.5
+            else:
+                radius = HEX_RADIUS * 3.0
+
             x = center_x + radius * math.cos(angle_rad)
             y = center_y + radius * math.sin(angle_rad)
             
