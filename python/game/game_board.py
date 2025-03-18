@@ -8,8 +8,10 @@ from game.resources import ResourceType
 
 class GameBoard:
     def __init__(self):
+        # 街道、タイル、ノード、盗賊タイルの初期化
+        self.roads = []  # 街道(Road)を保持するリスト
         self.tiles = []
-        self.nodes = []  # 全ノードを保持
+        self.nodes = []
         self.robber_tile = None
         self.setup_board()
 
@@ -102,11 +104,19 @@ class GameBoard:
         return new_node
 
     def draw(self, screen):
-        # まずタイルを描画
+        # 1) タイルを描画
         for tile in self.tiles:
             tile.draw(screen, robber_tile=self.robber_tile)
-
-        # 各ノード上に建物があれば描画
+        # 2) 街道を描画（プレイヤーの色で線を引く）
+        for road in self.roads:
+            pygame.draw.line(
+                screen,
+                road.owner.color,
+                (road.node1.x, road.node1.y),
+                (road.node2.x, road.node2.y),
+                8  # 線の太さ
+            )
+        # 3) 建物（開拓地など）を描画
         for node in self.nodes:
             if node.building is not None:
                 color = node.building.owner.color
