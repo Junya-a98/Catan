@@ -4,8 +4,8 @@ import random
 from enum import Enum
 
 # 画面サイズなどの定数
-SCREEN_WIDTH = 800
-SCREEN_HEIGHT = 600
+SCREEN_WIDTH = 1200
+SCREEN_HEIGHT = 800
 HEX_RADIUS = 50
 WINDOW_TITLE = "カタン風ゲーム"
 
