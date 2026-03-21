@@ -9,14 +9,11 @@ from game.dice import roll_dice
 from game.resources import ResourceType
 from game.road import Road
 from game.log_display import draw_log, draw_resource_counts, draw_current_turn
-
+from game.dice import roll_dice
 # 簡易的な建物クラス（必要に応じて別ファイルに分割）
 class Building:
     def __init__(self, owner: Player):
         self.owner = owner
-
-def roll_dice():
-    return random.randint(1, 6) + random.randint(1, 6)
 
 class CatanGame:
     def __init__(self):
