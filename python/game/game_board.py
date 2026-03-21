@@ -2,6 +2,7 @@ import pygame
 import math
 import random
 from game.constants import SCREEN_WIDTH, SCREEN_HEIGHT, HEX_RADIUS, COLORS
+from game.building import BuildingType
 from game.hex_tile import HexTile
 from game.node import Node
 from game.resources import ResourceType
@@ -12,6 +13,7 @@ class GameBoard:
         self.roads = []  # 街道(Road)を保持するリスト
         self.tiles = []
         self.nodes = []
+        self.edges = []
         self.robber_tile = None
         self.setup_board()
 
@@ -73,6 +75,7 @@ class GameBoard:
 
         # 各タイルの頂点(Node)を作成・共有する
         self._create_nodes_for_tiles()
+        self._create_edges()
 
     def _create_nodes_for_tiles(self):
         def get_hex_corners(cx, cy, radius):
@@ -103,6 +106,20 @@ class GameBoard:
         self.nodes.append(new_node)
         return new_node
 
+    def _create_edges(self):
+        unique_edges = {}
+        for tile in self.tiles:
+            for index, node1 in enumerate(tile.corners):
+                node2 = tile.corners[(index + 1) % len(tile.corners)]
+                key = tuple(sorted((id(node1), id(node2))))
+                if key not in unique_edges:
+                    unique_edges[key] = (node1, node2)
+        self.edges = list(unique_edges.values())
+
+    def has_edge(self, node1, node2):
+        target_key = tuple(sorted((id(node1), id(node2))))
+        return any(tuple(sorted((id(edge_node1), id(edge_node2)))) == target_key for edge_node1, edge_node2 in self.edges)
+
     def draw(self, screen):
         # 1) タイルを描画
         for tile in self.tiles:
@@ -120,8 +137,15 @@ class GameBoard:
         for node in self.nodes:
             if node.building is not None:
                 color = node.building.owner.color
-                pygame.draw.circle(screen, color, (int(node.x), int(node.y)), 8)
-                pygame.draw.circle(screen, COLORS["BLACK"], (int(node.x), int(node.y)), 8, 1)
+                center = (int(node.x), int(node.y))
+                if node.building.building_type == BuildingType.CITY:
+                    rect = pygame.Rect(0, 0, 20, 20)
+                    rect.center = center
+                    pygame.draw.rect(screen, color, rect, border_radius=4)
+                    pygame.draw.rect(screen, COLORS["BLACK"], rect, 2, border_radius=4)
+                else:
+                    pygame.draw.circle(screen, color, center, 8)
+                    pygame.draw.circle(screen, COLORS["BLACK"], center, 8, 1)
 
     def move_robber_to(self, tile: HexTile):
         self.robber_tile = tile

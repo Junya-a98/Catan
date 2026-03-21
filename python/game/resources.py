@@ -17,3 +17,25 @@ RESOURCE_COLORS = {
     ResourceType.ORE: COLORS["GRAY"],
     ResourceType.DESERT: COLORS["WHEAT"]
 }
+
+BUILD_COSTS = {
+    "road": {
+        ResourceType.WOOD: 1,
+        ResourceType.BRICK: 1,
+    },
+    "settlement": {
+        ResourceType.WOOD: 1,
+        ResourceType.BRICK: 1,
+        ResourceType.SHEEP: 1,
+        ResourceType.WHEAT: 1,
+    },
+    "city": {
+        ResourceType.ORE: 3,
+        ResourceType.WHEAT: 2,
+    },
+    "development": {
+        ResourceType.ORE: 1,
+        ResourceType.SHEEP: 1,
+        ResourceType.WHEAT: 1,
+    },
+}
