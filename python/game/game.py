@@ -5,7 +5,26 @@ import pygame
 
 from game.audio import GameAudio
 from game.building import Building, BuildingType
-from game.constants import COLORS, SCREEN_HEIGHT, SCREEN_WIDTH, WINDOW_TITLE
+from game.constants import (
+    COLORS,
+    EDGE_SELECTION_RADIUS,
+    HELP_PANEL_COLLAPSED_HEIGHT,
+    HELP_PANEL_HEIGHT,
+    HELP_PANEL_Y,
+    LOG_PANEL_HEIGHT,
+    MAX_LOG_MESSAGES,
+    MIN_LARGEST_ARMY_SIZE,
+    MIN_LONGEST_ROAD_LENGTH,
+    NODE_SELECTION_RADIUS,
+    SIDE_PANEL_WIDTH,
+    SIDE_PANEL_X,
+    ROBBER_DISCARD_THRESHOLD,
+    SCREEN_HEIGHT,
+    SCREEN_WIDTH,
+    TILE_SELECTION_RADIUS,
+    WINNING_VICTORY_POINTS,
+    WINDOW_TITLE,
+)
 from game.dice_animation import DiceAnimationOverlay
 from game.development_cards import (
     DEVELOPMENT_CARD_LABELS,
@@ -18,7 +37,14 @@ from game.log_display import draw_log, draw_resource_counts
 from game.player import Player
 from game.resources import BUILD_COSTS, ResourceType
 from game.road import Road
-from game.ui import RESOURCE_LABELS, UIButton, draw_side_panel
+from game.ui import (
+    RESOURCE_LABELS,
+    PhaseStep,
+    UIButton,
+    draw_board_highlights,
+    draw_help_panel,
+    draw_side_panel,
+)
 
 
 class CatanGame:
@@ -42,6 +68,7 @@ class CatanGame:
         self.players = []
         self.turn_order = []
         self.buttons = []
+        self.show_help_panel = False
 
         self.phase = "initial"  # "initial", "main", "finished"
         self.initial_dice_phase = True
@@ -87,7 +114,7 @@ class CatanGame:
 
     def add_log(self, message):
         self.log_messages.append(message)
-        self.log_messages = self.log_messages[-200:]
+        self.log_messages = self.log_messages[-MAX_LOG_MESSAGES:]
         print(message)
 
     def play_sound(self, sound_name):
@@ -96,12 +123,30 @@ class CatanGame:
     def clear_log(self):
         self.log_messages = []
 
-    def configure_players(self, player_count, reset_logs=True):
-        self.players = [
-            Player(name, color)
-            for name, color in self.player_palette[:player_count]
-        ]
-        self.turn_order = self.players.copy()
+    def reset_pending_dice_state(self):
+        self.pending_dice_context = None
+        self.pending_dice_roll = None
+        self.pending_dice_player_name = ""
+        self.dice_overlay.state = "idle"
+
+    def reset_special_phase_state(self):
+        self.special_phase = None
+        self.discard_queue = []
+        self.discard_player = None
+        self.discard_remaining = 0
+        self.robber_tile_candidates = []
+        self.robber_target_players = []
+        self.resource_selection_remaining = 0
+        self.free_roads_remaining = 0
+        self.bank_trade_give_resource = None
+
+    def reset_turn_state(self):
+        self.dice_rolled = False
+        self.action_mode = None
+        self.development_card_used_this_turn = False
+        self.reset_special_phase_state()
+
+    def reset_initial_setup_state(self):
         self.initial_dice_phase = True
         self.initial_dice_results = {}
         self.initial_dice_histories = {player.name: [] for player in self.players}
@@ -113,31 +158,26 @@ class CatanGame:
         self.initial_player_index = 0
         self.waiting_for_road = False
         self.last_settlement_node = None
+
+    def configure_players(self, player_count, reset_logs=True):
+        self.players = [
+            Player(name, color)
+            for name, color in self.player_palette[:player_count]
+        ]
+        self.turn_order = self.players.copy()
+        self.reset_initial_setup_state()
         self.current_player_index = 0
-        self.dice_rolled = False
-        self.action_mode = None
-        self.development_card_used_this_turn = False
-        self.special_phase = None
-        self.discard_queue = []
-        self.discard_player = None
-        self.discard_remaining = 0
-        self.robber_tile_candidates = []
-        self.robber_target_players = []
-        self.resource_selection_remaining = 0
-        self.free_roads_remaining = 0
-        self.bank_trade_give_resource = None
+        self.reset_turn_state()
         self.winner = None
         self.longest_road_owner = None
         self.longest_road_length = 0
         self.largest_army_owner = None
         self.largest_army_size = 0
-        self.pending_dice_context = None
-        self.pending_dice_roll = None
-        self.pending_dice_player_name = ""
-        self.dice_overlay.state = "idle"
+        self.reset_pending_dice_state()
         self.phase = "initial"
         self.development_deck = create_development_deck()
         self.buttons = self.build_buttons()
+        self.show_help_panel = False
         if reset_logs:
             self.clear_log()
             self.add_log(f"{player_count} 人プレイに設定しました。")
@@ -260,6 +300,248 @@ class CatanGame:
             return {}
         return self.board.get_player_trade_rates(player)
 
+    def get_buildable_road_edges(self, player, require_affordability=True):
+        if player is None or player.roads_remaining <= 0:
+            return []
+        if require_affordability and not player.can_afford(BUILD_COSTS["road"]):
+            return []
+        return [
+            (node1, node2)
+            for node1, node2 in self.board.edges
+            if self.can_place_road(player, node1, node2)[0]
+        ]
+
+    def get_buildable_settlement_nodes(self, player):
+        if player is None or player.settlements_remaining <= 0:
+            return []
+        if not player.can_afford(BUILD_COSTS["settlement"]):
+            return []
+        return [
+            node
+            for node in self.board.nodes
+            if self.can_place_main_settlement(player, node)[0]
+        ]
+
+    def get_buildable_city_nodes(self, player):
+        if player is None or player.cities_remaining <= 0:
+            return []
+        if not player.can_afford(BUILD_COSTS["city"]):
+            return []
+        return [
+            node
+            for node in self.board.nodes
+            if self.can_upgrade_to_city(player, node)[0]
+        ]
+
+    def get_initial_settlement_candidates(self):
+        return [
+            node
+            for node in self.board.nodes
+            if self.can_place_initial_settlement(node)[0]
+        ]
+
+    def get_initial_road_candidates(self, player):
+        if player is None or self.last_settlement_node is None or player.roads_remaining <= 0:
+            return []
+        return [
+            (self.last_settlement_node, adjacent_node)
+            for adjacent_node in self.get_adjacent_nodes(self.last_settlement_node)
+            if not self.road_exists_between(self.last_settlement_node, adjacent_node)
+        ]
+
+    def get_steal_target_nodes(self):
+        if self.board.robber_tile is None:
+            return []
+        return [
+            node
+            for node in self.board.robber_tile.corners
+            if node.building is not None and node.building.owner in self.robber_target_players
+        ]
+
+    def get_board_highlight_data(self):
+        highlights = {
+            "settlement_nodes": [],
+            "city_nodes": [],
+            "target_nodes": [],
+            "edge_highlights": [],
+            "tile_highlights": [],
+        }
+
+        if self.has_active_dice_animation():
+            return highlights
+
+        if self.phase == "initial":
+            if self.initial_dice_phase:
+                return highlights
+            current_player = self.initial_placement_order[self.initial_player_index]
+            if self.waiting_for_road:
+                highlights["edge_highlights"] = self.get_initial_road_candidates(current_player)
+            else:
+                highlights["settlement_nodes"] = self.get_initial_settlement_candidates()
+            return highlights
+
+        if self.phase != "main" or self.winner is not None:
+            return highlights
+
+        current_player = self.get_current_player()
+        if self.special_phase == "move_robber":
+            highlights["tile_highlights"] = self.robber_tile_candidates
+        elif self.special_phase == "steal":
+            highlights["target_nodes"] = self.get_steal_target_nodes()
+        elif self.special_phase == "road_building":
+            highlights["edge_highlights"] = self.get_buildable_road_edges(current_player, require_affordability=False)
+        elif self.action_mode == "road":
+            highlights["edge_highlights"] = self.get_buildable_road_edges(current_player)
+        elif self.action_mode == "settlement":
+            highlights["settlement_nodes"] = self.get_buildable_settlement_nodes(current_player)
+        elif self.action_mode == "city":
+            highlights["city_nodes"] = self.get_buildable_city_nodes(current_player)
+
+        return highlights
+
+    def get_phase_tracker_data(self):
+        if self.phase == "initial" and self.initial_dice_phase:
+            return (
+                "セットアップ進行",
+                "人数と順番を決定",
+                [
+                    PhaseStep("人数", "complete"),
+                    PhaseStep("初期ダイス", "active"),
+                    PhaseStep("初期配置", "pending"),
+                ],
+            )
+
+        if self.phase == "initial":
+            if self.initial_round == 1:
+                return (
+                    "初期配置",
+                    "1周目の配置中",
+                    [
+                        PhaseStep("配置1", "active"),
+                        PhaseStep("配置2", "pending"),
+                        PhaseStep("開始", "pending"),
+                    ],
+                )
+            return (
+                "初期配置",
+                "2周目の配置中",
+                [
+                    PhaseStep("配置1", "complete"),
+                    PhaseStep("配置2", "active"),
+                    PhaseStep("開始", "pending"),
+                ],
+            )
+
+        if self.phase == "finished":
+            return (
+                "ゲーム終了",
+                f"勝者: {self.winner.name}" if self.winner is not None else "",
+                [
+                    PhaseStep("ダイス", "complete"),
+                    PhaseStep("行動", "complete"),
+                    PhaseStep("勝利", "active"),
+                ],
+            )
+
+        if not self.dice_rolled:
+            return (
+                "ターン進行",
+                "まずダイスを振る",
+                [
+                    PhaseStep("ダイス", "active"),
+                    PhaseStep("行動", "pending"),
+                    PhaseStep("終了", "pending"),
+                ],
+            )
+
+        if self.special_phase is not None:
+            return (
+                "ターン進行",
+                "特殊処理を完了",
+                [
+                    PhaseStep("ダイス", "complete"),
+                    PhaseStep("特殊", "active"),
+                    PhaseStep("終了", "pending"),
+                ],
+            )
+
+        if self.action_mode is not None:
+            return (
+                "ターン進行",
+                "建設先を選択中",
+                [
+                    PhaseStep("ダイス", "complete"),
+                    PhaseStep("行動", "active"),
+                    PhaseStep("終了", "pending"),
+                ],
+            )
+
+        return (
+            "ターン進行",
+            "行動するか手番終了",
+            [
+                PhaseStep("ダイス", "complete"),
+                PhaseStep("行動", "complete"),
+                PhaseStep("終了", "active"),
+            ],
+        )
+
+    def get_help_panel_content(self):
+        if self.phase == "initial" and self.initial_dice_phase:
+            return (
+                "操作ヘルプ",
+                [
+                    "2 / 3 / 4: プレイヤー人数を変更",
+                    "Space: 初期ダイスを振る",
+                    "同点は自動で再ロール",
+                    "順位確定後に初期配置へ進行",
+                ],
+                "初回は人数を決めてからダイスを進めます。",
+            )
+
+        if self.phase == "initial":
+            accent = "ノードを選んで開拓地、次に隣接辺へ街道を置きます。"
+            if self.waiting_for_road:
+                accent = "直前の開拓地に接続する辺だけが有効です。"
+            return (
+                "初期配置ガイド",
+                [
+                    "クリック: 開拓地または街道を配置",
+                    "Space: マウス位置で配置",
+                    "緑のハイライトが配置可能地点",
+                    "2周目の開拓地では初期資源を獲得",
+                ],
+                accent,
+            )
+
+        help_lines = [
+            "Space: ダイス / Enter: 手番終了",
+            "R / S / C: 街道 / 開拓地 / 都市",
+            "D / T: 発展購入 / 銀行交易",
+            "K / B / Y / M: 騎士 / 街道建設 / 収穫 / 独占",
+            "Esc: 選択取消",
+        ]
+        accent = "青く光る場所をクリックして操作します。"
+        if self.special_phase == "discard":
+            accent = "1-5 で捨てる資源を選択します。"
+        elif self.special_phase == "move_robber":
+            accent = "黄色く光る地形へ盗賊を移動します。"
+        elif self.special_phase == "steal":
+            accent = "赤く光る相手の建物を選んで略奪します。"
+        elif self.special_phase == "road_building":
+            accent = "光っている辺に無料の街道を置けます。"
+        elif self.special_phase in ("year_of_plenty", "monopoly"):
+            accent = "1-5 で対象の資源を選択します。"
+        elif self.action_mode == "road":
+            accent = "光っている辺が建設可能な街道です。"
+        elif self.action_mode == "settlement":
+            accent = "緑の交点が開拓地を建てられる場所です。"
+        elif self.action_mode == "city":
+            accent = "金色の交点が都市へアップグレード可能です。"
+        elif not self.dice_rolled:
+            accent = "手番開始時はまずダイスを振ります。"
+        return "操作ヘルプ", help_lines, accent
+
     def get_initial_dice_history_text(self, player):
         return " -> ".join(str(value) for value in self.initial_dice_histories.get(player.name, []))
 
@@ -291,55 +573,159 @@ class CatanGame:
         elif context == "main":
             self.resolve_main_dice_roll(dice_roll)
 
+    def has_bank_trade_option(self, player):
+        if player is None:
+            return False
+        trade_rates = self.get_trade_rates(player)
+        return any(
+            player.resources[resource_type] >= trade_rates[resource_type]
+            for resource_type in trade_rates
+        )
+
+    def get_actionable_button_actions(self, player):
+        actions = set()
+        if player is None:
+            return actions
+
+        if self.phase == "initial" and self.initial_dice_phase:
+            actions.add("initial_roll")
+            return actions
+
+        if self.phase != "main" or self.winner is not None:
+            return actions
+
+        if self.special_phase == "bank_trade_give":
+            trade_rates = self.get_trade_rates(player)
+            for resource_type, required in trade_rates.items():
+                if player.resources[resource_type] >= required:
+                    actions.add(f"trade_resource_{resource_type.name}")
+            actions.add("cancel_action")
+            return actions
+
+        if self.special_phase == "bank_trade_receive":
+            for resource_type in ResourceType:
+                if resource_type in (ResourceType.DESERT, self.bank_trade_give_resource):
+                    continue
+                actions.add(f"trade_resource_{resource_type.name}")
+            actions.add("cancel_action")
+            return actions
+
+        if self.special_phase == "road_building":
+            actions.add("cancel_action")
+            return actions
+
+        if self.special_phase is not None:
+            return actions
+
+        if not self.dice_rolled:
+            actions.add("roll_dice")
+            return actions
+
+        if self.action_mode is not None:
+            actions.add("cancel_action")
+
+        if self.get_buildable_road_edges(player):
+            actions.add("mode_road")
+        if self.get_buildable_settlement_nodes(player):
+            actions.add("mode_settlement")
+        if self.get_buildable_city_nodes(player):
+            actions.add("mode_city")
+        if self.development_deck and player.can_afford(BUILD_COSTS["development"]):
+            actions.add("buy_dev")
+        if self.has_bank_trade_option(player):
+            actions.add("bank_trade")
+
+        if not self.development_card_used_this_turn:
+            if player.has_playable_development_card(DevelopmentCardType.KNIGHT):
+                actions.add("use_knight")
+            if (
+                player.has_playable_development_card(DevelopmentCardType.ROAD_BUILDING)
+                and player.roads_remaining > 0
+                and self.has_legal_road_placement(player)
+            ):
+                actions.add("use_road_building")
+            if player.has_playable_development_card(DevelopmentCardType.YEAR_OF_PLENTY):
+                actions.add("use_year_of_plenty")
+            if player.has_playable_development_card(DevelopmentCardType.MONOPOLY):
+                actions.add("use_monopoly")
+
+        if not actions or actions == {"cancel_action"}:
+            actions.add("end_turn")
+        return actions
+
     def build_buttons(self):
         buttons = []
-        base_x = 866
-        base_y = 86
-        button_width = 146
-        button_height = 38
+        panel_padding = 16
+        base_x = SIDE_PANEL_X + panel_padding
+        base_y = 126
+        available_width = SIDE_PANEL_WIDTH - panel_padding * 2
+        button_width = int((available_width - 12) / 2)
+        button_height = 36
         gap_x = 12
         gap_y = 10
+        actionable_actions = self.get_actionable_button_actions(self.get_current_player())
 
-        def add(action, label, row, col, enabled=True, selected=False):
+        def add(action, label, row, col, enabled=True, selected=False, highlighted=False):
             rect = pygame.Rect(
                 base_x + col * (button_width + gap_x),
                 base_y + row * (button_height + gap_y),
                 button_width,
                 button_height,
             )
-            buttons.append(UIButton(action, label, rect, enabled=enabled, selected=selected))
+            buttons.append(
+                UIButton(action, label, rect, enabled=enabled, selected=selected, highlighted=highlighted)
+            )
 
-        def add_custom(action, label, x, y, width, height, enabled=True, selected=False):
+        def add_custom(action, label, x, y, width, height, enabled=True, selected=False, highlighted=False):
             rect = pygame.Rect(x, y, width, height)
-            buttons.append(UIButton(action, label, rect, enabled=enabled, selected=selected))
+            buttons.append(
+                UIButton(action, label, rect, enabled=enabled, selected=selected, highlighted=highlighted)
+            )
 
         current_player = self.get_current_player()
         if self.phase == "initial" and self.initial_dice_phase:
             add("player_count_2", "2人", 0, 0, selected=len(self.players) == 2)
             add("player_count_3", "3人", 0, 1, selected=len(self.players) == 3)
             add("player_count_4", "4人", 1, 0, selected=len(self.players) == 4)
-            add("initial_roll", "初期ダイス", 1, 1, enabled=bool(self.players))
+            add(
+                "initial_roll",
+                "初期ダイス",
+                1,
+                1,
+                enabled=bool(self.players),
+                highlighted="initial_roll" in actionable_actions,
+            )
             return buttons
         if self.phase != "main" or self.winner is not None:
             return buttons
 
-        add("roll_dice", "ダイス", 0, 0, enabled=self.phase == "main" and not self.dice_rolled and self.winner is None)
-        add("end_turn", "手番終了", 0, 1, enabled=self.phase == "main" and self.dice_rolled and self.special_phase is None)
-        add("mode_road", "街道", 1, 0, enabled=self.phase == "main" and self.dice_rolled and self.special_phase is None, selected=self.action_mode == "road")
-        add("mode_settlement", "開拓地", 1, 1, enabled=self.phase == "main" and self.dice_rolled and self.special_phase is None, selected=self.action_mode == "settlement")
-        add("mode_city", "都市", 2, 0, enabled=self.phase == "main" and self.dice_rolled and self.special_phase is None, selected=self.action_mode == "city")
-        add("buy_dev", "発展購入", 2, 1, enabled=self.phase == "main" and self.dice_rolled and self.special_phase is None)
-        add("bank_trade", "銀行交易", 3, 0, enabled=self.phase == "main" and self.dice_rolled and self.special_phase is None)
-        add("cancel_action", "取消", 3, 1, enabled=self.phase == "main" and (self.action_mode is not None or self.special_phase in ("bank_trade_give", "bank_trade_receive")))
-        add("use_knight", "騎士", 4, 0, enabled=current_player is not None and self.phase == "main")
-        add("use_road_building", "街道建設", 4, 1, enabled=current_player is not None and self.phase == "main")
-        add("use_year_of_plenty", "収穫", 5, 0, enabled=current_player is not None and self.phase == "main")
-        add("use_monopoly", "独占", 5, 1, enabled=current_player is not None and self.phase == "main")
+        if self.special_phase == "road_building":
+            add_custom(
+                "cancel_action",
+                f"街道建設を終了 ({self.free_roads_remaining} 本)",
+                base_x,
+                base_y,
+                available_width,
+                button_height,
+                enabled=True,
+                highlighted="cancel_action" in actionable_actions,
+            )
+            return buttons
 
         if self.special_phase in ("bank_trade_give", "bank_trade_receive"):
+            add_custom(
+                "cancel_action",
+                "取消",
+                base_x,
+                base_y,
+                available_width,
+                button_height,
+                enabled=True,
+                highlighted="cancel_action" in actionable_actions,
+            )
             selector_x = base_x
-            selector_y = base_y + 6 * (button_height + gap_y)
-            selector_width = 94
+            selector_y = base_y + button_height + 14
+            selector_width = int((available_width - 16) / 3)
             selector_height = 34
             selector_gap_x = 8
             selector_gap_y = 8
@@ -359,7 +745,105 @@ class CatanGame:
                     selector_height,
                     enabled=True,
                     selected=selected and self.special_phase == "bank_trade_receive",
+                    highlighted=f"trade_resource_{resource_type.name}" in actionable_actions,
                 )
+            return buttons
+
+        if self.special_phase is not None:
+            return buttons
+
+        if not self.dice_rolled:
+            add_custom(
+                "roll_dice",
+                "ダイス",
+                base_x,
+                base_y,
+                available_width,
+                button_height,
+                enabled=True,
+                highlighted="roll_dice" in actionable_actions,
+            )
+            return buttons
+
+        grid_base_y = base_y
+        if self.action_mode is not None:
+            add_custom(
+                "cancel_action",
+                "選択を取り消す",
+                base_x,
+                grid_base_y,
+                available_width,
+                button_height,
+                enabled=True,
+                highlighted="cancel_action" in actionable_actions,
+            )
+            grid_base_y += button_height + gap_y
+
+        def add_grid(action, label, slot, enabled=True, selected=False, highlighted=False):
+            row = slot // 2
+            col = slot % 2
+            rect = pygame.Rect(
+                base_x + col * (button_width + gap_x),
+                grid_base_y + row * (button_height + gap_y),
+                button_width,
+                button_height,
+            )
+            buttons.append(
+                UIButton(action, label, rect, enabled=enabled, selected=selected, highlighted=highlighted)
+            )
+
+        slot = 0
+        add_grid(
+            "mode_road",
+            "街道",
+            slot,
+            selected=self.action_mode == "road",
+            highlighted="mode_road" in actionable_actions,
+        )
+        slot += 1
+        add_grid(
+            "mode_settlement",
+            "開拓地",
+            slot,
+            selected=self.action_mode == "settlement",
+            highlighted="mode_settlement" in actionable_actions,
+        )
+        slot += 1
+        add_grid(
+            "mode_city",
+            "都市",
+            slot,
+            selected=self.action_mode == "city",
+            highlighted="mode_city" in actionable_actions,
+        )
+        slot += 1
+        add_grid(
+            "buy_dev",
+            "発展購入",
+            slot,
+            enabled=bool(self.development_deck),
+            highlighted="buy_dev" in actionable_actions,
+        )
+        slot += 1
+        add_grid("bank_trade", "銀行交易", slot, highlighted="bank_trade" in actionable_actions)
+        slot += 1
+        add_grid("end_turn", "手番終了", slot, highlighted="end_turn" in actionable_actions)
+        slot += 1
+
+        if current_player is not None and not self.development_card_used_this_turn:
+            development_actions = []
+            if current_player.has_playable_development_card(DevelopmentCardType.KNIGHT):
+                development_actions.append(("use_knight", "騎士"))
+            if current_player.has_playable_development_card(DevelopmentCardType.ROAD_BUILDING):
+                development_actions.append(("use_road_building", "街道建設"))
+            if current_player.has_playable_development_card(DevelopmentCardType.YEAR_OF_PLENTY):
+                development_actions.append(("use_year_of_plenty", "収穫"))
+            if current_player.has_playable_development_card(DevelopmentCardType.MONOPOLY):
+                development_actions.append(("use_monopoly", "独占"))
+
+            for action, label in development_actions:
+                add_grid(action, label, slot, highlighted=action in actionable_actions)
+                slot += 1
 
         return buttons
 
@@ -582,7 +1066,7 @@ class CatanGame:
         players_to_discard = []
         if with_discard:
             players_to_discard = [
-                player for player in self.turn_order if player.total_resource_count() > 7
+                player for player in self.turn_order if player.total_resource_count() > ROBBER_DISCARD_THRESHOLD
             ]
         self.discard_queue = players_to_discard
         self.discard_player = None
@@ -677,7 +1161,7 @@ class CatanGame:
     def handle_robber_move_click(self, pos):
         mx, my = pos
         tile, min_dist = self.find_closest_tile(mx, my, self.robber_tile_candidates)
-        if tile is None or min_dist >= 45:
+        if tile is None or min_dist >= TILE_SELECTION_RADIUS:
             self.add_log("盗賊を移動したい地形の中央付近をクリックしてください。")
             return
         self.relocate_robber(tile)
@@ -690,7 +1174,7 @@ class CatanGame:
             if node.building is not None and node.building.owner in self.robber_target_players
         ]
         closest_node, min_dist = self.find_closest_node(mx, my, candidate_nodes)
-        if closest_node is None or min_dist >= 20:
+        if closest_node is None or min_dist >= NODE_SELECTION_RADIUS:
             self.add_log("略奪したい相手の建物をクリックしてください。")
             return
 
@@ -724,11 +1208,7 @@ class CatanGame:
         self.add_log("盗賊フェイズ完了。引き続き手番を続けてください。")
 
     def has_legal_road_placement(self, player):
-        for node1, node2 in self.board.edges:
-            can_place, _ = self.can_place_road(player, node1, node2)
-            if can_place:
-                return True
-        return False
+        return bool(self.get_buildable_road_edges(player, require_affordability=False))
 
     def buy_development_card(self):
         if self.phase != "main" or self.winner is not None:
@@ -887,7 +1367,7 @@ class CatanGame:
 
         mx, my = pos
         closest_edge, min_dist = self.find_closest_edge(mx, my)
-        if closest_edge is None or min_dist >= 18:
+        if closest_edge is None or min_dist >= EDGE_SELECTION_RADIUS:
             self.add_log("無料の街道を置きたい辺の中央付近をクリックしてください。")
             return
 
@@ -917,7 +1397,7 @@ class CatanGame:
         previous_owner = self.largest_army_owner
         max_knights = max((player.played_knights for player in self.players), default=0)
 
-        if max_knights < 3:
+        if max_knights < MIN_LARGEST_ARMY_SIZE:
             self.largest_army_owner = None
             self.largest_army_size = 0
             return
@@ -1063,23 +1543,11 @@ class CatanGame:
     def start_main_phase(self):
         self.phase = "main"
         self.current_player_index = 0
-        self.dice_rolled = False
         self.waiting_for_road = False
         self.last_settlement_node = None
-        self.action_mode = None
-        self.development_card_used_this_turn = False
-        self.special_phase = None
-        self.discard_queue = []
-        self.discard_player = None
-        self.discard_remaining = 0
-        self.robber_tile_candidates = []
-        self.robber_target_players = []
-        self.resource_selection_remaining = 0
-        self.free_roads_remaining = 0
-        self.pending_dice_context = None
-        self.pending_dice_roll = None
-        self.pending_dice_player_name = ""
-        self.dice_overlay.state = "idle"
+        self.show_help_panel = False
+        self.reset_turn_state()
+        self.reset_pending_dice_state()
         self.clear_log()
         first_player = self.get_current_player()
         self.add_log("初期配置フェーズ完了。通常フェーズを開始します。")
@@ -1092,7 +1560,7 @@ class CatanGame:
 
         if not self.waiting_for_road:
             closest_node, min_dist = self.find_closest_node(mx, my)
-            if not closest_node or min_dist >= 20:
+            if not closest_node or min_dist >= NODE_SELECTION_RADIUS:
                 self.add_log("有効なノードが見つかりませんでした。")
                 return
 
@@ -1121,7 +1589,7 @@ class CatanGame:
 
         adjacent_nodes = self.get_adjacent_nodes(self.last_settlement_node)
         candidate_node, min_dist = self.find_closest_node(mx, my, adjacent_nodes)
-        if not candidate_node or min_dist >= 20:
+        if not candidate_node or min_dist >= NODE_SELECTION_RADIUS:
             self.add_log("有効な隣接ノードが選択されませんでした。")
             return
         if self.road_exists_between(self.last_settlement_node, candidate_node):
@@ -1174,11 +1642,7 @@ class CatanGame:
 
         current_player = self.get_current_player()
         current_player.activate_new_development_cards()
-        self.action_mode = None
-        self.development_card_used_this_turn = False
-        self.dice_rolled = False
-        self.resource_selection_remaining = 0
-        self.free_roads_remaining = 0
+        self.reset_turn_state()
         self.current_player_index = (self.current_player_index + 1) % len(self.turn_order)
         self.clear_log()
         self.add_log(f"{self.get_current_player().name} の手番です。")
@@ -1195,7 +1659,7 @@ class CatanGame:
 
         mx, my = pos
         closest_node, min_dist = self.find_closest_node(mx, my)
-        if not closest_node or min_dist >= 20:
+        if not closest_node or min_dist >= NODE_SELECTION_RADIUS:
             self.add_log("有効なノードが見つかりませんでした。")
             return
 
@@ -1224,7 +1688,7 @@ class CatanGame:
 
         mx, my = pos
         closest_node, min_dist = self.find_closest_node(mx, my)
-        if not closest_node or min_dist >= 20:
+        if not closest_node or min_dist >= NODE_SELECTION_RADIUS:
             self.add_log("有効なノードが見つかりませんでした。")
             return
 
@@ -1253,7 +1717,7 @@ class CatanGame:
 
         mx, my = pos
         closest_edge, min_dist = self.find_closest_edge(mx, my)
-        if closest_edge is None or min_dist >= 18:
+        if closest_edge is None or min_dist >= EDGE_SELECTION_RADIUS:
             self.add_log("街道を置きたい辺の中央付近をクリックしてください。")
             return
 
@@ -1336,7 +1800,7 @@ class CatanGame:
         lengths = {player: self.get_player_longest_road_length(player) for player in self.players}
         max_length = max(lengths.values(), default=0)
 
-        if max_length < 5:
+        if max_length < MIN_LONGEST_ROAD_LENGTH:
             self.longest_road_owner = None
             self.longest_road_length = 0
             return
@@ -1360,7 +1824,7 @@ class CatanGame:
         if self.phase != "main":
             return
         points = self.get_player_victory_points(player)
-        if points >= 10:
+        if points >= WINNING_VICTORY_POINTS:
             self.winner = player
             self.phase = "finished"
             self.action_mode = None
@@ -1375,6 +1839,10 @@ class CatanGame:
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 self.running = False
+                continue
+
+            if event.type == pygame.KEYDOWN and event.key == pygame.K_h:
+                self.show_help_panel = not self.show_help_panel
                 continue
 
             if self.phase == "finished":
@@ -1491,9 +1959,26 @@ class CatanGame:
         self.buttons = self.build_buttons()
 
     def render(self):
+        self.buttons = self.build_buttons()
         self.screen.fill(COLORS["BACKGROUND"])
         self.board.draw(self.screen)
-        draw_log(self.screen, self.log_messages)
+        highlight_data = self.get_board_highlight_data()
+        draw_board_highlights(
+            self.screen,
+            settlement_nodes=highlight_data["settlement_nodes"],
+            city_nodes=highlight_data["city_nodes"],
+            target_nodes=highlight_data["target_nodes"],
+            edge_highlights=highlight_data["edge_highlights"],
+            tile_highlights=highlight_data["tile_highlights"],
+        )
+        help_collapsed = not self.show_help_panel
+        log_height = LOG_PANEL_HEIGHT
+        if help_collapsed:
+            collapsed_help_y = HELP_PANEL_Y + HELP_PANEL_HEIGHT - HELP_PANEL_COLLAPSED_HEIGHT
+            log_height = collapsed_help_y - 12 - 14
+        draw_log(self.screen, self.log_messages, panel_height=log_height)
+        help_title, help_lines, help_accent = self.get_help_panel_content()
+        draw_help_panel(self.screen, help_title, help_lines, help_accent, collapsed=help_collapsed)
         draw_resource_counts(
             self.screen,
             self.players,
@@ -1501,6 +1986,7 @@ class CatanGame:
             longest_road_owner=self.longest_road_owner,
             largest_army_owner=self.largest_army_owner,
         )
+        tracker_title, tracker_subtitle, tracker_steps = self.get_phase_tracker_data()
         panel_title = "操作パネル"
         panel_subtitle = ""
         if self.phase == "initial" and self.initial_dice_phase:
@@ -1533,10 +2019,19 @@ class CatanGame:
                     panel_subtitle = "独占: 1-5 で資源種類を指定"
                 elif self.special_phase == "road_building":
                     panel_subtitle = f"街道建設: 残り {self.free_roads_remaining} 本"
+                elif not self.dice_rolled:
+                    panel_subtitle = f"現在の手番: {current_player.name} / ダイス前"
+                elif self.action_mode is not None:
+                    panel_subtitle = f"現在の手番: {current_player.name} / 建設先を選択"
+                else:
+                    panel_subtitle = f"現在の手番: {current_player.name} / 行動中"
+        if not panel_subtitle:
+            panel_subtitle = tracker_subtitle
         draw_side_panel(
             self.screen,
             panel_title,
             panel_subtitle,
+            tracker_steps,
             self.get_current_player() if self.phase == "main" else None,
             self.players,
             self.buttons,

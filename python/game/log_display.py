@@ -1,6 +1,6 @@
 import pygame
 
-from game.constants import COLORS, LOG_PANEL_WIDTH, SIDE_PANEL_X
+from game.constants import COLORS, LOG_PANEL_HEIGHT, LOG_PANEL_WIDTH, SIDE_PANEL_X
 from game.resources import ResourceType
 
 # フォントファイルのパス
@@ -48,11 +48,11 @@ def _wrap_message(font, message, max_width):
     return lines or [message]
 
 
-def draw_log(screen, log_messages):
+def draw_log(screen, log_messages, panel_height=LOG_PANEL_HEIGHT):
     title_font = _load_font(24)
     log_font = _load_font(18)
 
-    panel_rect = pygame.Rect(12, 12, LOG_PANEL_WIDTH, 340)
+    panel_rect = pygame.Rect(12, 12, LOG_PANEL_WIDTH, panel_height)
     panel_surface = pygame.Surface(panel_rect.size, pygame.SRCALPHA)
     pygame.draw.rect(panel_surface, (12, 18, 28, 215), panel_surface.get_rect(), border_radius=18)
     pygame.draw.rect(panel_surface, (115, 150, 190, 235), panel_surface.get_rect(), 2, border_radius=18)
@@ -102,16 +102,16 @@ def draw_resource_counts(
     if not players:
         return
 
-    title_font = _load_font(20)
-    body_font = _load_font(18)
-    detail_font = _load_font(14)
+    title_font = _load_font(18)
+    body_font = _load_font(15)
+    detail_font = _load_font(13)
     margin = 12
-    card_gap = 12
-    columns = 1 if len(players) == 1 else 2
+    card_gap = 10
+    columns = len(players) if len(players) <= 3 else 2
     rows = (len(players) + columns - 1) // columns
     available_width = SIDE_PANEL_X - (margin * 2)
     card_width = int((available_width - card_gap * (columns - 1)) / columns)
-    card_height = 82
+    card_height = 72 if rows == 1 else 76
     total_height = rows * card_height + (rows - 1) * card_gap
     start_y = screen.get_height() - total_height - margin
 
@@ -135,18 +135,25 @@ def draw_resource_counts(
         vp_surface = title_font.render(f"VP {vp_value}", True, (255, 236, 178))
         screen.blit(vp_surface, (card_rect.right - vp_surface.get_width() - 16, card_rect.y + 10))
 
-        resource_text = "  ".join(
+        resource_text_top = "  ".join(
             f"{RESOURCE_LABELS[resource_type]} {player.resources[resource_type]}"
             for resource_type in (
                 ResourceType.WOOD,
                 ResourceType.SHEEP,
                 ResourceType.WHEAT,
+            )
+        )
+        resource_text_bottom = "  ".join(
+            f"{RESOURCE_LABELS[resource_type]} {player.resources[resource_type]}"
+            for resource_type in (
                 ResourceType.BRICK,
                 ResourceType.ORE,
             )
         )
-        resource_surface = body_font.render(resource_text, True, COLORS["TEXT_MUTED"])
-        screen.blit(resource_surface, (card_rect.x + 18, card_rect.y + 40))
+        resource_surface = body_font.render(resource_text_top, True, COLORS["TEXT_MUTED"])
+        screen.blit(resource_surface, (card_rect.x + 18, card_rect.y + 34))
+        secondary_surface = body_font.render(resource_text_bottom, True, COLORS["TEXT_MUTED"])
+        screen.blit(secondary_surface, (card_rect.x + 18, card_rect.y + 52))
 
         badges = []
         if longest_road_owner is not None and longest_road_owner.name == player.name:
@@ -155,7 +162,7 @@ def draw_resource_counts(
             badges.append("最大騎士力")
         detail_text = " / ".join(badges) if badges else f"資源合計 {player.total_resource_count()} 枚"
         detail_surface = detail_font.render(detail_text, True, (255, 222, 160) if badges else (190, 205, 220))
-        screen.blit(detail_surface, (card_rect.x + 18, card_rect.y + 63))
+        screen.blit(detail_surface, (card_rect.right - detail_surface.get_width() - 16, card_rect.y + 54))
 
 
 def draw_current_turn(

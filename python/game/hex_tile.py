@@ -45,6 +45,9 @@ class HexTile:
             text_rect = text.get_rect(center=(self.x, self.y))
             screen.blit(text, text_rect)
 
-        # 盗賊の表示（黒円）
+        # 盗賊の表示
         if robber_tile is self:
-            pygame.draw.circle(screen, COLORS["BLACK"], (self.x, self.y), 10)
+            center = (self.x, self.y)
+            pygame.draw.circle(screen, COLORS["WHITE"], center, 18)
+            pygame.draw.circle(screen, COLORS["BLACK"], center, 16)
+            pygame.draw.circle(screen, COLORS["WARNING"], center, 16, 2)

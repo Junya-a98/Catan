@@ -194,8 +194,8 @@ class GameBoard:
             dx = midpoint_x - BOARD_CENTER_X
             dy = midpoint_y - BOARD_CENTER_Y
             length = max(1.0, math.hypot(dx, dy))
-            offset_x = dx / length * 34
-            offset_y = dy / length * 34
+            offset_x = dx / length * 48
+            offset_y = dy / length * 48
             label_x = midpoint_x + offset_x
             label_y = midpoint_y + offset_y
 
@@ -204,15 +204,15 @@ class GameBoard:
                 (180, 210, 230),
                 (midpoint_x, midpoint_y),
                 (label_x, label_y),
-                2,
+                3,
             )
             label = harbor.label
             text_surface = font.render(label, True, COLORS["BLACK"])
             badge_rect = text_surface.get_rect()
-            badge_rect.inflate_ip(18, 12)
+            badge_rect.inflate_ip(22, 14)
             badge_rect.center = (int(label_x), int(label_y))
             pygame.draw.rect(screen, (228, 240, 246), badge_rect, border_radius=10)
-            pygame.draw.rect(screen, (70, 95, 116), badge_rect, 1, border_radius=10)
+            pygame.draw.rect(screen, (70, 95, 116), badge_rect, 2, border_radius=10)
             screen.blit(text_surface, text_surface.get_rect(center=badge_rect.center))
 
     def draw(self, screen):
@@ -222,6 +222,13 @@ class GameBoard:
         self._draw_harbors(screen)
 
         for road in self.roads:
+            pygame.draw.line(
+                screen,
+                COLORS["BLACK"],
+                (road.node1.x, road.node1.y),
+                (road.node2.x, road.node2.y),
+                12,
+            )
             pygame.draw.line(
                 screen,
                 road.owner.color,
