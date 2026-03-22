@@ -4,3 +4,4 @@ class Node:
         self.y = y
         self.building = None  # 建物がない場合は None
         self.tiles = []       # このノードに接しているタイル (HexTile) のリスト
+        self.harbors = []     # 接続している港(Harbor)のリスト

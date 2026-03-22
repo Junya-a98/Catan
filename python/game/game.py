@@ -6,6 +6,7 @@ import pygame
 from game.audio import GameAudio
 from game.building import Building, BuildingType
 from game.constants import COLORS, SCREEN_HEIGHT, SCREEN_WIDTH, WINDOW_TITLE
+from game.dice_animation import DiceAnimationOverlay
 from game.development_cards import (
     DEVELOPMENT_CARD_LABELS,
     DevelopmentCardType,
@@ -13,10 +14,11 @@ from game.development_cards import (
 )
 from game.dice import roll_dice
 from game.game_board import GameBoard
-from game.log_display import draw_current_turn, draw_log, draw_resource_counts
+from game.log_display import draw_log, draw_resource_counts
 from game.player import Player
 from game.resources import BUILD_COSTS, ResourceType
 from game.road import Road
+from game.ui import RESOURCE_LABELS, UIButton, draw_side_panel
 
 
 class CatanGame:
@@ -28,19 +30,27 @@ class CatanGame:
         self.board = GameBoard()
         self.running = True
         self.audio = GameAudio()
+        self.dice_overlay = DiceAnimationOverlay()
         self.audio.start_bgm()
 
-        self.players = [
-            Player("Player1", COLORS["RED"]),
-            Player("Player2", COLORS["BLUE"]),
+        self.player_palette = [
+            ("Player1", COLORS["RED"]),
+            ("Player2", COLORS["BLUE"]),
+            ("Player3", COLORS["ORANGE"]),
+            ("Player4", COLORS["CYAN"]),
         ]
-        self.turn_order = self.players.copy()
+        self.players = []
+        self.turn_order = []
+        self.buttons = []
 
         self.phase = "initial"  # "initial", "main", "finished"
         self.initial_dice_phase = True
         self.initial_dice_results = {}
+        self.initial_dice_histories = {}
+        self.initial_dice_contenders = []
+        self.initial_dice_pending_groups = []
         self.initial_placement_order = []
-        self.initial_placement_counts = {player.name: 0 for player in self.players}
+        self.initial_placement_counts = {}
         self.initial_round = 1
         self.initial_player_index = 0
         self.waiting_for_road = False
@@ -59,6 +69,7 @@ class CatanGame:
         self.robber_target_players = []
         self.resource_selection_remaining = 0
         self.free_roads_remaining = 0
+        self.bank_trade_give_resource = None
         self.winner = None
         self.longest_road_owner = None
         self.longest_road_length = 0
@@ -66,7 +77,12 @@ class CatanGame:
         self.largest_army_size = 0
 
         self.log_messages = []
+        self.pending_dice_context = None
+        self.pending_dice_roll = None
+        self.pending_dice_player_name = ""
+        self.configure_players(2, reset_logs=False)
         self.add_log("ゲーム開始: 初期配置フェーズです。")
+        self.add_log("プレイヤー数は 2/3/4 キーまたは右のボタンで変更できます。")
         self.add_log("各プレイヤーはスペースキーでダイスを振って、配置順を決定してください。")
 
     def add_log(self, message):
@@ -80,7 +96,56 @@ class CatanGame:
     def clear_log(self):
         self.log_messages = []
 
+    def configure_players(self, player_count, reset_logs=True):
+        self.players = [
+            Player(name, color)
+            for name, color in self.player_palette[:player_count]
+        ]
+        self.turn_order = self.players.copy()
+        self.initial_dice_phase = True
+        self.initial_dice_results = {}
+        self.initial_dice_histories = {player.name: [] for player in self.players}
+        self.initial_dice_contenders = self.players.copy()
+        self.initial_dice_pending_groups = []
+        self.initial_placement_order = []
+        self.initial_placement_counts = {player.name: 0 for player in self.players}
+        self.initial_round = 1
+        self.initial_player_index = 0
+        self.waiting_for_road = False
+        self.last_settlement_node = None
+        self.current_player_index = 0
+        self.dice_rolled = False
+        self.action_mode = None
+        self.development_card_used_this_turn = False
+        self.special_phase = None
+        self.discard_queue = []
+        self.discard_player = None
+        self.discard_remaining = 0
+        self.robber_tile_candidates = []
+        self.robber_target_players = []
+        self.resource_selection_remaining = 0
+        self.free_roads_remaining = 0
+        self.bank_trade_give_resource = None
+        self.winner = None
+        self.longest_road_owner = None
+        self.longest_road_length = 0
+        self.largest_army_owner = None
+        self.largest_army_size = 0
+        self.pending_dice_context = None
+        self.pending_dice_roll = None
+        self.pending_dice_player_name = ""
+        self.dice_overlay.state = "idle"
+        self.phase = "initial"
+        self.development_deck = create_development_deck()
+        self.buttons = self.build_buttons()
+        if reset_logs:
+            self.clear_log()
+            self.add_log(f"{player_count} 人プレイに設定しました。")
+            self.add_log("各プレイヤーはスペースキーでダイスを振って、配置順を決定してください。")
+
     def get_current_player(self):
+        if not self.turn_order:
+            return None
         return self.turn_order[self.current_player_index]
 
     def get_player_victory_points(self, player):
@@ -128,6 +193,8 @@ class CatanGame:
 
     def get_current_player_development_summary(self):
         player = self.get_current_player()
+        if player is None:
+            return ""
         parts = [
             f"K:{player.development_cards[DevelopmentCardType.KNIGHT]}",
             f"B:{player.development_cards[DevelopmentCardType.ROAD_BUILDING]}",
@@ -138,6 +205,276 @@ class CatanGame:
         if sum(player.new_development_cards.values()) > 0:
             parts.append(f"新規:{sum(player.new_development_cards.values())}")
         return " ".join(parts)
+
+    def get_point_breakdown(self, player):
+        settlement_points = 0
+        city_points = 0
+        for node in self.board.nodes:
+            if node.building is None or node.building.owner != player:
+                continue
+            if node.building.building_type == BuildingType.CITY:
+                city_points += 2
+            else:
+                settlement_points += 1
+        return {
+            "settlement": settlement_points,
+            "city": city_points,
+            "longest_road": 2 if self.longest_road_owner == player else 0,
+            "largest_army": 2 if self.largest_army_owner == player else 0,
+            "vp_card": player.victory_point_cards,
+        }
+
+    def get_all_point_breakdowns(self):
+        return {player.name: self.get_point_breakdown(player) for player in self.players}
+
+    def get_missing_resources(self, player, cost):
+        missing = []
+        for resource_type, required in cost.items():
+            shortage = required - player.resources.get(resource_type, 0)
+            if shortage > 0:
+                missing.append(f"{RESOURCE_LABELS[resource_type]}{shortage}")
+        return missing
+
+    def get_build_preview(self, label, player, cost, supply_available=True, unavailable_reason="在庫なし"):
+        if not supply_available:
+            return {"label": label, "available": False, "detail": unavailable_reason}
+
+        missing = self.get_missing_resources(player, cost)
+        if missing:
+            return {"label": label, "available": False, "detail": f"不足: {' '.join(missing)}"}
+
+        return {"label": label, "available": True, "detail": "建設可"}
+
+    def get_build_affordability(self, player):
+        if player is None:
+            return []
+        return [
+            self.get_build_preview("街道", player, BUILD_COSTS["road"], player.roads_remaining > 0),
+            self.get_build_preview("開拓地", player, BUILD_COSTS["settlement"], player.settlements_remaining > 0),
+            self.get_build_preview("都市", player, BUILD_COSTS["city"], player.cities_remaining > 0),
+            self.get_build_preview("発展", player, BUILD_COSTS["development"], bool(self.development_deck), "山札なし"),
+        ]
+
+    def get_trade_rates(self, player):
+        if player is None:
+            return {}
+        return self.board.get_player_trade_rates(player)
+
+    def get_initial_dice_history_text(self, player):
+        return " -> ".join(str(value) for value in self.initial_dice_histories.get(player.name, []))
+
+    def has_active_dice_animation(self):
+        return self.pending_dice_context is not None and self.dice_overlay.is_active
+
+    def start_dice_animation(self, context, dice_roll, player_name, title):
+        self.pending_dice_context = context
+        self.pending_dice_roll = dice_roll
+        self.pending_dice_player_name = player_name
+        self.play_sound("dice")
+        subtitle = f"{player_name} が振っています" if player_name else ""
+        self.dice_overlay.start(dice_roll, title, subtitle)
+
+    def update_dice_animation(self):
+        if self.pending_dice_context is None:
+            return
+        if not self.dice_overlay.update(pygame.time.get_ticks()):
+            return
+
+        context = self.pending_dice_context
+        dice_roll = self.pending_dice_roll
+        self.pending_dice_context = None
+        self.pending_dice_roll = None
+        self.pending_dice_player_name = ""
+
+        if context == "initial":
+            self.resolve_initial_key_roll(dice_roll)
+        elif context == "main":
+            self.resolve_main_dice_roll(dice_roll)
+
+    def build_buttons(self):
+        buttons = []
+        base_x = 866
+        base_y = 86
+        button_width = 146
+        button_height = 38
+        gap_x = 12
+        gap_y = 10
+
+        def add(action, label, row, col, enabled=True, selected=False):
+            rect = pygame.Rect(
+                base_x + col * (button_width + gap_x),
+                base_y + row * (button_height + gap_y),
+                button_width,
+                button_height,
+            )
+            buttons.append(UIButton(action, label, rect, enabled=enabled, selected=selected))
+
+        def add_custom(action, label, x, y, width, height, enabled=True, selected=False):
+            rect = pygame.Rect(x, y, width, height)
+            buttons.append(UIButton(action, label, rect, enabled=enabled, selected=selected))
+
+        current_player = self.get_current_player()
+        if self.phase == "initial" and self.initial_dice_phase:
+            add("player_count_2", "2人", 0, 0, selected=len(self.players) == 2)
+            add("player_count_3", "3人", 0, 1, selected=len(self.players) == 3)
+            add("player_count_4", "4人", 1, 0, selected=len(self.players) == 4)
+            add("initial_roll", "初期ダイス", 1, 1, enabled=bool(self.players))
+            return buttons
+        if self.phase != "main" or self.winner is not None:
+            return buttons
+
+        add("roll_dice", "ダイス", 0, 0, enabled=self.phase == "main" and not self.dice_rolled and self.winner is None)
+        add("end_turn", "手番終了", 0, 1, enabled=self.phase == "main" and self.dice_rolled and self.special_phase is None)
+        add("mode_road", "街道", 1, 0, enabled=self.phase == "main" and self.dice_rolled and self.special_phase is None, selected=self.action_mode == "road")
+        add("mode_settlement", "開拓地", 1, 1, enabled=self.phase == "main" and self.dice_rolled and self.special_phase is None, selected=self.action_mode == "settlement")
+        add("mode_city", "都市", 2, 0, enabled=self.phase == "main" and self.dice_rolled and self.special_phase is None, selected=self.action_mode == "city")
+        add("buy_dev", "発展購入", 2, 1, enabled=self.phase == "main" and self.dice_rolled and self.special_phase is None)
+        add("bank_trade", "銀行交易", 3, 0, enabled=self.phase == "main" and self.dice_rolled and self.special_phase is None)
+        add("cancel_action", "取消", 3, 1, enabled=self.phase == "main" and (self.action_mode is not None or self.special_phase in ("bank_trade_give", "bank_trade_receive")))
+        add("use_knight", "騎士", 4, 0, enabled=current_player is not None and self.phase == "main")
+        add("use_road_building", "街道建設", 4, 1, enabled=current_player is not None and self.phase == "main")
+        add("use_year_of_plenty", "収穫", 5, 0, enabled=current_player is not None and self.phase == "main")
+        add("use_monopoly", "独占", 5, 1, enabled=current_player is not None and self.phase == "main")
+
+        if self.special_phase in ("bank_trade_give", "bank_trade_receive"):
+            selector_x = base_x
+            selector_y = base_y + 6 * (button_height + gap_y)
+            selector_width = 94
+            selector_height = 34
+            selector_gap_x = 8
+            selector_gap_y = 8
+            for index, resource_type in enumerate(
+                [ResourceType.WOOD, ResourceType.SHEEP, ResourceType.WHEAT, ResourceType.BRICK, ResourceType.ORE]
+            ):
+                col = index % 3
+                row = index // 3
+                selected = self.bank_trade_give_resource == resource_type
+                label = RESOURCE_LABELS[resource_type]
+                add_custom(
+                    f"trade_resource_{resource_type.name}",
+                    label,
+                    selector_x + col * (selector_width + selector_gap_x),
+                    selector_y + row * (selector_height + selector_gap_y),
+                    selector_width,
+                    selector_height,
+                    enabled=True,
+                    selected=selected and self.special_phase == "bank_trade_receive",
+                )
+
+        return buttons
+
+    def find_clicked_button(self, pos):
+        for button in self.buttons:
+            if button.rect.collidepoint(pos) and button.enabled:
+                return button
+        return None
+
+    def start_bank_trade(self):
+        if self.phase != "main" or self.winner is not None:
+            return
+        if not self.dice_rolled:
+            self.add_log("交易はダイスを振った後に行ってください。")
+            return
+        if self.special_phase is not None:
+            self.add_log("進行中の特殊処理を先に完了してください。")
+            return
+        self.action_mode = None
+        self.special_phase = "bank_trade_give"
+        self.bank_trade_give_resource = None
+        rates = self.get_trade_rates(self.get_current_player())
+        rate_text = ", ".join(f"{RESOURCE_LABELS[r]}{rate}:1" for r, rate in rates.items())
+        self.add_log(f"銀行交易: 先に支払う資源を選んでください。 {rate_text}")
+
+    def select_bank_trade_resource(self, resource_type):
+        player = self.get_current_player()
+        if player is None:
+            return
+        trade_rates = self.get_trade_rates(player)
+
+        if self.special_phase == "bank_trade_give":
+            required = trade_rates[resource_type]
+            if player.resources[resource_type] < required:
+                self.add_log(f"{RESOURCE_LABELS[resource_type]} が不足しています。必要枚数は {required} 枚です。")
+                return
+            self.bank_trade_give_resource = resource_type
+            self.special_phase = "bank_trade_receive"
+            self.add_log(
+                f"{RESOURCE_LABELS[resource_type]} を {required} 枚支払います。受け取りたい資源を選んでください。"
+            )
+            return
+
+        if self.special_phase == "bank_trade_receive":
+            if resource_type == self.bank_trade_give_resource:
+                self.add_log("同じ資源には交換できません。")
+                return
+            give_resource = self.bank_trade_give_resource
+            required = trade_rates[give_resource]
+            player.remove_resource(give_resource, required)
+            player.add_resource(resource_type)
+            self.play_sound("card")
+            self.add_log(
+                f"{player.name} が銀行交易: {RESOURCE_LABELS[give_resource]} {required} 枚を"
+                f" {RESOURCE_LABELS[resource_type]} 1枚に交換しました。"
+            )
+            self.special_phase = None
+            self.bank_trade_give_resource = None
+
+    def cancel_selection(self):
+        if self.special_phase in ("bank_trade_give", "bank_trade_receive"):
+            self.special_phase = None
+            self.bank_trade_give_resource = None
+            self.add_log("銀行交易をキャンセルしました。")
+            return
+        self.action_mode = None
+        self.add_log("行動選択をキャンセルしました。")
+
+    def handle_button_action(self, action):
+        if action.startswith("player_count_"):
+            if self.initial_dice_phase:
+                self.configure_players(int(action.rsplit("_", 1)[1]))
+            return
+        if action == "initial_roll":
+            self.handle_initial_key_roll()
+            return
+        if action == "roll_dice":
+            self.handle_roll_dice()
+            return
+        if action == "end_turn":
+            self.finish_current_turn()
+            return
+        if action == "mode_road":
+            self.set_action_mode("road")
+            return
+        if action == "mode_settlement":
+            self.set_action_mode("settlement")
+            return
+        if action == "mode_city":
+            self.set_action_mode("city")
+            return
+        if action == "buy_dev":
+            self.buy_development_card()
+            return
+        if action == "bank_trade":
+            self.start_bank_trade()
+            return
+        if action == "cancel_action":
+            self.cancel_selection()
+            return
+        if action == "use_knight":
+            self.use_knight_card()
+            return
+        if action == "use_road_building":
+            self.use_road_building_card()
+            return
+        if action == "use_year_of_plenty":
+            self.use_year_of_plenty_card()
+            return
+        if action == "use_monopoly":
+            self.use_monopoly_card()
+            return
+        if action.startswith("trade_resource_"):
+            resource_name = action.removeprefix("trade_resource_")
+            self.select_bank_trade_resource(ResourceType[resource_name])
 
     def find_closest_node(self, mx, my, candidates=None):
         nodes = candidates if candidates is not None else self.board.nodes
@@ -613,6 +950,93 @@ class CatanGame:
         else:
             self.add_log(f"{player.name} の2回目の開拓地は砂漠に隣接しています。")
 
+    def handle_initial_key_roll(self):
+        if not self.initial_dice_phase or not self.players or self.has_active_dice_animation():
+            return
+        current_player = self.initial_dice_contenders[self.initial_player_index]
+        dice_roll = roll_dice()
+        self.start_dice_animation("initial", dice_roll, current_player.name, "初期ダイス")
+
+    def resolve_initial_key_roll(self, dice_roll):
+        current_player = self.initial_dice_contenders[self.initial_player_index]
+        self.initial_dice_results[current_player.name] = dice_roll
+        self.initial_dice_histories[current_player.name].append(dice_roll)
+        self.add_log(f"{current_player.name} の初期ダイスの目: {dice_roll}")
+        self.initial_player_index += 1
+
+        if self.initial_player_index < len(self.initial_dice_contenders):
+            return
+
+        self.resolve_initial_dice_round()
+
+    def resolve_initial_dice_round(self):
+        score_groups = {}
+        for player in self.initial_dice_contenders:
+            score = self.initial_dice_results[player.name]
+            score_groups.setdefault(score, []).append(player)
+
+        tied_groups = [
+            score_groups[score]
+            for score in sorted(score_groups.keys(), reverse=True)
+            if len(score_groups[score]) > 1
+        ]
+        remaining_groups = self.initial_dice_pending_groups[1:] if self.initial_dice_pending_groups else []
+        self.initial_dice_pending_groups = tied_groups + remaining_groups
+
+        if self.initial_dice_pending_groups:
+            tied_group = self.initial_dice_pending_groups[0]
+            tied_score = self.initial_dice_histories[tied_group[0].name][-1]
+            tied_names = ", ".join(player.name for player in tied_group)
+            self.add_log(f"同点: {tied_names} が {tied_score} で並びました。再ロールします。")
+            self.initial_dice_contenders = tied_group
+            self.initial_dice_results = {}
+            self.initial_player_index = 0
+            self.add_log(f"次は {self.initial_dice_contenders[0].name} の再ロールです。")
+            return
+
+        self.finalize_initial_dice_order()
+
+    def finalize_initial_dice_order(self):
+        self.turn_order = sorted(
+            self.players,
+            key=lambda player: tuple(self.initial_dice_histories[player.name]),
+            reverse=True,
+        )
+        self.initial_placement_order = self.turn_order.copy()
+        self.clear_log()
+        self.add_log("初期配置順（第1ラウンド）:")
+        for index, player in enumerate(self.initial_placement_order, start=1):
+            self.add_log(
+                f"{index}: {player.name} (ダイス: {self.get_initial_dice_history_text(player)})"
+            )
+        self.initial_dice_phase = False
+        self.initial_player_index = 0
+        self.initial_dice_contenders = []
+        self.initial_dice_pending_groups = []
+        self.add_log("初期ダイスが完了しました。")
+        self.add_log("マウスクリックまたはスペースキーで建物・街道の配置を行ってください。")
+
+    def handle_roll_dice(self):
+        if self.phase != "main" or self.winner is not None or self.has_active_dice_animation():
+            return
+        if self.dice_rolled:
+            self.add_log("このターンはすでにダイスを振っています。")
+            return
+        dice_roll = roll_dice()
+        current_player = self.get_current_player()
+        player_name = current_player.name if current_player is not None else ""
+        self.start_dice_animation("main", dice_roll, player_name, "ダイスロール")
+
+    def resolve_main_dice_roll(self, dice_roll):
+        self.clear_log()
+        self.add_log(f"ダイスの目: {dice_roll}")
+        if dice_roll == 7:
+            self.start_robber_phase()
+        else:
+            self.distribute_resources(dice_roll)
+            self.add_log("D=発展カード購入, T=銀行交易, R/S/C=建設, Enter=手番終了 で行動してください。")
+        self.dice_rolled = True
+
     def advance_initial_phase(self, current_player):
         self.add_log(f"{current_player.name} の初期配置が完了しました。")
 
@@ -652,11 +1076,15 @@ class CatanGame:
         self.robber_target_players = []
         self.resource_selection_remaining = 0
         self.free_roads_remaining = 0
+        self.pending_dice_context = None
+        self.pending_dice_roll = None
+        self.pending_dice_player_name = ""
+        self.dice_overlay.state = "idle"
         self.clear_log()
         first_player = self.get_current_player()
         self.add_log("初期配置フェーズ完了。通常フェーズを開始します。")
         self.add_log(f"最初の手番: {first_player.name}")
-        self.add_log("スペースキーでダイスを振ってください。発展カードは K/B/Y/M で使用できます。")
+        self.add_log("スペースキーでダイスを振ってください。発展カードは K/B/Y/M、銀行交易は T です。")
 
     def handle_initial_placement(self, pos):
         mx, my = pos
@@ -721,7 +1149,7 @@ class CatanGame:
         if self.phase != "main" or self.winner is not None:
             return
         if self.special_phase is not None:
-            self.add_log("いまは盗賊の処理を完了してください。")
+            self.add_log("進行中の特殊処理を完了してください。")
             return
         if not self.dice_rolled:
             self.add_log("先にスペースキーでダイスを振ってください。")
@@ -754,7 +1182,7 @@ class CatanGame:
         self.current_player_index = (self.current_player_index + 1) % len(self.turn_order)
         self.clear_log()
         self.add_log(f"{self.get_current_player().name} の手番です。")
-        self.add_log("スペースキーでダイスを振ってください。発展カードは K/B/Y/M で使用できます。")
+        self.add_log("スペースキーでダイスを振ってください。発展カードは K/B/Y/M、銀行交易は T です。")
 
     def build_settlement(self, pos):
         current_player = self.get_current_player()
@@ -943,6 +1371,7 @@ class CatanGame:
             self.add_log("ウィンドウを閉じるまで盤面を表示しています。")
 
     def handle_events(self):
+        self.buttons = self.build_buttons()
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 self.running = False
@@ -951,32 +1380,19 @@ class CatanGame:
             if self.phase == "finished":
                 continue
 
+            if self.has_active_dice_animation():
+                continue
+
             if self.phase == "initial":
                 if self.initial_dice_phase:
-                    if event.type == pygame.KEYDOWN and event.key == pygame.K_SPACE:
-                        current_player = self.players[self.initial_player_index]
-                        dice_roll = roll_dice()
-                        self.initial_dice_results[current_player.name] = dice_roll
-                        self.add_log(f"{current_player.name} の初期ダイスの目: {dice_roll}")
-                        self.initial_player_index += 1
-
-                        if self.initial_player_index >= len(self.players):
-                            self.turn_order = sorted(
-                                self.players,
-                                key=lambda player: self.initial_dice_results[player.name],
-                                reverse=True,
-                            )
-                            self.initial_placement_order = self.turn_order.copy()
-                            self.clear_log()
-                            self.add_log("初期配置順（第1ラウンド）:")
-                            for index, player in enumerate(self.initial_placement_order, start=1):
-                                self.add_log(
-                                    f"{index}: {player.name} (ダイス: {self.initial_dice_results[player.name]})"
-                                )
-                            self.initial_dice_phase = False
-                            self.initial_player_index = 0
-                            self.add_log("初期ダイスが完了しました。")
-                            self.add_log("マウスクリックまたはスペースキーで建物・街道の配置を行ってください。")
+                    if event.type == pygame.KEYDOWN and event.key in (pygame.K_2, pygame.K_3, pygame.K_4):
+                        self.configure_players(int(event.unicode))
+                    elif event.type == pygame.KEYDOWN and event.key == pygame.K_SPACE:
+                        self.handle_initial_key_roll()
+                    elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                        clicked_button = self.find_clicked_button(event.pos)
+                        if clicked_button is not None:
+                            self.handle_button_action(clicked_button.action)
                 else:
                     if (
                         event.type == pygame.MOUSEBUTTONDOWN
@@ -1006,23 +1422,27 @@ class CatanGame:
                         self.add_log("資源選択は 1:木 2:羊 3:麦 4:土 5:鉄 で指定してください。")
                 continue
 
+            if self.special_phase in ("bank_trade_give", "bank_trade_receive"):
+                if event.type == pygame.KEYDOWN:
+                    if event.key == pygame.K_ESCAPE:
+                        self.cancel_selection()
+                        continue
+                    resource_type = self.get_discard_key_map().get(event.key)
+                    if resource_type is not None:
+                        self.select_bank_trade_resource(resource_type)
+                elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                    clicked_button = self.find_clicked_button(event.pos)
+                    if clicked_button is not None:
+                        self.handle_button_action(clicked_button.action)
+                continue
+
             if event.type == pygame.KEYDOWN:
                 if event.key == pygame.K_SPACE:
-                    if not self.dice_rolled:
-                        dice_roll = roll_dice()
-                        self.play_sound("dice")
-                        self.clear_log()
-                        self.add_log(f"ダイスの目: {dice_roll}")
-                        if dice_roll == 7:
-                            self.start_robber_phase()
-                        else:
-                            self.distribute_resources(dice_roll)
-                            self.add_log(
-                                "D=発展カード購入, R/S/C=建設, Enter=手番終了 で行動してください。"
-                            )
-                        self.dice_rolled = True
+                    self.handle_roll_dice()
                 elif event.key == pygame.K_d:
                     self.buy_development_card()
+                elif event.key == pygame.K_t:
+                    self.start_bank_trade()
                 elif event.key == pygame.K_k:
                     self.use_knight_card()
                 elif event.key == pygame.K_b:
@@ -1043,9 +1463,12 @@ class CatanGame:
                     if self.special_phase == "road_building":
                         self.complete_road_building_phase()
                         continue
-                    self.action_mode = None
-                    self.add_log("行動選択をキャンセルしました。")
+                    self.cancel_selection()
             elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                clicked_button = self.find_clicked_button(event.pos)
+                if clicked_button is not None:
+                    self.handle_button_action(clicked_button.action)
+                    continue
                 self.handle_main_phase_click(pygame.mouse.get_pos())
 
     def distribute_resources(self, dice_roll):
@@ -1064,10 +1487,11 @@ class CatanGame:
             self.add_log(str(player))
 
     def update(self):
-        pass
+        self.update_dice_animation()
+        self.buttons = self.build_buttons()
 
     def render(self):
-        self.screen.fill(COLORS["BLUE"])
+        self.screen.fill(COLORS["BACKGROUND"])
         self.board.draw(self.screen)
         draw_log(self.screen, self.log_messages)
         draw_resource_counts(
@@ -1077,18 +1501,54 @@ class CatanGame:
             longest_road_owner=self.longest_road_owner,
             largest_army_owner=self.largest_army_owner,
         )
-        if self.phase in ("main", "finished"):
-            draw_current_turn(
-                self.screen,
-                self.turn_order,
-                self.current_player_index,
-                action_mode=self.action_mode,
-                winner=self.winner,
-                special_phase=self.special_phase,
-                discard_player=self.discard_player,
-                discard_remaining=self.discard_remaining,
-                development_summary=self.get_current_player_development_summary() if self.phase == "main" else None,
-            )
+        panel_title = "操作パネル"
+        panel_subtitle = ""
+        if self.phase == "initial" and self.initial_dice_phase:
+            panel_title = "初期設定"
+            panel_subtitle = "2/3/4人を選び、初期ダイスを開始"
+        elif self.phase == "initial":
+            panel_title = "初期配置"
+            current_player = self.initial_placement_order[self.initial_player_index]
+            if self.waiting_for_road:
+                panel_subtitle = f"{current_player.name}: 開拓地に隣接する辺へ街道を配置"
+            else:
+                panel_subtitle = f"{current_player.name}: 開拓地を配置 (Round {self.initial_round})"
+        elif self.phase in ("main", "finished"):
+            current_player = self.get_current_player()
+            if current_player is not None:
+                panel_subtitle = f"現在の手番: {current_player.name}"
+                if self.special_phase == "discard" and self.discard_player is not None:
+                    panel_subtitle = f"捨て札中: {self.discard_player.name} 残り {self.discard_remaining}"
+                elif self.special_phase == "move_robber":
+                    panel_subtitle = f"{current_player.name}: 盗賊の移動先を選択"
+                elif self.special_phase == "steal":
+                    panel_subtitle = f"{current_player.name}: 略奪対象を選択"
+                elif self.special_phase == "bank_trade_give":
+                    panel_subtitle = "銀行交易: 支払う資源を選択"
+                elif self.special_phase == "bank_trade_receive":
+                    panel_subtitle = "銀行交易: 受け取る資源を選択"
+                elif self.special_phase == "year_of_plenty":
+                    panel_subtitle = "収穫: 1-5 で資源を2枚選択"
+                elif self.special_phase == "monopoly":
+                    panel_subtitle = "独占: 1-5 で資源種類を指定"
+                elif self.special_phase == "road_building":
+                    panel_subtitle = f"街道建設: 残り {self.free_roads_remaining} 本"
+        draw_side_panel(
+            self.screen,
+            panel_title,
+            panel_subtitle,
+            self.get_current_player() if self.phase == "main" else None,
+            self.players,
+            self.buttons,
+            self.get_points_by_player(),
+            self.get_all_point_breakdowns(),
+            self.get_trade_rates(self.get_current_player()) if self.phase == "main" else {},
+            self.get_current_player_development_summary() if self.phase == "main" else "",
+            len(self.development_deck),
+            self.get_build_affordability(self.get_current_player()) if self.phase == "main" and self.get_current_player() else [],
+        )
+        if self.dice_overlay.is_active:
+            self.dice_overlay.draw(self.screen)
         pygame.display.flip()
 
     def run(self):
