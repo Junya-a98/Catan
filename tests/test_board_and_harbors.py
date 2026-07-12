@@ -1,10 +1,23 @@
+import math
+
 import pygame
 
 from game.building import Building
-from game.constants import SIDE_PANEL_X
+from game.constants import BOARD_CENTER_X, BOARD_CENTER_Y, SIDE_PANEL_X
 from game.game_board import GameBoard
 from game.player import Player
 from game.resources import ResourceType
+from game.road import Road
+
+
+def coastline_samples(harbor):
+    return [
+        (
+            round(harbor.node1.x + (harbor.node2.x - harbor.node1.x) * fraction),
+            round(harbor.node1.y + (harbor.node2.y - harbor.node1.y) * fraction),
+        )
+        for fraction in (0.20, 0.35, 0.50, 0.65, 0.80)
+    ]
 
 
 def test_board_uses_standard_tile_and_edge_counts():
@@ -139,22 +152,42 @@ def test_harbor_badge_is_clamped_before_the_side_panel():
     assert rect.right <= SIDE_PANEL_X - 12
 
 
-def test_harbor_draws_a_visible_pier_on_the_coastal_edge():
-    pygame.font.init()
+def test_harbor_dock_stays_outside_the_playable_coastal_edge():
     board = GameBoard(seed=4)
-    surface = pygame.Surface((1200, 800), pygame.SRCALPHA)
-    harbor = board.harbors[0]
+    for harbor in board.harbors:
+        surface = pygame.Surface((1200, 800), pygame.SRCALPHA)
+        connector_start = board._draw_harbor_dock(surface, harbor)
+        midpoint = (
+            round((harbor.node1.x + harbor.node2.x) / 2),
+            round((harbor.node1.y + harbor.node2.y) / 2),
+        )
 
-    board._draw_harbors(surface)
+        assert all(surface.get_at(point).a == 0 for point in coastline_samples(harbor))
+        assert surface.get_at(connector_start).a > 0
+        connector_distance = math.hypot(
+            connector_start[0] - BOARD_CENTER_X,
+            connector_start[1] - BOARD_CENTER_Y,
+        )
+        coastline_distance = math.hypot(
+            midpoint[0] - BOARD_CENTER_X,
+            midpoint[1] - BOARD_CENTER_Y,
+        )
+        assert connector_distance > coastline_distance
 
-    midpoint = (
-        round((harbor.node1.x + harbor.node2.x) / 2),
-        round((harbor.node1.y + harbor.node2.y) / 2),
-    )
-    assert surface.get_at(midpoint).a > 0
-    pier_pixels = sum(
-        surface.get_at((midpoint[0] + dx, midpoint[1] + dy)).a > 0
-        for dx in range(-7, 8)
-        for dy in range(-7, 8)
-    )
-    assert pier_pixels >= 75
+
+def test_harbor_dock_does_not_obscure_a_road_on_its_coastal_edge():
+    board = GameBoard(seed=4)
+    player = Player("RoadOwner", (211, 61, 52))
+
+    for harbor in board.harbors:
+        surface = pygame.Surface((1200, 800), pygame.SRCALPHA)
+        reference = pygame.Surface((1200, 800), pygame.SRCALPHA)
+        board._draw_harbor_dock(surface, harbor)
+        road = Road(player, harbor.node1, harbor.node2)
+        road.draw(reference)
+        road.draw(surface)
+
+        assert all(
+            surface.get_at(point) == reference.get_at(point)
+            for point in coastline_samples(harbor)
+        )

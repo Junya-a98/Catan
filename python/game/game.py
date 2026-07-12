@@ -15,8 +15,10 @@ from game.constants import (
     HELP_PANEL_Y,
     LOG_PANEL_HEIGHT,
     LOG_PANEL_WIDTH,
+    MAX_VICTORY_POINT_TARGET,
     MIN_LARGEST_ARMY_SIZE,
     MIN_LONGEST_ROAD_LENGTH,
+    MIN_VICTORY_POINT_TARGET,
     NODE_SELECTION_RADIUS,
     SIDE_PANEL_WIDTH,
     SIDE_PANEL_X,
@@ -78,6 +80,7 @@ class CatanGame:
         self.board_seed = self.normalize_board_seed(board_seed)
         self.board_seed_text = str(self.board_seed)
         self.seed_input_active = False
+        self.victory_point_target = WINNING_VICTORY_POINTS
         self.board = GameBoard(mode=self.board_mode, seed=self.board_seed)
         self.board_rules = BoardRules(self.board)
         self.running = True
@@ -158,7 +161,7 @@ class CatanGame:
         self.log_messages = []
         self.latest_event = {
             "title": "ゲーム準備中",
-            "detail": "人数・AI・盤面を確認して初期ダイスを振ってください。",
+            "detail": "人数・AI・勝利点・盤面を確認して初期ダイスを振ってください。",
             "level": "info",
             "color": COLORS["PANEL_BORDER"],
         }
@@ -399,7 +402,10 @@ class CatanGame:
 
     def get_board_configuration_summary(self):
         mode_label = "制約付き" if self.board_mode == "constrained" else "公式ランダム"
-        return f"{mode_label} / seed {self.board_seed} / AI {self.ai_player_count}人"
+        return (
+            f"{mode_label} / seed {self.board_seed} / AI {self.ai_player_count}人 / "
+            f"勝利{self.victory_point_target}点"
+        )
 
     def get_board_rules(self):
         board_rules = getattr(self, "board_rules", None)
@@ -426,6 +432,7 @@ class CatanGame:
             "rows": [
                 ("現在の mode", mode_label),
                 ("現在の seed", str(self.board_seed)),
+                ("勝利条件", f"{self.victory_point_target} VP"),
             ],
             "description": description,
             "accent": accent,
@@ -472,7 +479,7 @@ class CatanGame:
         self.configure_players(player_count, reset_logs=False)
         self.clear_log()
         self.add_log(f"再戦準備: {self.get_board_configuration_summary()}")
-        self.add_log("人数と盤面を確認して、初期ダイスを振ってください。")
+        self.add_log("人数・AI・勝利点・盤面を確認して、初期ダイスを振ってください。")
 
     def set_board_mode(self, mode):
         if mode not in ("constrained", "fully_random"):
@@ -492,6 +499,16 @@ class CatanGame:
         player_count = len(self.players) or 2
         self.set_ai_player_count((self.ai_player_count + 1) % player_count)
 
+    def adjust_victory_point_target(self, delta):
+        if self.phase != "initial" or not self.initial_dice_phase:
+            return False
+        previous = self.victory_point_target
+        self.victory_point_target = max(
+            MIN_VICTORY_POINT_TARGET,
+            min(MAX_VICTORY_POINT_TARGET, previous + int(delta)),
+        )
+        return self.victory_point_target != previous
+
     def reset_pending_dice_state(self):
         self.pending_dice_context = None
         self.pending_dice_roll = None
@@ -505,6 +522,16 @@ class CatanGame:
         self.domestic_trade_edit_side = "give"
         self.domestic_trade_editor = None
         self.domestic_trade_is_counter = False
+        self.domestic_trade_is_broadcast = False
+        self.domestic_trade_broadcast_responders = []
+        self.domestic_trade_broadcast_index = -1
+        self.domestic_trade_broadcast_give = {
+            resource_type: 0 for resource_type in RESOURCE_TYPES
+        }
+        self.domestic_trade_broadcast_receive = {
+            resource_type: 0 for resource_type in RESOURCE_TYPES
+        }
+        self.domestic_trade_broadcast_viewer = None
 
     def clear_player_handoff_state(self):
         self.handoff_player = None
@@ -530,9 +557,15 @@ class CatanGame:
     def reveal_player_handoff(self):
         if self.special_phase != "player_handoff":
             return False
+        handoff_player = self.handoff_player
         return_phase = self.handoff_return_phase
         self.clear_player_handoff_state()
         self.special_phase = return_phase
+        if (
+            self.domestic_trade_is_broadcast
+            and return_phase == "domestic_trade_counter_response"
+        ):
+            self.domestic_trade_broadcast_viewer = handoff_player
         return True
 
     def is_domestic_trade_phase(self):
@@ -1040,6 +1073,7 @@ class CatanGame:
             dice_rolled=self.dice_rolled,
             action_mode=self.action_mode,
             show_seed_input_hint=self.seed_input_active,
+            victory_point_target=self.victory_point_target,
             discard_player_name=self.discard_player.name if self.discard_player is not None else None,
             discard_remaining=self.discard_remaining,
             resource_selection_remaining=self.resource_selection_remaining,
@@ -1173,6 +1207,7 @@ class CatanGame:
         if self.is_domestic_trade_phase():
             actions.add("domestic_trade_cancel")
             if self.special_phase == "domestic_trade_partner":
+                actions.add("domestic_trade_broadcast")
                 actions.update(
                     f"domestic_trade_partner_{index}"
                     for index, other in enumerate(self.players)
@@ -1361,23 +1396,33 @@ class CatanGame:
             )
             add("seed_apply", "seed反映", 4, 0)
             add("seed_randomize", "再生成", 4, 1)
-            add_custom(
+            add(
                 "ai_count_cycle",
-                f"AIプレイヤー: {self.ai_player_count} 人（クリックで変更）",
-                base_x,
-                base_y + 5 * (button_height + gap_y),
-                available_width,
-                button_height,
+                f"AI人数: {self.ai_player_count}",
+                5,
+                0,
                 selected=self.ai_player_count > 0,
             )
-            add_custom(
+            add(
                 "ai_speed_cycle",
-                f"AI速度: {self.get_ai_speed_label()}（クリックで変更）",
-                base_x,
-                base_y + 6 * (button_height + gap_y),
-                available_width,
-                button_height,
+                f"AI速度: {self.get_ai_speed_label()}",
+                5,
+                1,
                 selected=self.get_ai_speed_label() != "標準",
+            )
+            add(
+                "victory_target_decrease",
+                f"勝利点 −（{self.victory_point_target}）",
+                6,
+                0,
+                enabled=self.victory_point_target > MIN_VICTORY_POINT_TARGET,
+            )
+            add(
+                "victory_target_increase",
+                f"勝利点 ＋（{self.victory_point_target}）",
+                6,
+                1,
+                enabled=self.victory_point_target < MAX_VICTORY_POINT_TARGET,
             )
             return buttons
 
@@ -1409,18 +1454,27 @@ class CatanGame:
                 for index, player in enumerate(self.players)
                 if player is not current_player and player.total_resource_count() > 0
             ]
+            add_custom(
+                "domestic_trade_broadcast",
+                f"全員に募集（{len(partners)}人）",
+                base_x,
+                base_y,
+                available_width,
+                button_height,
+                highlighted=True,
+            )
             for slot, (index, partner) in enumerate(partners):
                 profile = self.get_public_production_profile(partner)
                 add_custom(
                     f"domestic_trade_partner_{index}",
                     f"{partner.name}｜手札{partner.total_resource_count()}枚｜生産 {profile}",
                     base_x,
-                    base_y + slot * (button_height + gap_y),
+                    base_y + (slot + 1) * (button_height + gap_y),
                     available_width,
                     button_height,
                     highlighted=True,
                 )
-            cancel_y = base_y + len(partners) * (button_height + gap_y)
+            cancel_y = base_y + (len(partners) + 1) * (button_height + gap_y)
             add_custom(
                 "domestic_trade_cancel",
                 "交渉をやめる",
@@ -1486,7 +1540,12 @@ class CatanGame:
                     enabled=amount < limit,
                 )
             action_y = rows_y + len(RESOURCE_TYPES) * (34 + row_gap) + 6
-            submit_label = "条件変更を送る" if self.domestic_trade_is_counter else "提案を送る"
+            if self.domestic_trade_is_counter:
+                submit_label = "条件変更を送る"
+            elif self.domestic_trade_is_broadcast:
+                submit_label = "全員に募集"
+            else:
+                submit_label = "提案を送る"
             add_custom(
                 "domestic_trade_submit",
                 submit_label,
@@ -1794,22 +1853,38 @@ class CatanGame:
         receive = self.format_resource_bundle(self.domestic_trade_receive)
         return f"{give} → {receive}"
 
+    def get_domestic_trade_broadcast_progress(self):
+        total = len(self.domestic_trade_broadcast_responders)
+        if total <= 0 or self.domestic_trade_broadcast_index < 0:
+            return f"全員募集（{total}人）"
+        return f"全員募集 {self.domestic_trade_broadcast_index + 1}/{total}"
+
     def get_domestic_trade_guidance(self):
         partner_name = self.domestic_trade_partner.name if self.domestic_trade_partner is not None else "相手"
         if self.special_phase == "domestic_trade_partner":
             return [
-                "次: 交渉する相手を選ぶ",
+                "次: 交渉相手または「全員に募集」を選ぶ",
                 "生産傾向と直近公開獲得は推測用。現在の手札内訳は非公開です。",
             ]
         if self.special_phase == "domestic_trade_edit":
-            action = "条件変更を送る" if self.domestic_trade_is_counter else "提案を送る"
+            if self.domestic_trade_is_counter:
+                action = "条件変更を送る"
+            elif self.domestic_trade_is_broadcast:
+                action = "全員に募集"
+            else:
+                action = "提案を送る"
             if self.domestic_trade_partner is not None:
                 public_summary = self.get_trade_partner_public_summary(self.domestic_trade_partner)
             else:
                 public_summary = self.get_domestic_trade_compact_summary()
             return [f"次: 資源と枚数を決めて「{action}」", public_summary]
         if self.special_phase == "domestic_trade_handoff":
-            return [f"次: {partner_name} に画面を渡す", "手札の内訳を隠したまま回答画面へ進みます。"]
+            prefix = (
+                f"{self.get_domestic_trade_broadcast_progress()} / "
+                if self.domestic_trade_is_broadcast
+                else ""
+            )
+            return [f"次: {prefix}{partner_name} に画面を渡す", "手札の内訳を隠したまま回答画面へ進みます。"]
         if self.special_phase == "domestic_trade_response":
             return ["次: 承諾・条件変更・拒否を選ぶ", self.get_domestic_trade_compact_summary()]
         if self.special_phase == "domestic_trade_counter_handoff":
@@ -1821,9 +1896,16 @@ class CatanGame:
     def get_domestic_trade_subtitle(self):
         active_player = self.get_current_player()
         partner = self.domestic_trade_partner
+        if self.domestic_trade_is_broadcast and partner is None:
+            return f"全員募集: {active_player.name} / {self.get_domestic_trade_compact_summary()}"
         if partner is None:
             return f"国内交易: {active_player.name} が相手を選択"
-        prefix = "条件変更" if self.domestic_trade_is_counter else "提案"
+        if self.domestic_trade_is_broadcast:
+            prefix = self.get_domestic_trade_broadcast_progress()
+            if self.domestic_trade_is_counter:
+                prefix += "・条件変更"
+        else:
+            prefix = "条件変更" if self.domestic_trade_is_counter else "提案"
         return (
             f"{prefix}: {active_player.name} ⇄ {partner.name}（手札{partner.total_resource_count()}枚）"
             f" / {self.get_domestic_trade_compact_summary()}"
@@ -1833,6 +1915,26 @@ class CatanGame:
         if player is None or player.total_resource_count() <= 0:
             return False
         return any(other is not player and other.total_resource_count() > 0 for other in self.players)
+
+    def get_domestic_trade_eligible_partners(self, active_player=None):
+        active_player = active_player or self.get_current_player()
+        if active_player is None:
+            return []
+        if active_player in self.turn_order:
+            active_index = self.turn_order.index(active_player)
+            ordered_players = (
+                self.turn_order[active_index + 1 :]
+                + self.turn_order[:active_index]
+            )
+        else:
+            ordered_players = [
+                player for player in self.players if player is not active_player
+            ]
+        return [
+            player
+            for player in ordered_players
+            if player is not active_player and player.total_resource_count() > 0
+        ]
 
     def start_domestic_trade(self):
         if self.phase != "main" or self.winner is not None:
@@ -1871,6 +1973,27 @@ class CatanGame:
         self.domestic_trade_editor = active_player
         self.domestic_trade_edit_side = "give"
         self.special_phase = "domestic_trade_edit"
+        return True
+
+    def select_domestic_trade_broadcast(self):
+        if self.special_phase != "domestic_trade_partner":
+            return False
+        active_player = self.get_current_player()
+        responders = self.get_domestic_trade_eligible_partners(active_player)
+        if not responders:
+            self.notify_invalid("募集に回答できるプレイヤーがいません。")
+            return False
+        self.domestic_trade_is_broadcast = True
+        self.domestic_trade_broadcast_responders = responders
+        self.domestic_trade_broadcast_index = -1
+        self.domestic_trade_broadcast_viewer = active_player
+        self.domestic_trade_partner = None
+        self.domestic_trade_editor = active_player
+        self.domestic_trade_edit_side = "give"
+        self.special_phase = "domestic_trade_edit"
+        self.add_log(
+            f"{active_player.name} が全員募集の交易条件を編集中です。"
+        )
         return True
 
     def set_domestic_trade_edit_side(self, side):
@@ -1933,8 +2056,53 @@ class CatanGame:
             and self.player_can_pay_bundle(partner, self.domestic_trade_receive)
         )
 
+    def restore_domestic_trade_broadcast_terms(self):
+        self.domestic_trade_give = dict(self.domestic_trade_broadcast_give)
+        self.domestic_trade_receive = dict(self.domestic_trade_broadcast_receive)
+        self.domestic_trade_is_counter = False
+        self.domestic_trade_editor = self.get_current_player()
+        self.domestic_trade_edit_side = "give"
+
+    def advance_domestic_trade_broadcast(self):
+        if not self.domestic_trade_is_broadcast:
+            return False
+
+        active_player = self.get_current_player()
+        self.restore_domestic_trade_broadcast_terms()
+        self.domestic_trade_broadcast_index += 1
+
+        if self.domestic_trade_broadcast_index >= len(
+            self.domestic_trade_broadcast_responders
+        ):
+            previous_viewer = self.domestic_trade_broadcast_viewer
+            self.add_log("全員が交易募集を拒否しました。")
+            self.record_event(
+                f"{active_player.name}の交易募集は不成立",
+                "回答者全員が拒否しました",
+                level="warning",
+                actor=active_player,
+            )
+            self.finish_domestic_trade(previous_viewer=previous_viewer)
+            return True
+
+        partner = self.domestic_trade_broadcast_responders[
+            self.domestic_trade_broadcast_index
+        ]
+        self.domestic_trade_partner = partner
+        progress = self.get_domestic_trade_broadcast_progress()
+        self.add_log(f"{progress}: {partner.name} に同じ条件を提示しました。")
+        if partner.is_ai:
+            return self.resolve_ai_domestic_trade_response()
+        self.special_phase = "domestic_trade_handoff"
+        return True
+
     def submit_domestic_trade_offer(self):
-        if self.special_phase != "domestic_trade_edit" or self.domestic_trade_partner is None:
+        if self.special_phase != "domestic_trade_edit":
+            return False
+        if self.domestic_trade_partner is None and not (
+            self.domestic_trade_is_broadcast
+            and self.domestic_trade_broadcast_index < 0
+        ):
             return False
         is_valid, message = self.validate_domestic_trade_terms()
         if not is_valid:
@@ -1962,6 +2130,19 @@ class CatanGame:
                 return self.reject_domestic_trade(active_player, "変更条件を受け入れませんでした")
             self.special_phase = "domestic_trade_counter_handoff"
             return True
+
+        if self.domestic_trade_is_broadcast:
+            self.domestic_trade_broadcast_give = dict(self.domestic_trade_give)
+            self.domestic_trade_broadcast_receive = dict(
+                self.domestic_trade_receive
+            )
+            self.add_log(f"{active_player.name} が全員に交易を募集: {summary}")
+            self.record_event(
+                f"{active_player.name}が全員に交易を募集",
+                summary,
+                actor=active_player,
+            )
+            return self.advance_domestic_trade_broadcast()
 
         self.add_log(f"{active_player.name} が {partner.name} に交易を提案: {summary}")
         self.record_event(
@@ -2016,16 +2197,30 @@ class CatanGame:
                     if active_decision == "accept" and self.can_execute_domestic_trade():
                         return self.execute_domestic_trade()
                     return self.reject_domestic_trade(active_player, "変更条件を受け入れませんでした")
-                self.special_phase = "domestic_trade_counter_response"
+                if self.should_hide_for_handoff(
+                    self.domestic_trade_broadcast_viewer,
+                    active_player,
+                ):
+                    self.begin_player_handoff(
+                        active_player,
+                        return_phase="domestic_trade_counter_response",
+                        context="募集の条件変更",
+                    )
+                else:
+                    self.special_phase = "domestic_trade_counter_response"
                 return True
         return self.reject_domestic_trade(partner, "提案を拒否しました")
 
     def reveal_domestic_trade_response(self):
         if self.special_phase == "domestic_trade_handoff":
             self.special_phase = "domestic_trade_response"
+            if self.domestic_trade_is_broadcast:
+                self.domestic_trade_broadcast_viewer = self.domestic_trade_partner
             return True
         if self.special_phase == "domestic_trade_counter_handoff":
             self.special_phase = "domestic_trade_counter_response"
+            if self.domestic_trade_is_broadcast:
+                self.domestic_trade_broadcast_viewer = self.get_current_player()
             return True
         return False
 
@@ -2049,7 +2244,11 @@ class CatanGame:
     def execute_domestic_trade(self):
         if not self.can_execute_domestic_trade():
             return False
-        previous_viewer = self.get_domestic_trade_actor()
+        previous_viewer = (
+            self.domestic_trade_broadcast_viewer
+            if self.domestic_trade_is_broadcast
+            else self.get_domestic_trade_actor()
+        )
         active_player = self.get_current_player()
         partner = self.domestic_trade_partner
         give_text = self.format_resource_bundle(self.domestic_trade_give)
@@ -2090,13 +2289,26 @@ class CatanGame:
             level="warning",
             actor=responder,
         )
+        if self.domestic_trade_is_broadcast:
+            if responder is not None and not responder.is_ai:
+                self.domestic_trade_broadcast_viewer = responder
+            return self.advance_domestic_trade_broadcast()
         self.finish_domestic_trade(previous_viewer=responder)
         return True
 
     def cancel_domestic_trade(self):
         if not self.is_domestic_trade_phase():
             return False
-        actor = self.get_domestic_trade_actor() or self.get_current_player()
+        if self.special_phase == "domestic_trade_handoff":
+            actor = (
+                self.domestic_trade_broadcast_viewer
+                if self.domestic_trade_is_broadcast
+                else self.get_current_player()
+            )
+        elif self.special_phase == "domestic_trade_counter_handoff":
+            actor = self.domestic_trade_partner
+        else:
+            actor = self.get_domestic_trade_actor() or self.get_current_player()
         self.add_log(f"{actor.name} が国内交易を終了しました。")
         self.finish_domestic_trade(previous_viewer=actor)
         return True
@@ -2203,6 +2415,12 @@ class CatanGame:
         if action == "ai_speed_cycle":
             self.cycle_ai_speed()
             return
+        if action == "victory_target_decrease":
+            self.adjust_victory_point_target(-1)
+            return
+        if action == "victory_target_increase":
+            self.adjust_victory_point_target(1)
+            return
         if action == "board_mode_constrained":
             self.set_board_mode("constrained")
             return
@@ -2250,6 +2468,9 @@ class CatanGame:
             return
         if action == "domestic_trade":
             self.start_domestic_trade()
+            return
+        if action == "domestic_trade_broadcast":
+            self.select_domestic_trade_broadcast()
             return
         if action.startswith("domestic_trade_partner_"):
             player_index = int(action.rsplit("_", 1)[1])
@@ -3360,7 +3581,7 @@ class CatanGame:
         if self.phase != "main":
             return
         points = self.get_player_victory_points(player)
-        if points >= WINNING_VICTORY_POINTS:
+        if points >= self.victory_point_target:
             self.winner = player
             self.phase = "finished"
             self.action_mode = None
@@ -3667,6 +3888,7 @@ class CatanGame:
                 player.name: self.get_recent_public_gain_text(player)
                 for player in self.players
             },
+            victory_point_target=self.victory_point_target,
         )
         progress = self.get_progress_header_data()
         draw_progress_header(
@@ -3685,7 +3907,7 @@ class CatanGame:
             panel_subtitle = f"{self.handoff_player.name} / {self.handoff_context}"
         elif self.phase == "initial" and self.initial_dice_phase:
             panel_title = "初期設定"
-            panel_subtitle = "人数と盤面を確認して開始"
+            panel_subtitle = "人数・勝利点・盤面を確認して開始"
         elif self.phase == "initial":
             panel_title = "初期配置"
             current_player = self.initial_placement_order[self.initial_player_index]

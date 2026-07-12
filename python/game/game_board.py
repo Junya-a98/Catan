@@ -415,55 +415,100 @@ class GameBoard:
 
     @staticmethod
     def _draw_harbor_dock(screen, harbor):
-        """Give every harbor a small wooden pier on its coastal edge."""
-        start = (round(harbor.node1.x), round(harbor.node1.y))
-        end = (round(harbor.node2.x), round(harbor.node2.y))
+        """Draw a compact pier outside the playable coastal edge.
+
+        Roads may legally occupy the harbor's coastal edge, so the dock must not
+        use that edge as a wooden crossbeam.  Two short piers start just offshore
+        and meet a smaller outward crossbeam; the returned point is where the
+        harbor sign connector should begin.
+        """
+        start = (float(harbor.node1.x), float(harbor.node1.y))
+        end = (float(harbor.node2.x), float(harbor.node2.y))
         dx = end[0] - start[0]
         dy = end[1] - start[1]
         length = max(1.0, math.hypot(dx, dy))
-        normal = (-dy / length, dx / length)
+        axis = (dx / length, dy / length)
+        midpoint = ((start[0] + end[0]) / 2, (start[1] + end[1]) / 2)
 
-        shadow_offset = (2, 3)
+        # Pick the edge normal that points away from the island center.
+        outward = (-axis[1], axis[0])
+        radial = (midpoint[0] - BOARD_CENTER_X, midpoint[1] - BOARD_CENTER_Y)
+        if outward[0] * radial[0] + outward[1] * radial[1] < 0:
+            outward = (-outward[0], -outward[1])
+
+        half_span = min(12.0, length * 0.24)
+        shore_gap = 7.0
+        pier_length = 13.0
+
+        def local_point(along, away):
+            return (
+                round(midpoint[0] + axis[0] * along + outward[0] * away),
+                round(midpoint[1] + axis[1] * along + outward[1] * away),
+            )
+
+        inner_points = (
+            local_point(-half_span, shore_gap),
+            local_point(half_span, shore_gap),
+        )
+        outer_points = (
+            local_point(-half_span, shore_gap + pier_length),
+            local_point(half_span, shore_gap + pier_length),
+        )
+        shadow_shift = (outward[0] * 2 + axis[0], outward[1] * 2 + axis[1])
+
+        def shifted(point, amount=1.0):
+            return (
+                round(point[0] + shadow_shift[0] * amount),
+                round(point[1] + shadow_shift[1] * amount),
+            )
+
+        # Perpendicular pier arms sit entirely outside the road-bearing edge.
+        for along, inner, outer in zip(
+            (-half_span, half_span),
+            inner_points,
+            outer_points,
+        ):
+            pygame.draw.line(screen, (37, 31, 27), shifted(inner), shifted(outer), 9)
+            pygame.draw.line(screen, (70, 49, 33), inner, outer, 8)
+            pygame.draw.line(screen, (158, 105, 59), inner, outer, 5)
+            highlight_start = local_point(
+                along - 1.2,
+                shore_gap + 1.5,
+            )
+            highlight_end = local_point(
+                along - 1.2,
+                shore_gap + pier_length - 1.5,
+            )
+            pygame.draw.line(screen, (230, 176, 103), highlight_start, highlight_end, 1)
+
+        # The crossbeam is offshore rather than on top of a possible road.
         pygame.draw.line(
             screen,
             (37, 31, 27),
-            (start[0] + shadow_offset[0], start[1] + shadow_offset[1]),
-            (end[0] + shadow_offset[0], end[1] + shadow_offset[1]),
-            12,
+            shifted(outer_points[0]),
+            shifted(outer_points[1]),
+            10,
         )
-        pygame.draw.line(screen, (70, 49, 33), start, end, 12)
-        pygame.draw.line(screen, (151, 99, 55), start, end, 8)
-        highlight_offset = (round(normal[0] * -2), round(normal[1] * -2))
-        pygame.draw.line(
-            screen,
-            (225, 169, 98),
-            (start[0] + highlight_offset[0], start[1] + highlight_offset[1]),
-            (end[0] + highlight_offset[0], end[1] + highlight_offset[1]),
-            2,
+        pygame.draw.line(screen, (70, 49, 33), outer_points[0], outer_points[1], 9)
+        pygame.draw.line(screen, (158, 105, 59), outer_points[0], outer_points[1], 6)
+        crossbeam_highlight = tuple(
+            local_point(along, shore_gap + pier_length - 1.5)
+            for along in (-half_span + 1.5, half_span - 1.5)
         )
+        pygame.draw.line(screen, (232, 180, 108), *crossbeam_highlight, 1)
 
-        # Short plank seams make the harbor read as a pier rather than a road.
-        for fraction in (0.28, 0.50, 0.72):
-            x = start[0] + dx * fraction
-            y = start[1] + dy * fraction
-            across = 5
-            pygame.draw.line(
-                screen,
-                (83, 53, 34),
-                (round(x - normal[0] * across), round(y - normal[1] * across)),
-                (round(x + normal[0] * across), round(y + normal[1] * across)),
-                1,
-            )
-
-        for point in (start, end):
-            pygame.draw.circle(screen, (52, 39, 30), (point[0] + 1, point[1] + 2), 5)
+        for point in outer_points:
+            pygame.draw.circle(screen, (52, 39, 30), shifted(point, 0.7), 5)
             pygame.draw.circle(screen, (177, 118, 66), point, 4)
-            pygame.draw.circle(screen, (233, 181, 112), (point[0] - 1, point[1] - 1), 2)
+            post_highlight = (round(point[0] - 1), round(point[1] - 1))
+            pygame.draw.circle(screen, (235, 187, 118), post_highlight, 2)
+
+        return local_point(0, shore_gap + pier_length)
 
     def _draw_harbors(self, screen):
         font = _load_font(17)
         for harbor in self.harbors:
-            self._draw_harbor_dock(screen, harbor)
+            connector_start = self._draw_harbor_dock(screen, harbor)
             midpoint_x = (harbor.node1.x + harbor.node2.x) / 2
             midpoint_y = (harbor.node1.y + harbor.node2.y) / 2
             dx = midpoint_x - BOARD_CENTER_X
@@ -482,14 +527,14 @@ class GameBoard:
             pygame.draw.line(
                 screen,
                 (56, 48, 39),
-                (round(midpoint_x + 2), round(midpoint_y + 3)),
+                (connector_start[0] + 2, connector_start[1] + 3),
                 (round(label_x + 2), round(label_y + 3)),
                 4,
             )
             pygame.draw.line(
                 screen,
                 (218, 188, 136),
-                (round(midpoint_x), round(midpoint_y)),
+                connector_start,
                 (round(label_x), round(label_y)),
                 2,
             )

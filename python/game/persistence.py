@@ -6,6 +6,11 @@ from game.assets import PROJECT_ROOT
 from game.ai import AI_SPEED_OPTIONS
 from game.bank import BANK_RESOURCE_COUNT, RESOURCE_TYPES
 from game.building import Building, BuildingType
+from game.constants import (
+    MAX_VICTORY_POINT_TARGET,
+    MIN_VICTORY_POINT_TARGET,
+    WINNING_VICTORY_POINTS,
+)
 from game.development_cards import DevelopmentCardType
 from game.game_board import GameBoard
 from game.resources import ResourceType
@@ -93,7 +98,11 @@ def _optional_index(value, objects, *, label):
 def _restore_ref(index, objects, *, label, allow_none=True):
     if index is None and allow_none:
         return None
-    if not isinstance(index, int) or not 0 <= index < len(objects):
+    if (
+        isinstance(index, bool)
+        or not isinstance(index, int)
+        or not 0 <= index < len(objects)
+    ):
         raise SaveGameError(f"{label} の参照先が不正です。")
     return objects[index]
 
@@ -143,6 +152,9 @@ def serialize_game(game):
     return {
         "format": SAVE_FORMAT,
         "version": SAVE_VERSION,
+        "rules": {
+            "victory_point_target": int(game.victory_point_target),
+        },
         "board": {
             "mode": game.board_mode,
             "seed": game.board_seed,
@@ -235,6 +247,23 @@ def serialize_game(game):
             "edit_side": game.domestic_trade_edit_side,
             "editor": _optional_index(game.domestic_trade_editor, players, label="交渉編集者"),
             "is_counter": bool(game.domestic_trade_is_counter),
+            "is_broadcast": bool(game.domestic_trade_is_broadcast),
+            "broadcast_responders": [
+                player_indices[player]
+                for player in game.domestic_trade_broadcast_responders
+            ],
+            "broadcast_index": int(game.domestic_trade_broadcast_index),
+            "broadcast_give": _resource_map_to_json(
+                game.domestic_trade_broadcast_give
+            ),
+            "broadcast_receive": _resource_map_to_json(
+                game.domestic_trade_broadcast_receive
+            ),
+            "broadcast_viewer": _optional_index(
+                game.domestic_trade_broadcast_viewer,
+                players,
+                label="募集画面の閲覧者",
+            ),
         },
         "history": {
             "log_messages": list(game.log_messages),
@@ -285,6 +314,19 @@ def restore_game(game, data):
     _validate_save_header(data)
     board_data = data["board"]
     player_data = data["players"]
+    rules_data = data.get("rules", {})
+    if not isinstance(rules_data, dict):
+        raise SaveGameError("ルール設定が不正です。")
+    victory_point_target = rules_data.get(
+        "victory_point_target",
+        WINNING_VICTORY_POINTS,
+    )
+    if (
+        not isinstance(victory_point_target, int)
+        or not MIN_VICTORY_POINT_TARGET <= victory_point_target <= MAX_VICTORY_POINT_TARGET
+    ):
+        raise SaveGameError("勝利点の目標値が不正です。")
+    game.victory_point_target = victory_point_target
 
     game.board_mode = board_data["mode"]
     game.board_seed = board_data["seed"]
@@ -512,6 +554,33 @@ def restore_game(game, data):
         label="交渉編集者",
     )
     game.domestic_trade_is_counter = bool(trade_data.get("is_counter", False))
+    game.domestic_trade_is_broadcast = bool(
+        trade_data.get("is_broadcast", False)
+    )
+    game.domestic_trade_broadcast_responders = _restore_refs(
+        trade_data.get("broadcast_responders", []),
+        players,
+        label="交易募集の回答順",
+    )
+    game.domestic_trade_broadcast_index = trade_data.get(
+        "broadcast_index",
+        -1,
+    )
+    if not isinstance(game.domestic_trade_broadcast_index, int):
+        raise SaveGameError("交易募集の回答位置が不正です。")
+    game.domestic_trade_broadcast_give = _resource_map_from_json(
+        trade_data.get("broadcast_give", {}),
+        label="交易募集の提示",
+    )
+    game.domestic_trade_broadcast_receive = _resource_map_from_json(
+        trade_data.get("broadcast_receive", {}),
+        label="交易募集の要求",
+    )
+    game.domestic_trade_broadcast_viewer = _restore_ref(
+        trade_data.get("broadcast_viewer"),
+        players,
+        label="募集画面の閲覧者",
+    )
 
     log_messages = history_data.get("log_messages", [])
     if not isinstance(log_messages, list) or not all(isinstance(item, str) for item in log_messages):
@@ -563,6 +632,7 @@ def restore_game(game, data):
 
 
 def _validate_restored_game(game):
+    _validate_restored_domestic_trade(game)
     if sum(player.is_ai for player in game.players) != game.ai_player_count:
         raise SaveGameError("AIプレイヤー数と席設定が一致しません。")
     if game.phase == "initial":
@@ -606,6 +676,139 @@ def _validate_restored_game(game):
             raise SaveGameError(f"{player.name} の開拓地コマ数が不正です。")
         if player.cities_remaining + city_count != 4:
             raise SaveGameError(f"{player.name} の都市コマ数が不正です。")
+
+
+def _validate_restored_domestic_trade(game):
+    """Reject inconsistent solicitation state before it can bypass hot-seat privacy."""
+
+    responders = game.domestic_trade_broadcast_responders
+    responder_index = game.domestic_trade_broadcast_index
+    base_give = game.domestic_trade_broadcast_give
+    base_receive = game.domestic_trade_broadcast_receive
+    viewer = game.domestic_trade_broadcast_viewer
+
+    if not game.domestic_trade_is_broadcast:
+        if (
+            responders
+            or responder_index != -1
+            or any(base_give.values())
+            or any(base_receive.values())
+            or viewer is not None
+        ):
+            raise SaveGameError("交易募集の状態が不正です。")
+        return
+
+    active_player = game.get_current_player()
+    expected_responders = game.get_domestic_trade_eligible_partners(active_player)
+    if (
+        game.phase != "main"
+        or not game.dice_rolled
+        or not responders
+        or responders != expected_responders
+        or isinstance(responder_index, bool)
+        or not isinstance(responder_index, int)
+        or not -1 <= responder_index < len(responders)
+    ):
+        raise SaveGameError("交易募集の回答順が不正です。")
+
+    partner = game.domestic_trade_partner
+    editor = game.domestic_trade_editor
+    is_counter = game.domestic_trade_is_counter
+    special_phase = game.special_phase
+
+    if responder_index == -1:
+        if (
+            special_phase != "domestic_trade_edit"
+            or partner is not None
+            or is_counter
+            or editor is not active_player
+            or viewer is not active_player
+            or any(base_give.values())
+            or any(base_receive.values())
+        ):
+            raise SaveGameError("交易募集の編集状態が不正です。")
+        return
+
+    if partner is not responders[responder_index]:
+        raise SaveGameError("交易募集の現在回答者が不正です。")
+    if (
+        sum(base_give.values()) <= 0
+        or sum(base_receive.values()) <= 0
+        or any(
+            base_give[resource_type] > 0
+            and base_receive[resource_type] > 0
+            for resource_type in RESOURCE_TYPES
+        )
+        or not game.player_can_pay_bundle(active_player, base_give)
+    ):
+        raise SaveGameError("交易募集の基本条件が不正です。")
+
+    if not is_counter and (
+        game.domestic_trade_give != base_give
+        or game.domestic_trade_receive != base_receive
+    ):
+        raise SaveGameError("交易募集の提示条件が不正です。")
+
+    previous_human_viewers = [active_player] + [
+        candidate
+        for candidate in responders[:responder_index]
+        if not candidate.is_ai
+    ]
+    if special_phase == "domestic_trade_handoff":
+        valid = (
+            not partner.is_ai
+            and not is_counter
+            and editor is active_player
+            and viewer in previous_human_viewers
+        )
+    elif special_phase == "domestic_trade_response":
+        valid = (
+            not partner.is_ai
+            and not is_counter
+            and editor is active_player
+            and viewer is partner
+        )
+    elif special_phase == "domestic_trade_edit":
+        valid = (
+            not partner.is_ai
+            and is_counter
+            and editor is partner
+            and viewer is partner
+        )
+    elif special_phase == "domestic_trade_counter_handoff":
+        valid = (
+            not partner.is_ai
+            and is_counter
+            and editor is partner
+            and viewer is partner
+        )
+    elif special_phase == "domestic_trade_counter_response":
+        expected_editor = active_player if partner.is_ai else partner
+        valid = (
+            is_counter
+            and editor is expected_editor
+            and viewer is active_player
+        )
+    elif special_phase == "player_handoff":
+        valid = (
+            partner.is_ai
+            and is_counter
+            and editor is active_player
+            and game.handoff_player is active_player
+            and game.handoff_return_phase == "domestic_trade_counter_response"
+            and viewer in previous_human_viewers[1:]
+        )
+    else:
+        valid = False
+
+    if not valid:
+        raise SaveGameError("交易募集の画面交代状態が不正です。")
+
+    if is_counter and not game.player_can_pay_bundle(
+        partner,
+        game.domestic_trade_receive,
+    ):
+        raise SaveGameError("交易募集の条件変更が回答者の手札を超えています。")
 
 
 def save_game(game, path=DEFAULT_SAVE_PATH):

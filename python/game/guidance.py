@@ -12,6 +12,7 @@ class GuidanceState:
     dice_rolled: bool
     action_mode: Optional[str]
     show_seed_input_hint: bool = False
+    victory_point_target: int = 10
     discard_player_name: Optional[str] = None
     discard_remaining: int = 0
     resource_selection_remaining: int = 0
@@ -109,7 +110,10 @@ def build_side_panel_guidance(state: GuidanceState, action_mode_guidance, highli
     if state.phase == "initial" and state.initial_dice_phase:
         if state.show_seed_input_hint:
             return ["次: seed を入力して Enter で反映", "再生成ボタンで新しい盤面も作れます。"]
-        return ["次: 人数・AI・盤面を確認して初期ダイスを振る", "最高点の同点だけ自動で再ロールされます。"]
+        return [
+            "次: 設定を確認して初期ダイスを振る",
+            f"人数・AI・勝利{state.victory_point_target}点・盤面を確認してください。",
+        ]
 
     if state.phase == "initial":
         if state.waiting_for_road:

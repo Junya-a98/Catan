@@ -202,6 +202,7 @@ def draw_resource_counts(
     reveal_all=False,
     current_player=None,
     public_gain_by_player=None,
+    victory_point_target=None,
 ):
     if not players:
         return
@@ -246,7 +247,12 @@ def draw_resource_counts(
         screen.blit(name_surface, (card_rect.x + 18, card_rect.y + 10))
 
         vp_value = points_by_player.get(player.name, 0) if points_by_player is not None else 0
-        vp_surface = title_font.render(f"VP {vp_value}", True, (255, 236, 178))
+        vp_label = (
+            f"VP {vp_value}/{victory_point_target}"
+            if victory_point_target is not None
+            else f"VP {vp_value}"
+        )
+        vp_surface = title_font.render(vp_label, True, (255, 236, 178))
         screen.blit(vp_surface, (card_rect.right - vp_surface.get_width() - 16, card_rect.y + 10))
 
         show_resource_types = reveal_all or player is visible_player
