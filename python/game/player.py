@@ -2,9 +2,12 @@ from game.development_cards import DevelopmentCardType
 from game.resources import ResourceType
 
 class Player:
-    def __init__(self, name, color):
+    def __init__(self, name, color, *, is_ai=False, piece_pattern=0, marker="●"):
         self.name = name
         self.color = color  # 建物表示用の色
+        self.is_ai = is_ai
+        self.piece_pattern = piece_pattern
+        self.marker = marker
         self.roads_remaining = 15
         self.settlements_remaining = 5
         self.cities_remaining = 4

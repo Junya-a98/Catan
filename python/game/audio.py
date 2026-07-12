@@ -28,10 +28,13 @@ class GameAudio:
                 ),
                 "error": self._create_note_sequence([(233.08, 0.05, 0.18), (207.65, 0.09, 0.15)]),
             }
-        except pygame.error:
-            self.enabled = False
-            self.bgm_channel = None
-            self.sounds = {}
+        except Exception:
+            self._disable()
+
+    def _disable(self):
+        self.enabled = False
+        self.bgm_channel = None
+        self.sounds = {}
 
     def _tone_samples(self, frequency, duration, volume=0.2):
         sample_count = max(1, int(self.sample_rate * duration))
@@ -83,13 +86,16 @@ class GameAudio:
     def start_bgm(self):
         if not self.enabled or self.bgm_channel is None:
             return
-        if self.bgm_channel.get_busy():
-            return
-        bgm_sound = self.sounds.get("bgm")
-        if bgm_sound is None:
-            return
-        self.bgm_channel.set_volume(0.35)
-        self.bgm_channel.play(bgm_sound, loops=-1)
+        try:
+            if self.bgm_channel.get_busy():
+                return
+            bgm_sound = self.sounds.get("bgm")
+            if bgm_sound is None:
+                return
+            self.bgm_channel.set_volume(0.35)
+            self.bgm_channel.play(bgm_sound, loops=-1)
+        except Exception:
+            self._disable()
 
     def play(self, name):
         if not self.enabled:
@@ -97,12 +103,18 @@ class GameAudio:
         sound = self.sounds.get(name)
         if sound is None:
             return
-        channel = pygame.mixer.find_channel()
-        if channel is None:
-            return
-        channel.play(sound)
+        try:
+            channel = pygame.mixer.find_channel()
+            if channel is None:
+                return
+            channel.play(sound)
+        except Exception:
+            self._disable()
 
     def stop(self):
         if not self.enabled:
             return
-        pygame.mixer.stop()
+        try:
+            pygame.mixer.stop()
+        except Exception:
+            self._disable()

@@ -26,13 +26,13 @@ def test_initial_dice_tie_triggers_reroll_for_tied_players_only():
         game.resolve_initial_key_roll(9)
 
         assert game.initial_dice_phase is False
-        assert [player.name for player in game.turn_order] == ["Player2", "Player1", "Player3", "Player4"]
+        assert [player.name for player in game.turn_order] == ["Player2", "Player3", "Player4", "Player1"]
     finally:
         game.audio.stop()
         pygame.quit()
 
 
-def test_initial_dice_resolves_multiple_tie_groups_in_order():
+def test_initial_dice_ignores_lower_place_ties_once_starting_player_is_known():
     pygame.init()
     pygame.display.set_mode((1, 1))
     game = CatanGame()
@@ -46,11 +46,6 @@ def test_initial_dice_resolves_multiple_tie_groups_in_order():
 
         game.resolve_initial_key_roll(5)
         game.resolve_initial_key_roll(3)
-
-        assert [player.name for player in game.initial_dice_contenders] == ["Player3", "Player4"]
-
-        game.resolve_initial_key_roll(4)
-        game.resolve_initial_key_roll(2)
 
         assert game.initial_dice_phase is False
         assert [player.name for player in game.turn_order] == ["Player1", "Player2", "Player3", "Player4"]

@@ -1,86 +1,127 @@
-import io
-import os
-import zipfile
-
 import pygame
 
+from game.assets import get_font
 from game.constants import BOARD_CENTER_X, BOARD_CENTER_Y, COLORS, SCREEN_HEIGHT, SCREEN_WIDTH
 
 
-ASSET_ZIP_PATH = "material/d12_pygame_assets.zip"
-FONT_PATH = "Noto_Sans_JP/NotoSansJP-VariableFont_wght.ttf"
-DISPLAY_SIZE = 188
+DIE_SIZE = 96
+DICE_GAP = 24
 ROLL_DURATION_MS = 900
 RESULT_HOLD_MS = 650
 FRAME_TIME_MS = 45
 
+ROLL_FRAME_VALUES = [
+    (1, 5),
+    (6, 2),
+    (3, 4),
+    (5, 6),
+    (2, 1),
+    (4, 3),
+    (6, 6),
+    (1, 2),
+    (5, 4),
+    (3, 1),
+    (2, 6),
+    (4, 5),
+    (6, 3),
+    (1, 4),
+    (5, 2),
+    (3, 6),
+    (2, 5),
+    (4, 1),
+    (6, 4),
+    (1, 3),
+    (5, 1),
+    (2, 4),
+    (3, 5),
+    (4, 6),
+]
+
+PIP_LAYOUTS = {
+    1: [(0, 0)],
+    2: [(-1, -1), (1, 1)],
+    3: [(-1, -1), (0, 0), (1, 1)],
+    4: [(-1, -1), (1, -1), (-1, 1), (1, 1)],
+    5: [(-1, -1), (1, -1), (0, 0), (-1, 1), (1, 1)],
+    6: [(-1, -1), (1, -1), (-1, 0), (1, 0), (-1, 1), (1, 1)],
+}
+
 
 def _load_font(size):
-    try:
-        return pygame.font.Font(FONT_PATH, size)
-    except Exception:
-        return pygame.font.Font(None, size)
+    return get_font(size)
+
+
+def _draw_die(surface, value):
+    rect = surface.get_rect()
+    pygame.draw.rect(surface, (248, 250, 252), rect, border_radius=20)
+    pygame.draw.rect(surface, COLORS["PANEL_BORDER"], rect, 3, border_radius=20)
+
+    center_x = rect.width // 2
+    center_y = rect.height // 2
+    offset = 22
+    pip_radius = 6
+    pip_color = (24, 32, 42)
+
+    for dx, dy in PIP_LAYOUTS[value]:
+        pygame.draw.circle(
+            surface,
+            pip_color,
+            (center_x + dx * offset, center_y + dy * offset),
+            pip_radius,
+        )
+
+
+def _compose_dice_surface(left_value, right_value):
+    width = DIE_SIZE * 2 + DICE_GAP
+    height = DIE_SIZE
+    surface = pygame.Surface((width, height), pygame.SRCALPHA)
+
+    left_surface = pygame.Surface((DIE_SIZE, DIE_SIZE), pygame.SRCALPHA)
+    right_surface = pygame.Surface((DIE_SIZE, DIE_SIZE), pygame.SRCALPHA)
+    _draw_die(left_surface, left_value)
+    _draw_die(right_surface, right_value)
+
+    surface.blit(left_surface, (0, 0))
+    surface.blit(right_surface, (DIE_SIZE + DICE_GAP, 0))
+    return surface
 
 
 class DiceAnimationOverlay:
-    def __init__(self, asset_zip_path=ASSET_ZIP_PATH):
-        self.asset_zip_path = asset_zip_path
-        self.available = False
-        self.idle_image = None
-        self.shadow_image = None
-        self.face_images = {}
-        self.roll_frames = []
+    def __init__(self):
+        self.available = True
+        self.face_images = {value: self._build_die_face(value) for value in range(1, 7)}
+        self.roll_frames = [_compose_dice_surface(left, right) for left, right in ROLL_FRAME_VALUES]
+        self.shadow_image = self._build_shadow()
         self.state = "idle"
-        self.result = None
+        self.result_values = (1, 1)
+        self.result_total = 2
         self.title = ""
         self.subtitle = ""
         self.roll_started_at = 0
         self.result_started_at = 0
-        self._load_assets()
 
     @property
     def is_active(self):
         return self.state != "idle"
 
-    def _load_assets(self):
-        if not os.path.exists(self.asset_zip_path):
-            return
+    def _build_die_face(self, value):
+        surface = pygame.Surface((DIE_SIZE, DIE_SIZE), pygame.SRCALPHA)
+        _draw_die(surface, value)
+        return surface
 
-        try:
-            with zipfile.ZipFile(self.asset_zip_path) as asset_zip:
-                self.idle_image = self._load_scaled_image(asset_zip, "d12_idle.png")
-                self.shadow_image = self._load_shadow(asset_zip)
-                self.roll_frames = [
-                    self._load_scaled_image(asset_zip, f"roll/d12_roll_{index:02d}.png")
-                    for index in range(24)
-                ]
-                self.face_images = {
-                    index: self._load_scaled_image(asset_zip, f"faces/d12_face_{index:02d}.png")
-                    for index in range(1, 13)
-                }
-        except (OSError, zipfile.BadZipFile, pygame.error) as error:
-            print("ダイス素材の読み込みに失敗:", error)
-            self.idle_image = None
-            self.shadow_image = None
-            self.roll_frames = []
-            self.face_images = {}
-            self.available = False
-            return
+    def _build_shadow(self):
+        width = DIE_SIZE * 2 + DICE_GAP + 28
+        height = DIE_SIZE + 24
+        surface = pygame.Surface((width, height), pygame.SRCALPHA)
+        pygame.draw.ellipse(surface, (0, 0, 0, 72), pygame.Rect(0, 8, width, height - 8))
+        return surface
 
-        self.available = bool(self.roll_frames and self.face_images)
+    def start(self, result_values, title, subtitle=""):
+        if isinstance(result_values, int):
+            result_values = (max(1, min(6, result_values - 1)), 1)
 
-    def _load_scaled_image(self, asset_zip, member_name):
-        raw_bytes = asset_zip.read(member_name)
-        image = pygame.image.load(io.BytesIO(raw_bytes), member_name).convert_alpha()
-        return pygame.transform.smoothscale(image, (DISPLAY_SIZE, DISPLAY_SIZE))
-
-    def _load_shadow(self, asset_zip):
-        raw_bytes = asset_zip.read("d12_shadow.png")
-        image = pygame.image.load(io.BytesIO(raw_bytes), "d12_shadow.png").convert_alpha()
-        return pygame.transform.smoothscale(image, (DISPLAY_SIZE + 18, DISPLAY_SIZE + 18))
-
-    def start(self, result, title, subtitle=""):
-        self.result = result
+        self.result_values = tuple(result_values)
+        self.result_total = sum(self.result_values)
         self.title = title
         self.subtitle = subtitle
         self.roll_started_at = pygame.time.get_ticks()
@@ -111,7 +152,7 @@ class DiceAnimationOverlay:
         overlay.fill((5, 10, 18, 110))
         screen.blit(overlay, (0, 0))
 
-        panel_rect = pygame.Rect(0, 0, 320, 312)
+        panel_rect = pygame.Rect(0, 0, 360, 320)
         panel_rect.center = (BOARD_CENTER_X, BOARD_CENTER_Y + 8)
         panel_surface = pygame.Surface(panel_rect.size, pygame.SRCALPHA)
         pygame.draw.rect(panel_surface, (*COLORS["PANEL_BG"], 238), panel_surface.get_rect(), border_radius=26)
@@ -119,20 +160,16 @@ class DiceAnimationOverlay:
         screen.blit(panel_surface, panel_rect.topleft)
 
         image = self._get_current_image()
-        shadow = self.shadow_image if self.shadow_image is not None else None
-        image_rect = image.get_rect(center=(panel_rect.centerx, panel_rect.centery + 18))
+        shadow_rect = self.shadow_image.get_rect(center=(panel_rect.centerx, panel_rect.centery + 72))
+        screen.blit(self.shadow_image, shadow_rect)
 
-        if shadow is not None:
-            shadow_rect = shadow.get_rect(center=(image_rect.centerx, image_rect.centery + 78))
-            shadow_surface = shadow.copy()
-            shadow_surface.set_alpha(150)
-            screen.blit(shadow_surface, shadow_rect)
-
+        image_rect = image.get_rect(center=(panel_rect.centerx, panel_rect.centery + 8))
         screen.blit(image, image_rect)
 
         title_font = _load_font(28)
         subtitle_font = _load_font(18)
-        result_font = _load_font(22)
+        total_font = _load_font(30)
+        detail_font = _load_font(18)
 
         title_surface = title_font.render(self.title, True, COLORS["WHITE"])
         screen.blit(title_surface, title_surface.get_rect(center=(panel_rect.centerx, panel_rect.y + 34)))
@@ -141,34 +178,24 @@ class DiceAnimationOverlay:
             subtitle_surface = subtitle_font.render(self.subtitle, True, COLORS["TEXT_MUTED"])
             screen.blit(subtitle_surface, subtitle_surface.get_rect(center=(panel_rect.centerx, panel_rect.y + 68)))
 
+        total_surface = total_font.render(f"合計 {self.result_total}", True, (255, 225, 165))
+        screen.blit(total_surface, total_surface.get_rect(center=(panel_rect.centerx, panel_rect.bottom - 56)))
+
+        detail_text = f"{self.result_values[0]} + {self.result_values[1]}"
         if self.state == "rolling":
-            footer_text = "ダイスを振っています..."
-            footer_color = (235, 240, 250)
-        else:
-            footer_text = f"結果: {self.result}"
-            footer_color = (255, 225, 165)
-        footer_surface = result_font.render(footer_text, True, footer_color)
-        screen.blit(footer_surface, footer_surface.get_rect(center=(panel_rect.centerx, panel_rect.bottom - 28)))
+            detail_text = "2d6 を振っています..."
+        detail_surface = detail_font.render(detail_text, True, (235, 240, 250))
+        screen.blit(detail_surface, detail_surface.get_rect(center=(panel_rect.centerx, panel_rect.bottom - 26)))
 
     def _get_current_image(self):
-        if not self.available:
-            return self._build_fallback_surface()
-
         if self.state == "rolling":
             elapsed = pygame.time.get_ticks() - self.roll_started_at
             frame_index = int((elapsed / FRAME_TIME_MS) % len(self.roll_frames))
             return self.roll_frames[frame_index]
 
-        if self.state == "result":
-            return self.face_images.get(self.result, self.idle_image)
-
-        return self.idle_image
-
-    def _build_fallback_surface(self):
-        surface = pygame.Surface((DISPLAY_SIZE, DISPLAY_SIZE), pygame.SRCALPHA)
-        pygame.draw.circle(surface, (230, 236, 244), (DISPLAY_SIZE // 2, DISPLAY_SIZE // 2), DISPLAY_SIZE // 2 - 8)
-        pygame.draw.circle(surface, COLORS["PANEL_BORDER"], (DISPLAY_SIZE // 2, DISPLAY_SIZE // 2), DISPLAY_SIZE // 2 - 8, 4)
-        font = _load_font(46)
-        text = font.render(str(self.result or "?"), True, COLORS["BLACK"])
-        surface.blit(text, text.get_rect(center=(DISPLAY_SIZE // 2, DISPLAY_SIZE // 2)))
+        left_surface = self.face_images[self.result_values[0]]
+        right_surface = self.face_images[self.result_values[1]]
+        surface = pygame.Surface((DIE_SIZE * 2 + DICE_GAP, DIE_SIZE), pygame.SRCALPHA)
+        surface.blit(left_surface, (0, 0))
+        surface.blit(right_surface, (DIE_SIZE + DICE_GAP, 0))
         return surface

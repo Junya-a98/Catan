@@ -3,26 +3,48 @@ import random
 
 import pygame
 
-from game.building import BuildingType
-from game.constants import BOARD_CENTER_X, BOARD_CENTER_Y, COLORS, HEX_RADIUS
+from game.assets import get_font
+from game.constants import (
+    BOARD_CENTER_X,
+    BOARD_CENTER_Y,
+    COLORS,
+    HEX_RADIUS,
+    LOG_PANEL_WIDTH,
+    SCREEN_HEIGHT,
+    SIDE_PANEL_X,
+)
 from game.harbor import Harbor
-from game.hex_tile import HexTile
+from game.hex_tile import HexTile, get_token_pip_count
 from game.node import Node
-from game.resources import ResourceType
+from game.resources import RESOURCE_COLORS, ResourceType
 
 
-FONT_PATH = "Noto_Sans_JP/NotoSansJP-VariableFont_wght.ttf"
+HEX_DIRECTIONS = (
+    (1, 0),
+    (1, -1),
+    (0, -1),
+    (-1, 0),
+    (-1, 1),
+    (0, 1),
+)
+CONSTRAINED_NUMBER_ATTEMPTS = 8000
+CONSTRAINED_HARBOR_ATTEMPTS = 500
 
 
 def _load_font(size):
-    try:
-        return pygame.font.Font(FONT_PATH, size)
-    except Exception:
-        return pygame.font.Font(None, size)
+    return get_font(size)
 
 
 class GameBoard:
-    def __init__(self):
+    def __init__(self, mode="constrained", seed=None):
+        if mode == "balanced":
+            mode = "constrained"
+        if mode not in ("constrained", "fully_random"):
+            raise ValueError(f"Unsupported board mode: {mode}")
+
+        self.mode = mode
+        self.seed = seed
+        self.rng = random.Random(seed)
         self.roads = []
         self.tiles = []
         self.nodes = []
@@ -33,16 +55,8 @@ class GameBoard:
         self.setup_board()
 
     def setup_board(self):
-        resources = [ResourceType.DESERT]
-        for resource in [res for res in ResourceType if res != ResourceType.DESERT]:
-            if resource in (ResourceType.BRICK, ResourceType.ORE):
-                resources.extend([resource] * 3)
-            else:
-                resources.extend([resource] * 4)
-        random.shuffle(resources)
-
-        numbers = [2, 3, 3, 4, 4, 5, 5, 6, 6, 8, 8, 9, 9, 10, 10, 11, 11, 12]
-        random.shuffle(numbers)
+        resources = self._build_resource_pool()
+        self.rng.shuffle(resources)
 
         axial_coords = []
         radius = 2
@@ -56,16 +70,128 @@ class GameBoard:
         for q, r in axial_coords:
             x, y = self.axial_to_pixel(q, r)
             resource = resources.pop(0)
-            number = None if resource == ResourceType.DESERT else numbers.pop(0)
-            tile = HexTile(x, y, resource, number)
+            tile = HexTile(x, y, resource, None)
             tile.axial = (q, r)
             self.tiles.append(tile)
             if resource == ResourceType.DESERT:
                 self.robber_tile = tile
 
+        self._assign_numbers()
         self._create_nodes_for_tiles()
         self._create_edges()
         self._create_harbors()
+
+    def _build_resource_pool(self):
+        resources = [ResourceType.DESERT]
+        for resource in [res for res in ResourceType if res != ResourceType.DESERT]:
+            if resource in (ResourceType.BRICK, ResourceType.ORE):
+                resources.extend([resource] * 3)
+            else:
+                resources.extend([resource] * 4)
+        return resources
+
+    def _build_number_pool(self):
+        return [2, 3, 3, 4, 4, 5, 5, 6, 6, 8, 8, 9, 9, 10, 10, 11, 11, 12]
+
+    def _assign_numbers(self):
+        land_tiles = [tile for tile in self.tiles if tile.resource_type != ResourceType.DESERT]
+        numbers = self._build_number_pool()
+        adjacency = self._get_tile_adjacency()
+
+        if self.mode == "fully_random":
+            candidate = numbers[:]
+            for _ in range(CONSTRAINED_NUMBER_ATTEMPTS):
+                self.rng.shuffle(candidate)
+                assignment = {tile: number for tile, number in zip(land_tiles, candidate)}
+                if not self._has_adjacent_red_numbers(assignment, adjacency):
+                    break
+            for tile, number in zip(land_tiles, candidate):
+                tile.number = number
+            return
+
+        best_numbers = None
+        best_score = None
+
+        for _ in range(CONSTRAINED_NUMBER_ATTEMPTS):
+            candidate = numbers[:]
+            self.rng.shuffle(candidate)
+            assignment = {tile: number for tile, number in zip(land_tiles, candidate)}
+            score = self._score_number_assignment(assignment, adjacency)
+            if best_score is None or score < best_score:
+                best_score = score
+                best_numbers = candidate[:]
+            if score == 0:
+                best_numbers = candidate[:]
+                break
+
+        for tile, number in zip(land_tiles, best_numbers):
+            tile.number = number
+
+    def _has_adjacent_red_numbers(self, assignment, adjacency):
+        for tile, number in assignment.items():
+            if number not in (6, 8):
+                continue
+            if any(assignment.get(neighbor) in (6, 8) for neighbor in adjacency[tile]):
+                return True
+        return False
+
+    def _get_tile_adjacency(self):
+        by_coord = {tile.axial: tile for tile in self.tiles}
+        adjacency = {tile: [] for tile in self.tiles}
+        for tile in self.tiles:
+            q, r = tile.axial
+            for dq, dr in HEX_DIRECTIONS:
+                neighbor = by_coord.get((q + dq, r + dr))
+                if neighbor is not None:
+                    adjacency[tile].append(neighbor)
+        return adjacency
+
+    def _score_number_assignment(self, assignment, adjacency):
+        high_numbers = {6, 8}
+        score = 0
+
+        for tile, number in assignment.items():
+            if number not in high_numbers:
+                continue
+            for neighbor in adjacency[tile]:
+                neighbor_number = assignment.get(neighbor)
+                if neighbor_number in high_numbers and tile.axial < neighbor.axial:
+                    score += 1000
+
+        high_number_resources = {}
+        for tile, number in assignment.items():
+            if number in high_numbers:
+                high_number_resources[tile.resource_type] = high_number_resources.get(tile.resource_type, 0) + 1
+        for count in high_number_resources.values():
+            if count > 1:
+                score += (count - 1) * 1800
+
+        resource_pips = {}
+        for tile, number in assignment.items():
+            resource_pips.setdefault(tile.resource_type, []).append(get_token_pip_count(number))
+
+        total_pips = sum(get_token_pip_count(number) for number in assignment.values())
+        average_pips_per_tile = total_pips / max(1, len(assignment))
+        for resource_type, pip_values in resource_pips.items():
+            expected_total = len(pip_values) * average_pips_per_tile
+            actual_total = sum(pip_values)
+            score += int((actual_total - expected_total) ** 2 * 5)
+
+            strongest_two = sorted(pip_values, reverse=True)[:2]
+            if sum(strongest_two) > 8:
+                score += (sum(strongest_two) - 8) * 36
+            if pip_values.count(5) > 1:
+                score += (pip_values.count(5) - 1) * 1800
+
+        for tile, number in assignment.items():
+            for neighbor in adjacency[tile]:
+                if tile.axial >= neighbor.axial or neighbor not in assignment:
+                    continue
+                combined_pips = get_token_pip_count(number) + get_token_pip_count(assignment[neighbor])
+                if combined_pips > 8:
+                    score += (combined_pips - 8) * 4
+
+        return score
 
     def axial_to_pixel(self, q, r):
         x = BOARD_CENTER_X + math.sqrt(3) * HEX_RADIUS * (q + r / 2)
@@ -129,7 +255,6 @@ class GameBoard:
             ResourceType.BRICK,
             ResourceType.ORE,
         ]
-        random.shuffle(harbor_types)
 
         sorted_edges = sorted(
             self.perimeter_edges,
@@ -147,13 +272,102 @@ class GameBoard:
                 candidate = (candidate + 1) % edge_count
             used_indices.append(candidate)
 
+        selected_edges = [sorted_edges[index] for index in sorted(used_indices)]
+        harbor_types = self._select_harbor_types(harbor_types, selected_edges)
+
         self.harbors = []
-        for harbor_type, edge_index in zip(harbor_types, sorted(used_indices)):
-            node1, node2 = sorted_edges[edge_index]
+        for harbor_type, (node1, node2) in zip(harbor_types, selected_edges):
             harbor = Harbor(node1, node2, 3 if harbor_type is None else 2, harbor_type)
             self.harbors.append(harbor)
             node1.harbors.append(harbor)
             node2.harbors.append(harbor)
+
+    def _select_harbor_types(self, harbor_types, selected_edges):
+        if self.mode == "fully_random":
+            self.rng.shuffle(harbor_types)
+            return harbor_types
+
+        best_layout = None
+        best_score = None
+        for _ in range(CONSTRAINED_HARBOR_ATTEMPTS):
+            candidate = harbor_types[:]
+            self.rng.shuffle(candidate)
+            score = self._score_harbor_assignment(candidate, selected_edges)
+            if best_score is None or score < best_score:
+                best_score = score
+                best_layout = candidate[:]
+            if score == 0:
+                break
+        return best_layout
+
+    def _score_harbor_assignment(self, harbor_types, selected_edges):
+        score = 0
+        for harbor_type, edge in zip(harbor_types, selected_edges):
+            adjacent_tiles = self.get_edge_adjacent_tiles(edge)
+            if harbor_type is None:
+                generic_pips = sum(
+                    get_token_pip_count(tile.number)
+                    for tile in adjacent_tiles
+                    if tile.number is not None
+                )
+                if generic_pips > 8:
+                    score += (generic_pips - 8) * 2
+                continue
+
+            matching_tiles = [
+                tile
+                for tile in adjacent_tiles
+                if tile.resource_type == harbor_type and tile.number is not None
+            ]
+            match_pips = sum(get_token_pip_count(tile.number) for tile in matching_tiles)
+            score += match_pips * 24
+            score += sum(900 for tile in matching_tiles if tile.number in (6, 8))
+
+        return score
+
+    def get_edge_adjacent_tiles(self, edge):
+        node1, node2 = edge
+        adjacent_tiles = []
+        for tile in node1.tiles:
+            if tile in node2.tiles and tile.resource_type != ResourceType.DESERT:
+                adjacent_tiles.append(tile)
+        return adjacent_tiles
+
+    def get_resource_high_number_counts(self):
+        counts = {
+            ResourceType.WOOD: 0,
+            ResourceType.SHEEP: 0,
+            ResourceType.WHEAT: 0,
+            ResourceType.BRICK: 0,
+            ResourceType.ORE: 0,
+        }
+        for tile in self.tiles:
+            if tile.resource_type == ResourceType.DESERT or tile.number not in (6, 8):
+                continue
+            counts[tile.resource_type] += 1
+        return counts
+
+    def get_resource_pip_totals(self):
+        totals = {
+            ResourceType.WOOD: 0,
+            ResourceType.SHEEP: 0,
+            ResourceType.WHEAT: 0,
+            ResourceType.BRICK: 0,
+            ResourceType.ORE: 0,
+        }
+        for tile in self.tiles:
+            if tile.resource_type == ResourceType.DESERT or tile.number is None:
+                continue
+            totals[tile.resource_type] += get_token_pip_count(tile.number)
+        return totals
+
+    def harbor_matches_high_value_tile(self, harbor):
+        if harbor.resource_type is None:
+            return False
+        return any(
+            tile.resource_type == harbor.resource_type and tile.number in (6, 8)
+            for tile in self.get_edge_adjacent_tiles((harbor.node1, harbor.node2))
+        )
 
     def get_player_trade_rates(self, player):
         rates = {
@@ -186,9 +400,70 @@ class GameBoard:
             for edge_node1, edge_node2 in self.edges
         )
 
+    def _get_harbor_badge_rect(self, text_surface, position):
+        safe_badge_area = pygame.Rect(
+            LOG_PANEL_WIDTH + 20,
+            12,
+            SIDE_PANEL_X - LOG_PANEL_WIDTH - 32,
+            SCREEN_HEIGHT - 226,
+        )
+        badge_rect = text_surface.get_rect()
+        badge_rect.inflate_ip(30, 16)
+        badge_rect.center = (int(position[0]), int(position[1]))
+        badge_rect.clamp_ip(safe_badge_area)
+        return badge_rect
+
+    @staticmethod
+    def _draw_harbor_dock(screen, harbor):
+        """Give every harbor a small wooden pier on its coastal edge."""
+        start = (round(harbor.node1.x), round(harbor.node1.y))
+        end = (round(harbor.node2.x), round(harbor.node2.y))
+        dx = end[0] - start[0]
+        dy = end[1] - start[1]
+        length = max(1.0, math.hypot(dx, dy))
+        normal = (-dy / length, dx / length)
+
+        shadow_offset = (2, 3)
+        pygame.draw.line(
+            screen,
+            (37, 31, 27),
+            (start[0] + shadow_offset[0], start[1] + shadow_offset[1]),
+            (end[0] + shadow_offset[0], end[1] + shadow_offset[1]),
+            12,
+        )
+        pygame.draw.line(screen, (70, 49, 33), start, end, 12)
+        pygame.draw.line(screen, (151, 99, 55), start, end, 8)
+        highlight_offset = (round(normal[0] * -2), round(normal[1] * -2))
+        pygame.draw.line(
+            screen,
+            (225, 169, 98),
+            (start[0] + highlight_offset[0], start[1] + highlight_offset[1]),
+            (end[0] + highlight_offset[0], end[1] + highlight_offset[1]),
+            2,
+        )
+
+        # Short plank seams make the harbor read as a pier rather than a road.
+        for fraction in (0.28, 0.50, 0.72):
+            x = start[0] + dx * fraction
+            y = start[1] + dy * fraction
+            across = 5
+            pygame.draw.line(
+                screen,
+                (83, 53, 34),
+                (round(x - normal[0] * across), round(y - normal[1] * across)),
+                (round(x + normal[0] * across), round(y + normal[1] * across)),
+                1,
+            )
+
+        for point in (start, end):
+            pygame.draw.circle(screen, (52, 39, 30), (point[0] + 1, point[1] + 2), 5)
+            pygame.draw.circle(screen, (177, 118, 66), point, 4)
+            pygame.draw.circle(screen, (233, 181, 112), (point[0] - 1, point[1] - 1), 2)
+
     def _draw_harbors(self, screen):
         font = _load_font(17)
         for harbor in self.harbors:
+            self._draw_harbor_dock(screen, harbor)
             midpoint_x = (harbor.node1.x + harbor.node2.x) / 2
             midpoint_y = (harbor.node1.y + harbor.node2.y) / 2
             dx = midpoint_x - BOARD_CENTER_X
@@ -199,20 +474,52 @@ class GameBoard:
             label_x = midpoint_x + offset_x
             label_y = midpoint_y + offset_y
 
-            pygame.draw.line(
-                screen,
-                (180, 210, 230),
-                (midpoint_x, midpoint_y),
-                (label_x, label_y),
-                3,
-            )
             label = harbor.label
             text_surface = font.render(label, True, COLORS["BLACK"])
-            badge_rect = text_surface.get_rect()
-            badge_rect.inflate_ip(22, 14)
-            badge_rect.center = (int(label_x), int(label_y))
-            pygame.draw.rect(screen, (228, 240, 246), badge_rect, border_radius=10)
-            pygame.draw.rect(screen, (70, 95, 116), badge_rect, 2, border_radius=10)
+            badge_rect = self._get_harbor_badge_rect(text_surface, (label_x, label_y))
+            label_x, label_y = badge_rect.center
+
+            pygame.draw.line(
+                screen,
+                (56, 48, 39),
+                (round(midpoint_x + 2), round(midpoint_y + 3)),
+                (round(label_x + 2), round(label_y + 3)),
+                4,
+            )
+            pygame.draw.line(
+                screen,
+                (218, 188, 136),
+                (round(midpoint_x), round(midpoint_y)),
+                (round(label_x), round(label_y)),
+                2,
+            )
+
+            shadow_rect = badge_rect.move(3, 4)
+            pygame.draw.rect(screen, (43, 35, 29), shadow_rect, border_radius=8)
+            pygame.draw.rect(screen, (218, 181, 119), badge_rect, border_radius=8)
+            inner_rect = badge_rect.inflate(-4, -4)
+            pygame.draw.rect(screen, (238, 211, 159), inner_rect, border_radius=6)
+            pygame.draw.line(
+                screen,
+                (255, 236, 193),
+                (inner_rect.left + 7, inner_rect.top + 3),
+                (inner_rect.right - 7, inner_rect.top + 3),
+                2,
+            )
+            pygame.draw.rect(screen, (83, 58, 39), badge_rect, 2, border_radius=8)
+
+            accent_color = (95, 145, 178)
+            if harbor.resource_type is not None:
+                raw_color = RESOURCE_COLORS[harbor.resource_type]
+                accent_color = tuple((channel * 2 + 170) // 3 for channel in raw_color)
+            accent_rect = pygame.Rect(
+                badge_rect.left + 5,
+                badge_rect.top + 5,
+                7,
+                badge_rect.height - 10,
+            )
+            pygame.draw.rect(screen, accent_color, accent_rect, border_radius=3)
+            pygame.draw.rect(screen, (73, 57, 43), accent_rect, 1, border_radius=3)
             screen.blit(text_surface, text_surface.get_rect(center=badge_rect.center))
 
     def draw(self, screen):
@@ -222,34 +529,12 @@ class GameBoard:
         self._draw_harbors(screen)
 
         for road in self.roads:
-            pygame.draw.line(
-                screen,
-                COLORS["BLACK"],
-                (road.node1.x, road.node1.y),
-                (road.node2.x, road.node2.y),
-                12,
-            )
-            pygame.draw.line(
-                screen,
-                road.owner.color,
-                (road.node1.x, road.node1.y),
-                (road.node2.x, road.node2.y),
-                8,
-            )
+            road.draw(screen)
 
         for node in self.nodes:
             if node.building is None:
                 continue
-            color = node.building.owner.color
-            center = (int(node.x), int(node.y))
-            if node.building.building_type == BuildingType.CITY:
-                rect = pygame.Rect(0, 0, 20, 20)
-                rect.center = center
-                pygame.draw.rect(screen, color, rect, border_radius=4)
-                pygame.draw.rect(screen, COLORS["BLACK"], rect, 2, border_radius=4)
-            else:
-                pygame.draw.circle(screen, color, center, 8)
-                pygame.draw.circle(screen, COLORS["BLACK"], center, 8, 1)
+            node.building.draw(screen, (node.x, node.y))
 
     def move_robber_to(self, tile: HexTile):
         self.robber_tile = tile

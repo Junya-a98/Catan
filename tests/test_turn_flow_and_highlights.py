@@ -6,6 +6,7 @@ os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
 import pygame
 
 from game.building import Building
+from game.development_cards import DevelopmentCardType
 from game.game import CatanGame
 from game.game_board import GameBoard
 from game.player import Player
@@ -172,6 +173,7 @@ def test_build_buttons_hide_unavailable_development_actions():
             "mode_city",
             "buy_dev",
             "bank_trade",
+            "domestic_trade",
             "end_turn",
         }
     finally:
@@ -179,7 +181,7 @@ def test_build_buttons_hide_unavailable_development_actions():
         pygame.quit()
 
 
-def test_build_buttons_highlight_currently_actionable_actions():
+def test_build_buttons_enable_actions_and_emphasize_turn_end():
     pygame.init()
     pygame.display.set_mode((1, 1))
     game = CatanGame()
@@ -197,10 +199,133 @@ def test_build_buttons_highlight_currently_actionable_actions():
 
         buttons = {button.action: button for button in game.build_buttons()}
 
-        assert buttons["mode_road"].highlighted is True
-        assert buttons["mode_city"].highlighted is True
-        assert buttons["buy_dev"].highlighted is True
-        assert buttons["end_turn"].highlighted is False
+        assert buttons["mode_road"].enabled is True
+        assert buttons["mode_city"].enabled is True
+        assert buttons["buy_dev"].enabled is True
+        assert buttons["mode_road"].highlighted is False
+        assert buttons["mode_city"].highlighted is False
+        assert buttons["buy_dev"].highlighted is False
+        assert buttons["end_turn"].highlighted is True
+    finally:
+        game.audio.stop()
+        pygame.quit()
+
+
+def test_road_building_card_is_not_consumed_without_pieces_or_legal_placement():
+    pygame.init()
+    pygame.display.set_mode((1, 1))
+    game = CatanGame()
+    try:
+        game.start_main_phase()
+        player = game.get_current_player()
+        player.development_cards[DevelopmentCardType.ROAD_BUILDING] = 1
+
+        player.roads_remaining = 0
+        game.use_road_building_card()
+
+        assert player.development_cards[DevelopmentCardType.ROAD_BUILDING] == 1
+        assert game.development_card_used_this_turn is False
+        assert game.special_phase is None
+
+        player.roads_remaining = 15
+        game.use_road_building_card()
+
+        assert player.development_cards[DevelopmentCardType.ROAD_BUILDING] == 1
+        assert game.development_card_used_this_turn is False
+        assert game.special_phase is None
+    finally:
+        game.audio.stop()
+        pygame.quit()
+
+
+def test_road_building_finish_button_completes_special_phase():
+    pygame.init()
+    pygame.display.set_mode((1, 1))
+    game = CatanGame()
+    try:
+        game.start_main_phase()
+        player = game.get_current_player()
+        game.board.nodes[0].building = Building(player)
+        player.development_cards[DevelopmentCardType.ROAD_BUILDING] = 1
+
+        game.use_road_building_card()
+
+        assert game.special_phase == "road_building"
+        buttons = game.build_buttons()
+        assert [button.action for button in buttons] == ["finish_road_building"]
+
+        game.handle_button_action("finish_road_building")
+
+        assert game.special_phase is None
+        assert game.free_roads_remaining == 0
+    finally:
+        game.audio.stop()
+        pygame.quit()
+
+
+def test_knight_before_roll_blocks_dice_until_robber_move_is_completed():
+    pygame.init()
+    pygame.display.set_mode((1, 1))
+    game = CatanGame()
+    try:
+        game.start_main_phase()
+        player = game.get_current_player()
+        player.development_cards[DevelopmentCardType.KNIGHT] = 1
+        target_tile = next(tile for tile in game.board.tiles if tile != game.board.robber_tile)
+
+        game.use_knight_card()
+
+        assert game.dice_rolled is False
+        assert game.special_phase == "move_robber"
+
+        game.handle_roll_dice()
+
+        assert game.has_active_dice_animation() is False
+        assert game.pending_dice_context is None
+        assert "特殊処理" in game.get_active_feedback().text
+
+        game.handle_main_phase_click((target_tile.x, target_tile.y))
+
+        assert game.board.robber_tile == target_tile
+        assert game.special_phase is None
+        assert game.dice_rolled is False
+    finally:
+        game.audio.stop()
+        pygame.quit()
+
+
+def test_build_buttons_show_playable_development_cards_before_dice():
+    pygame.init()
+    pygame.display.set_mode((1, 1))
+    game = CatanGame()
+    try:
+        game.start_main_phase()
+        player = game.get_current_player()
+        game.board.nodes[0].building = Building(player)
+        for card_type in (
+            DevelopmentCardType.KNIGHT,
+            DevelopmentCardType.ROAD_BUILDING,
+            DevelopmentCardType.YEAR_OF_PLENTY,
+            DevelopmentCardType.MONOPOLY,
+        ):
+            player.development_cards[card_type] = 1
+
+        buttons = {button.action: button for button in game.build_buttons()}
+
+        assert set(buttons) == {
+            "roll_dice",
+            "use_knight",
+            "use_road_building",
+            "use_year_of_plenty",
+            "use_monopoly",
+        }
+        assert all(button.enabled for button in buttons.values())
+        assert buttons["roll_dice"].highlighted is True
+        assert all(
+            not button.highlighted
+            for action, button in buttons.items()
+            if action != "roll_dice"
+        )
     finally:
         game.audio.stop()
         pygame.quit()
