@@ -74,7 +74,12 @@ class SimpleAI:
             if domestic_trade is not None:
                 game.ai_domestic_trade_attempted = True
                 partner, give, receive = domestic_trade
-                self._set_status(game, player, "国内交易を提案", "都市・開拓地に足りない資源を補います")
+                self._set_status(
+                    game,
+                    player,
+                    "国内交易を提案",
+                    "公開されている生産力と直近獲得から交渉相手を選びます",
+                )
                 game.propose_domestic_trade(partner, give, receive)
                 return True
 
@@ -122,7 +127,12 @@ class SimpleAI:
             domestic_trade = self._choose_domestic_trade(game, player)
             if domestic_trade is not None:
                 partner, give, receive = domestic_trade
-                self._set_status(game, player, "国内交易を提案", "次の建設に必要な資源を補います")
+                self._set_status(
+                    game,
+                    player,
+                    "国内交易を提案",
+                    "公開されている生産力と直近獲得から交渉相手を選びます",
+                )
                 game.propose_domestic_trade(partner, give, receive)
                 return True
 
@@ -343,12 +353,20 @@ class SimpleAI:
                 continue
             for receive_resource in missing:
                 partners = sorted(
-                    (candidate for candidate in game.players if candidate is not player),
-                    key=lambda candidate: (not candidate.is_ai, -candidate.total_resource_count()),
+                    (
+                        candidate
+                        for candidate in game.players
+                        if candidate is not player
+                        and candidate.total_resource_count() > 0
+                    ),
+                    key=lambda candidate: self._public_trade_partner_score(
+                        game,
+                        candidate,
+                        receive_resource,
+                    ),
+                    reverse=True,
                 )
                 for partner in partners:
-                    if partner is player or partner.total_resource_count() <= 0:
-                        continue
                     give_candidates = []
                     for give_resource, amount in player.resources.items():
                         if give_resource == receive_resource:
@@ -362,6 +380,22 @@ class SimpleAI:
                         give_resource = max(give_candidates, key=lambda candidate: candidate[:2])[2]
                         return partner, {give_resource: 1}, {receive_resource: 1}
         return None
+
+    def _public_trade_partner_score(self, game, partner, resource_type):
+        """Estimate supply from public facts, never from the partner's hand types."""
+        production = self._player_production_scores(game, partner).get(
+            resource_type,
+            0,
+        )
+        recent_distribution = getattr(game, "last_resource_distribution", {})
+        recent_bundle = recent_distribution.get(partner.name, {})
+        recent_gain = recent_bundle.get(resource_type, 0)
+        likelihood = production + recent_gain * 20
+        return (
+            likelihood,
+            int(partner.is_ai),
+            partner.total_resource_count(),
+        )
 
     def evaluate_domestic_trade(self, player, *, incoming, outgoing):
         if not incoming or not outgoing:

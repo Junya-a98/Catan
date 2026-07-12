@@ -7,7 +7,7 @@ import pygame
 
 from game.building import Building, BuildingType
 from game.game import CatanGame
-from game.resources import BUILD_COSTS
+from game.resources import BUILD_COSTS, ResourceType
 
 
 def create_game(ai_player_count=1):
@@ -95,5 +95,89 @@ def test_ai_rolls_and_ends_a_turn_when_no_action_is_available():
 
         assert game.get_current_player() is human
         assert game.dice_rolled is False
+    finally:
+        close_game(game)
+
+
+def test_ai_targets_the_publicly_likely_supplier_for_domestic_trade():
+    game = create_game(ai_player_count=1)
+    try:
+        game.configure_players(3, reset_logs=False)
+        first_human, likely_supplier, cpu = game.players
+        ore_node = next(
+            node
+            for node in game.board.nodes
+            if any(tile.resource_type == ResourceType.ORE for tile in node.tiles)
+        )
+        non_ore_node = next(
+            node
+            for node in game.board.nodes
+            if node is not ore_node
+            and all(tile.resource_type != ResourceType.ORE for tile in node.tiles)
+        )
+        non_ore_node.building = Building(first_human)
+        ore_node.building = Building(likely_supplier)
+
+        for resource_type, amount in {
+            ResourceType.WOOD: 1,
+            ResourceType.WHEAT: 2,
+            ResourceType.ORE: 2,
+        }.items():
+            assert game.bank.withdraw(resource_type, amount)
+            cpu.add_resource(resource_type, amount)
+        assert game.bank.withdraw(ResourceType.BRICK, 2)
+        first_human.add_resource(ResourceType.BRICK)
+        likely_supplier.add_resource(ResourceType.BRICK)
+
+        partner, give, receive = game.ai._choose_domestic_trade(
+            game,
+            cpu,
+            goals=("city",),
+        )
+
+        assert partner is likely_supplier
+        assert give == {ResourceType.WOOD: 1}
+        assert receive == {ResourceType.ORE: 1}
+    finally:
+        close_game(game)
+
+
+def test_ai_uses_recent_public_distribution_without_reading_hidden_hand_types():
+    game = create_game(ai_player_count=1)
+    try:
+        game.configure_players(3, reset_logs=False)
+        first_human, recent_supplier, cpu = game.players
+        for resource_type, amount in {
+            ResourceType.WOOD: 1,
+            ResourceType.WHEAT: 2,
+            ResourceType.ORE: 2,
+        }.items():
+            assert game.bank.withdraw(resource_type, amount)
+            cpu.add_resource(resource_type, amount)
+        assert game.bank.withdraw(ResourceType.BRICK, 2)
+        first_human.add_resource(ResourceType.BRICK)
+        recent_supplier.add_resource(ResourceType.BRICK)
+        game.last_resource_distribution = {
+            recent_supplier.name: {ResourceType.ORE: 1},
+        }
+
+        first_choice = game.ai._choose_domestic_trade(
+            game,
+            cpu,
+            goals=("city",),
+        )
+        first_human.resources[ResourceType.BRICK] = 0
+        first_human.resources[ResourceType.SHEEP] = 1
+        recent_supplier.resources[ResourceType.BRICK] = 0
+        recent_supplier.resources[ResourceType.WOOD] = 1
+        second_choice = game.ai._choose_domestic_trade(
+            game,
+            cpu,
+            goals=("city",),
+        )
+
+        assert first_choice[0] is recent_supplier
+        assert second_choice[0] is recent_supplier
+        assert first_choice[1:] == second_choice[1:]
     finally:
         close_game(game)

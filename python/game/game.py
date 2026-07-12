@@ -1258,7 +1258,6 @@ class CatanGame:
             return actions
 
         if self.special_phase == "road_building":
-            actions.add("finish_road_building")
             return actions
 
         if self.special_phase in ("discard", "year_of_plenty", "monopoly"):
@@ -1635,16 +1634,6 @@ class CatanGame:
                 development_actions.append(("use_monopoly", "独占"))
 
         if self.special_phase == "road_building":
-            add_custom(
-                "finish_road_building",
-                f"街道建設を終了 ({self.free_roads_remaining} 本)",
-                base_x,
-                base_y,
-                available_width,
-                button_height,
-                enabled=True,
-                highlighted="finish_road_building" in actionable_actions,
-            )
             return buttons
 
         if self.special_phase in ("bank_trade_give", "bank_trade_receive"):
@@ -2912,10 +2901,22 @@ class CatanGame:
         )
 
     def complete_road_building_phase(self):
+        if self.special_phase != "road_building":
+            return False
+        current_player = self.get_current_player()
+        if (
+            self.free_roads_remaining > 0
+            and self.has_legal_road_placement(current_player)
+        ):
+            self.notify_invalid(
+                "街道建設カードは、配置可能なら残りの街道も続けて置いてください。"
+            )
+            return False
         self.special_phase = None
         self.free_roads_remaining = 0
         self.add_log("街道建設カードの処理が完了しました。")
-        self.check_for_winner(self.get_current_player())
+        self.check_for_winner(current_player)
+        return True
 
     def handle_resource_selection(self, resource_type):
         player = self.get_current_player()

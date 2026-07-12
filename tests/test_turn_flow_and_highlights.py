@@ -238,7 +238,7 @@ def test_road_building_card_is_not_consumed_without_pieces_or_legal_placement():
         pygame.quit()
 
 
-def test_road_building_finish_button_completes_special_phase():
+def test_road_building_must_place_both_roads_when_legal():
     pygame.init()
     pygame.display.set_mode((1, 1))
     game = CatanGame()
@@ -251,13 +251,74 @@ def test_road_building_finish_button_completes_special_phase():
         game.use_road_building_card()
 
         assert game.special_phase == "road_building"
-        buttons = game.build_buttons()
-        assert [button.action for button in buttons] == ["finish_road_building"]
+        assert game.build_buttons() == []
+        assert game.complete_road_building_phase() is False
+        assert game.special_phase == "road_building"
+        assert game.free_roads_remaining == 2
+        assert "残りの街道" in game.get_active_feedback().text
 
-        game.handle_button_action("finish_road_building")
+        first_edge = game.get_buildable_road_edges(
+            player,
+            require_affordability=False,
+        )[0]
+        game.handle_free_road_build_click(
+            (
+                (first_edge[0].x + first_edge[1].x) / 2,
+                (first_edge[0].y + first_edge[1].y) / 2,
+            )
+        )
+        assert game.special_phase == "road_building"
+        assert game.free_roads_remaining == 1
+
+        second_edge = game.get_buildable_road_edges(
+            player,
+            require_affordability=False,
+        )[0]
+        game.handle_free_road_build_click(
+            (
+                (second_edge[0].x + second_edge[1].x) / 2,
+                (second_edge[0].y + second_edge[1].y) / 2,
+            )
+        )
 
         assert game.special_phase is None
         assert game.free_roads_remaining == 0
+        assert player.roads_remaining == 13
+        assert len([road for road in game.board.roads if road.owner is player]) == 2
+    finally:
+        game.audio.stop()
+        pygame.quit()
+
+
+def test_road_building_places_one_road_when_only_one_piece_remains():
+    pygame.init()
+    pygame.display.set_mode((1, 1))
+    game = CatanGame()
+    try:
+        game.start_main_phase()
+        player = game.get_current_player()
+        game.board.nodes[0].building = Building(player)
+        player.roads_remaining = 1
+        player.development_cards[DevelopmentCardType.ROAD_BUILDING] = 1
+
+        game.use_road_building_card()
+
+        assert game.special_phase == "road_building"
+        assert game.free_roads_remaining == 1
+        edge = game.get_buildable_road_edges(
+            player,
+            require_affordability=False,
+        )[0]
+        game.handle_free_road_build_click(
+            (
+                (edge[0].x + edge[1].x) / 2,
+                (edge[0].y + edge[1].y) / 2,
+            )
+        )
+
+        assert game.special_phase is None
+        assert game.free_roads_remaining == 0
+        assert player.roads_remaining == 0
     finally:
         game.audio.stop()
         pygame.quit()

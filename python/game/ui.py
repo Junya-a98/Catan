@@ -149,6 +149,44 @@ def _draw_player_name(screen, font, x, y, player):
     return name_surface.get_height()
 
 
+def _draw_player_stat_chips(screen, player, x, y, max_width):
+    """Draw the hand and remaining pieces without cryptic one-letter labels."""
+    font = _load_font(13)
+    chip_height = 25
+    gap = 5
+    chip_specs = (
+        (f"手札 {player.total_resource_count()}", COLORS["BUTTON_HIGHLIGHT_BORDER"]),
+        (f"街道 {player.roads_remaining}", COLORS["CARD_BORDER"]),
+        (f"開拓地 {player.settlements_remaining}", COLORS["CARD_BORDER"]),
+        (f"都市 {player.cities_remaining}", COLORS["CARD_BORDER"]),
+    )
+    desired_widths = [font.size(label)[0] + 14 for label, _ in chip_specs]
+    available_for_chips = max_width - gap * (len(chip_specs) - 1)
+    if sum(desired_widths) > available_for_chips:
+        chip_widths = [available_for_chips // len(chip_specs)] * len(chip_specs)
+        chip_widths[-1] += available_for_chips - sum(chip_widths)
+    else:
+        chip_widths = desired_widths
+
+    rendered_chips = []
+    chip_x = x
+    for (label, border_color), chip_width in zip(chip_specs, chip_widths):
+        rect = pygame.Rect(chip_x, y, chip_width, chip_height)
+        fill_color = (42, 51, 61) if not rendered_chips else COLORS["CARD_BG"]
+        pygame.draw.rect(screen, fill_color, rect, border_radius=8)
+        pygame.draw.rect(screen, border_color, rect, 1, border_radius=8)
+        text = _truncate_text(font, label, rect.width - 10)
+        text_surface = font.render(
+            text,
+            True,
+            COLORS["WHITE"] if not rendered_chips else COLORS["TEXT_MUTED"],
+        )
+        screen.blit(text_surface, text_surface.get_rect(center=rect.center))
+        rendered_chips.append((label, rect))
+        chip_x = rect.right + gap
+    return rendered_chips
+
+
 def _draw_build_status(screen, x, y, width, label_font, detail_font, item):
     status_color = COLORS["SUCCESS"] if item["available"] else COLORS["DANGER"]
     label_surface = label_font.render(item["label"], True, COLORS["WHITE"])
@@ -438,19 +476,18 @@ def draw_transient_message(screen, message):
         text_y += font.get_height() + 4
 
 
-def draw_button(screen, button):
+def _get_button_colors(button):
     if not button.enabled:
-        color = COLORS["BUTTON_DISABLED"]
-        border_color = COLORS["PANEL_BORDER"]
-    elif button.selected:
-        color = COLORS["BUTTON_ACTIVE"]
-        border_color = COLORS["BUTTON_HIGHLIGHT_BORDER"]
-    elif button.highlighted:
-        color = COLORS["BUTTON_HIGHLIGHT"]
-        border_color = COLORS["BUTTON_HIGHLIGHT_BORDER"]
-    else:
-        color = COLORS["BUTTON"]
-        border_color = COLORS["PANEL_BORDER"]
+        return COLORS["BUTTON_DISABLED"], (80, 91, 102), (150, 160, 170)
+    if button.selected:
+        return COLORS["BUTTON_ACTIVE"], COLORS["BUTTON_HIGHLIGHT_BORDER"], COLORS["BUTTON_TEXT"]
+    if button.highlighted:
+        return COLORS["BUTTON_HIGHLIGHT"], COLORS["BUTTON_HIGHLIGHT_BORDER"], COLORS["BUTTON_TEXT"]
+    return COLORS["BUTTON"], COLORS["PANEL_BORDER"], COLORS["BUTTON_TEXT"]
+
+
+def draw_button(screen, button):
+    color, border_color, text_color = _get_button_colors(button)
     if button.enabled and (button.selected or button.highlighted):
         glow_rect = button.rect.inflate(8, 8)
         glow = pygame.Surface(glow_rect.size, pygame.SRCALPHA)
@@ -461,7 +498,7 @@ def draw_button(screen, button):
     if button.action == "seed_input_focus":
         font = _load_font(17)
         hint_font = _load_font(12)
-        text_surface = font.render(button.label, True, COLORS["BUTTON_TEXT"])
+        text_surface = font.render(button.label, True, text_color)
         screen.blit(
             text_surface,
             (button.rect.x + 14, button.rect.y + (button.rect.height - text_surface.get_height()) // 2),
@@ -479,7 +516,7 @@ def draw_button(screen, button):
         return
 
     font = _load_font(17)
-    text_surface = font.render(button.label, True, COLORS["BUTTON_TEXT"])
+    text_surface = font.render(button.label, True, text_color)
     screen.blit(text_surface, text_surface.get_rect(center=button.rect.center))
 
 
@@ -596,13 +633,14 @@ def draw_side_panel(
         name_height = _draw_player_name(screen, section_font, panel_rect.x + 20, section_y, current_player)
         section_y += name_height + 4
 
-        pieces_text = (
-            f"手札 {current_player.total_resource_count()} 枚 / "
-            f"道{current_player.roads_remaining} 開{current_player.settlements_remaining} 都{current_player.cities_remaining}"
+        stat_chips = _draw_player_stat_chips(
+            screen,
+            current_player,
+            panel_rect.x + 20,
+            section_y,
+            panel_rect.width - 40,
         )
-        pieces_surface = small_font.render(pieces_text, True, COLORS["TEXT_MUTED"])
-        screen.blit(pieces_surface, (panel_rect.x + 20, section_y))
-        section_y += small_font.get_height() + 2
+        section_y += max((rect.height for _, rect in stat_chips), default=0) + 4
 
         if trade_rates:
             trade_text = "交易: " + " ".join(
