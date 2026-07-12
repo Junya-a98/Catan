@@ -24,7 +24,7 @@ def _classify_log_color(message):
         return (255, 160, 150)
     if any(keyword in message for keyword in ("勝利", "獲得", "建設", "配置", "アップグレード", "購入", "使用")):
         return (245, 235, 180)
-    if any(keyword in message for keyword in ("フェーズ", "手番", "ダイス", "盗賊")):
+    if any(keyword in message for keyword in ("フェーズ", "手番", "ダイス", "盗賊", "判断", "AI速度")):
         return (180, 225, 255)
     return (232, 236, 242)
 
@@ -48,9 +48,58 @@ def _wrap_message(font, message, max_width):
     return lines or [message]
 
 
-def draw_log(screen, log_messages, panel_height=LOG_PANEL_HEIGHT, latest_event=None):
+def _truncate_message(font, message, max_width):
+    if font.size(message)[0] <= max_width:
+        return message
+    ellipsis = "…"
+    result = message
+    while result and font.size(result + ellipsis)[0] > max_width:
+        result = result[:-1]
+    return result + ellipsis
+
+
+def get_log_slice(log_messages, scroll_offset, candidate_limit=80):
+    """Return a stable history window, where offset counts back from newest."""
+    if not log_messages:
+        return 0, 0, []
+    offset = max(0, min(int(scroll_offset), len(log_messages) - 1))
+    end = len(log_messages) - offset
+    start = max(0, end - candidate_limit)
+    return start, end, list(log_messages[start:end])
+
+
+def draw_log(
+    screen,
+    log_messages,
+    panel_height=LOG_PANEL_HEIGHT,
+    latest_event=None,
+    *,
+    expanded=True,
+    scroll_offset=0,
+):
     title_font = _load_font(24)
     log_font = _load_font(18)
+
+    if not expanded:
+        panel_rect = pygame.Rect(12, 12, LOG_PANEL_WIDTH, 50)
+        panel_surface = pygame.Surface(panel_rect.size, pygame.SRCALPHA)
+        pygame.draw.rect(panel_surface, (12, 18, 28, 218), panel_surface.get_rect(), border_radius=16)
+        pygame.draw.rect(panel_surface, (115, 150, 190, 235), panel_surface.get_rect(), 2, border_radius=16)
+        screen.blit(panel_surface, panel_rect.topleft)
+
+        compact_font = _load_font(15)
+        label = f"L: 履歴を表示  ({len(log_messages)}件)"
+        label_surface = compact_font.render(label, True, COLORS["WARNING"])
+        screen.blit(label_surface, (panel_rect.x + 14, panel_rect.y + 7))
+        if latest_event:
+            latest_text = _truncate_message(
+                _load_font(12),
+                f"直前: {latest_event.get('title', '')}",
+                panel_rect.width - 28,
+            )
+            latest_surface = _load_font(12).render(latest_text, True, COLORS["TEXT_MUTED"])
+            screen.blit(latest_surface, (panel_rect.x + 14, panel_rect.y + 27))
+        return
 
     panel_rect = pygame.Rect(12, 12, LOG_PANEL_WIDTH, panel_height)
     panel_surface = pygame.Surface(panel_rect.size, pygame.SRCALPHA)
@@ -58,8 +107,10 @@ def draw_log(screen, log_messages, panel_height=LOG_PANEL_HEIGHT, latest_event=N
     pygame.draw.rect(panel_surface, (115, 150, 190, 235), panel_surface.get_rect(), 2, border_radius=18)
     screen.blit(panel_surface, panel_rect.topleft)
 
-    title_surface = title_font.render("イベント履歴", True, (255, 255, 255))
+    title_surface = title_font.render(f"イベント履歴  {len(log_messages)}件", True, (255, 255, 255))
     screen.blit(title_surface, (panel_rect.x + 18, panel_rect.y + 14))
+    close_surface = _load_font(12).render("L: 閉じる", True, COLORS["WARNING"])
+    screen.blit(close_surface, (panel_rect.right - close_surface.get_width() - 16, panel_rect.y + 18))
     pygame.draw.line(
         screen,
         (90, 120, 155),
@@ -70,7 +121,7 @@ def draw_log(screen, log_messages, panel_height=LOG_PANEL_HEIGHT, latest_event=N
 
     content_width = panel_rect.width - 36
     content_top = panel_rect.y + 58
-    if latest_event:
+    if latest_event and scroll_offset == 0:
         card_height = 76
         card_rect = pygame.Rect(panel_rect.x + 14, content_top, panel_rect.width - 28, card_height)
         card_surface = pygame.Surface(card_rect.size, pygame.SRCALPHA)
@@ -96,11 +147,14 @@ def draw_log(screen, log_messages, panel_height=LOG_PANEL_HEIGHT, latest_event=N
             detail_y += detail_font.get_height() + 2
         content_top = card_rect.bottom + 8
 
-    bottom_y = panel_rect.bottom - 16
+    bottom_y = panel_rect.bottom - 50
     line_gap = 4
-    visible_entries = list(log_messages[-24:])
+    start_index, _, visible_entries = get_log_slice(log_messages, scroll_offset)
+    rendered_indices = []
 
-    for entry_index, message in enumerate(reversed(visible_entries)):
+    for local_index in range(len(visible_entries) - 1, -1, -1):
+        message = visible_entries[local_index]
+        message_index = start_index + local_index
         message_lines = _wrap_message(log_font, f"・{message}", content_width)
         message_height = len(message_lines) * (log_font.get_height() + line_gap)
         bottom_y -= message_height
@@ -108,7 +162,7 @@ def draw_log(screen, log_messages, panel_height=LOG_PANEL_HEIGHT, latest_event=N
             break
 
         color = _classify_log_color(message)
-        if entry_index == 0:
+        if message_index == len(log_messages) - 1:
             color = (255, 255, 255)
 
         y = bottom_y
@@ -117,6 +171,25 @@ def draw_log(screen, log_messages, panel_height=LOG_PANEL_HEIGHT, latest_event=N
             screen.blit(text_surface, (panel_rect.x + 18, y))
             y += log_font.get_height() + line_gap
         bottom_y -= 6
+        rendered_indices.append(message_index)
+
+    footer_font = _load_font(12)
+    if rendered_indices:
+        first_shown = min(rendered_indices) + 1
+        last_shown = max(rendered_indices) + 1
+        position_text = f"{first_shown}–{last_shown} / {len(log_messages)}"
+    else:
+        position_text = "履歴はまだありません"
+    if scroll_offset > 0:
+        position_text += "  過去を表示中"
+    footer_surface = footer_font.render(position_text, True, COLORS["TEXT_MUTED"])
+    screen.blit(footer_surface, (panel_rect.x + 18, panel_rect.bottom - 34))
+    control_text = "Wheel:移動  PgUp/PgDn:ページ  Home:最初  End:最新"
+    control_surface = footer_font.render(control_text, True, COLORS["WARNING"])
+    screen.blit(
+        control_surface,
+        (panel_rect.x + 18, panel_rect.bottom - 18),
+    )
 
 
 def draw_resource_counts(
@@ -128,6 +201,7 @@ def draw_resource_counts(
     visible_player=None,
     reveal_all=False,
     current_player=None,
+    public_gain_by_player=None,
 ):
     if not players:
         return
@@ -208,7 +282,19 @@ def draw_resource_counts(
             badges.append("最大騎士力")
         if is_current:
             badges.insert(0, "手番中")
-        detail_text = " / ".join(badges) if badges else f"資源合計 {player.total_resource_count()} 枚"
+        if badges:
+            detail_text = " / ".join(badges)
+        else:
+            recent_gain = (
+                public_gain_by_player.get(player.name)
+                if public_gain_by_player is not None
+                else None
+            )
+            if recent_gain and not show_resource_types and recent_gain != "なし":
+                detail_text = f"直近公開 {recent_gain}"
+            else:
+                detail_text = f"資源合計 {player.total_resource_count()} 枚"
+        detail_text = _truncate_message(detail_font, detail_text, card_rect.width - 36)
         detail_surface = detail_font.render(detail_text, True, (255, 222, 160) if badges else (190, 205, 220))
         detail_y = card_rect.bottom - detail_surface.get_height() - 7
         screen.blit(detail_surface, (card_rect.right - detail_surface.get_width() - 16, detail_y))

@@ -2,7 +2,7 @@ import random
 
 import pygame
 
-from game.ai import AI_ACTION_DELAY_MS, SimpleAI
+from game.ai import AI_ACTION_DELAY_MS, AI_SPEED_OPTIONS, SimpleAI
 from game.audio import GameAudio
 from game.bank import BANK_RESOURCE_COUNT, RESOURCE_TYPES, ResourceBank
 from game.board_rules import BoardHighlightState, BoardRules
@@ -14,7 +14,7 @@ from game.constants import (
     HELP_PANEL_HEIGHT,
     HELP_PANEL_Y,
     LOG_PANEL_HEIGHT,
-    MAX_LOG_MESSAGES,
+    LOG_PANEL_WIDTH,
     MIN_LARGEST_ARMY_SIZE,
     MIN_LONGEST_ROAD_LENGTH,
     NODE_SELECTION_RADIUS,
@@ -37,6 +37,7 @@ from game.dice import roll_two_dice
 from game.feedback import FeedbackManager
 from game.game_board import GameBoard
 from game.guidance import GuidanceState, build_action_mode_guidance, build_help_panel_content, build_side_panel_guidance
+from game.hex_tile import get_token_pip_count
 from game.log_display import draw_log, draw_resource_counts
 from game.player import Player
 from game.resources import BUILD_COSTS, ResourceType
@@ -81,7 +82,24 @@ class CatanGame:
         self.ai = SimpleAI()
         self.ai_player_count = max(0, int(ai_player_count))
         self.ai_action_delay_ms = max(0, int(ai_action_delay_ms))
+        timed_speed_indices = [
+            index
+            for index, (_, delay_ms) in enumerate(AI_SPEED_OPTIONS)
+            if delay_ms is not None
+        ]
+        self.ai_speed_index = min(
+            timed_speed_indices,
+            key=lambda index: abs(AI_SPEED_OPTIONS[index][1] - self.ai_action_delay_ms),
+        )
+        self.ai_paused = False
         self.ai_next_action_at = 0
+        self.ai_status = {
+            "player_name": "",
+            "title": "AI待機中",
+            "detail": "AIの手番になると判断内容を表示します。",
+        }
+        self.last_resource_distribution = {}
+        self.public_gain_history = {}
         self.audio.start_bgm()
 
         self.player_palette = [
@@ -94,6 +112,8 @@ class CatanGame:
         self.turn_order = []
         self.buttons = []
         self.show_help_panel = False
+        self.show_log_panel = False
+        self.log_scroll_offset = 0
 
         self.phase = "initial"  # "initial", "main", "finished"
         self.initial_dice_phase = True
@@ -145,8 +165,13 @@ class CatanGame:
         self.add_log("人間プレイヤーはスペースキーで初期ダイスを振ります。AIは自動で進行します。")
 
     def add_log(self, message):
+        if self.log_scroll_offset > 0:
+            self.log_scroll_offset += 1
         self.log_messages.append(message)
-        self.log_messages = self.log_messages[-MAX_LOG_MESSAGES:]
+        self.log_scroll_offset = min(
+            self.log_scroll_offset,
+            max(0, len(self.log_messages) - 1),
+        )
         print(message)
 
     def record_event(self, title, detail="", *, level="info", actor=None, include_in_turn=True):
@@ -170,6 +195,79 @@ class CatanGame:
         delay = int(self.ai_action_delay_ms * max(0.0, delay_multiplier))
         self.ai_next_action_at = pygame.time.get_ticks() + delay
 
+    def get_ai_speed_label(self):
+        return AI_SPEED_OPTIONS[self.ai_speed_index][0]
+
+    def cycle_ai_speed(self):
+        self.ai_speed_index = (self.ai_speed_index + 1) % len(AI_SPEED_OPTIONS)
+        _, delay_ms = AI_SPEED_OPTIONS[self.ai_speed_index]
+        self.ai_paused = delay_ms is None
+        if delay_ms is not None:
+            self.ai_action_delay_ms = delay_ms
+            self.schedule_ai_action(0.45)
+        self.add_log(f"AI速度を「{self.get_ai_speed_label()}」に変更しました。")
+
+    def set_ai_status(self, player, title, detail="", *, log=False):
+        if player is None or not player.is_ai:
+            return
+        previous = (self.ai_status.get("player_name"), self.ai_status.get("title"))
+        self.ai_status = {
+            "player_name": player.name,
+            "title": title,
+            "detail": detail,
+        }
+        if log and previous != (player.name, title):
+            suffix = f" — {detail}" if detail else ""
+            self.add_log(f"{player.name} の判断: {title}{suffix}")
+
+    def record_public_gain(self, player, bundle, source):
+        if player is None:
+            return
+        gain_text = self.format_resource_bundle(bundle)
+        if gain_text == "なし":
+            return
+        history = self.public_gain_history.setdefault(player.name, [])
+        history.append({"source": source, "text": gain_text})
+        self.public_gain_history[player.name] = history[-4:]
+
+    def get_recent_public_gain_text(self, player):
+        if player is None:
+            return "なし"
+        history = self.public_gain_history.get(player.name, [])
+        if not history:
+            return "なし"
+        latest = history[-1]
+        return f"{latest['text']}（{latest['source']}）"
+
+    def get_public_production_profile(self, player, limit=2):
+        if player is None:
+            return "なし"
+        scores = {resource_type: 0 for resource_type in RESOURCE_TYPES}
+        for node in self.board.nodes:
+            if node.building is None or node.building.owner is not player:
+                continue
+            multiplier = node.building.resource_multiplier
+            for tile in node.tiles:
+                if tile.resource_type == ResourceType.DESERT:
+                    continue
+                scores[tile.resource_type] += get_token_pip_count(tile.number) * multiplier
+        ranked = [
+            resource_type
+            for resource_type, score in sorted(
+                scores.items(),
+                key=lambda item: (-item[1], item[0].value),
+            )
+            if score > 0
+        ]
+        if not ranked:
+            return "なし"
+        return "・".join(RESOURCE_LABELS[resource_type] for resource_type in ranked[:limit])
+
+    def get_trade_partner_public_summary(self, partner):
+        profile = self.get_public_production_profile(partner)
+        recent = self.get_recent_public_gain_text(partner)
+        return f"手札{partner.total_resource_count()}枚 / 生産{profile} / 直近獲得{recent}"
+
     def generate_board_seed(self):
         return random.randint(10000, 99999999)
 
@@ -192,6 +290,68 @@ class CatanGame:
 
     def clear_log(self):
         self.log_messages = []
+        self.log_scroll_offset = 0
+
+    def toggle_log_panel(self):
+        self.show_log_panel = not self.show_log_panel
+        if not self.show_log_panel:
+            self.log_scroll_offset = 0
+
+    def scroll_log(self, amount):
+        if not self.log_messages:
+            self.log_scroll_offset = 0
+            return
+        self.log_scroll_offset = max(
+            0,
+            min(
+                self.log_scroll_offset + int(amount),
+                len(self.log_messages) - 1,
+            ),
+        )
+
+    def handle_global_ui_event(self, event):
+        if event.type == pygame.KEYDOWN and event.key == pygame.K_l:
+            self.toggle_log_panel()
+            return True
+        if event.type == pygame.KEYDOWN and event.key == pygame.K_h:
+            self.show_help_panel = not self.show_help_panel
+            return True
+        if event.type == pygame.KEYDOWN and event.key == pygame.K_a:
+            self.cycle_ai_speed()
+            return True
+
+        if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+            clicked_button = self.find_clicked_button(event.pos)
+            if clicked_button is not None and clicked_button.action == "ai_speed_cycle":
+                self.handle_button_action(clicked_button.action)
+                return True
+
+        if self.show_log_panel and event.type == pygame.MOUSEWHEEL:
+            self.scroll_log(event.y * 3)
+            return True
+        if self.show_log_panel and event.type == pygame.KEYDOWN:
+            if event.key == pygame.K_PAGEUP:
+                self.scroll_log(10)
+                return True
+            if event.key == pygame.K_PAGEDOWN:
+                self.scroll_log(-10)
+                return True
+            if event.key == pygame.K_HOME:
+                self.log_scroll_offset = max(0, len(self.log_messages) - 1)
+                return True
+            if event.key == pygame.K_END:
+                self.log_scroll_offset = 0
+                return True
+
+        log_header_rect = pygame.Rect(12, 12, LOG_PANEL_WIDTH, 50)
+        if (
+            event.type == pygame.MOUSEBUTTONDOWN
+            and event.button == 1
+            and log_header_rect.collidepoint(event.pos)
+        ):
+            self.toggle_log_panel()
+            return True
+        return False
 
     def get_board_configuration_summary(self):
         mode_label = "制約付き" if self.board_mode == "constrained" else "公式ランダム"
@@ -222,7 +382,6 @@ class CatanGame:
             "rows": [
                 ("現在の mode", mode_label),
                 ("現在の seed", str(self.board_seed)),
-                ("AIプレイヤー", f"{self.ai_player_count} 人"),
             ],
             "description": description,
             "accent": accent,
@@ -388,6 +547,13 @@ class CatanGame:
             )
             if is_ai:
                 cpu_index += 1
+        self.public_gain_history = {player.name: [] for player in self.players}
+        self.last_resource_distribution = {}
+        self.ai_status = {
+            "player_name": "",
+            "title": "AI待機中",
+            "detail": "AIの手番になると判断内容を表示します。",
+        }
         self.bank = ResourceBank()
         self.turn_order = self.players.copy()
         self.reset_initial_setup_state()
@@ -872,7 +1038,12 @@ class CatanGame:
         if self.is_ai_input_locked():
             active_ai = self.discard_player if self.special_phase == "discard" else player
             if active_ai is not None:
-                return [f"{active_ai.name} が考えています", "合法手から短い評価で行動を選びます。"]
+                status_title = self.ai_status.get("title", "次の行動を検討中")
+                if self.ai_status.get("player_name") != active_ai.name:
+                    status_title = "次の行動を検討中"
+                detail = self.ai_status.get("detail", "")
+                secondary = detail or "盤面・公開情報・自分の手札から合法手を比較します。"
+                return [f"{active_ai.name}: {status_title}", secondary]
         action_guidance = self.get_action_mode_guidance(player)
         if action_guidance:
             return build_side_panel_guidance(self.get_guidance_state(), action_guidance, [])
@@ -1103,6 +1274,18 @@ class CatanGame:
             )
             return buttons
 
+        if self.is_ai_input_locked():
+            add_custom(
+                "ai_speed_cycle",
+                f"AI速度: {self.get_ai_speed_label()}（A）",
+                base_x,
+                base_y,
+                available_width,
+                button_height,
+                highlighted=self.ai_paused,
+            )
+            return buttons
+
         if self.phase == "initial" and self.initial_dice_phase:
             add("player_count_2", "2人（簡易）", 0, 0, selected=len(self.players) == 2)
             add("player_count_3", "3人", 0, 1, selected=len(self.players) == 3)
@@ -1143,6 +1326,15 @@ class CatanGame:
                 button_height,
                 selected=self.ai_player_count > 0,
             )
+            add_custom(
+                "ai_speed_cycle",
+                f"AI速度: {self.get_ai_speed_label()}（クリックで変更）",
+                base_x,
+                base_y + 6 * (button_height + gap_y),
+                available_width,
+                button_height,
+                selected=self.get_ai_speed_label() != "標準",
+            )
             return buttons
 
         if self.phase == "finished":
@@ -1174,14 +1366,17 @@ class CatanGame:
                 if player is not current_player and player.total_resource_count() > 0
             ]
             for slot, (index, partner) in enumerate(partners):
-                add(
+                profile = self.get_public_production_profile(partner)
+                add_custom(
                     f"domestic_trade_partner_{index}",
-                    f"{partner.name}・{partner.total_resource_count()}枚",
-                    slot // 2,
-                    slot % 2,
+                    f"{partner.name}｜手札{partner.total_resource_count()}枚｜生産 {profile}",
+                    base_x,
+                    base_y + slot * (button_height + gap_y),
+                    available_width,
+                    button_height,
                     highlighted=True,
                 )
-            cancel_y = base_y + ((len(partners) + 1) // 2) * (button_height + gap_y)
+            cancel_y = base_y + len(partners) * (button_height + gap_y)
             add_custom(
                 "domestic_trade_cancel",
                 "交渉をやめる",
@@ -1558,10 +1753,17 @@ class CatanGame:
     def get_domestic_trade_guidance(self):
         partner_name = self.domestic_trade_partner.name if self.domestic_trade_partner is not None else "相手"
         if self.special_phase == "domestic_trade_partner":
-            return ["次: 交渉する相手を選ぶ", "手番プレイヤーと選んだ相手だけが交換できます。"]
+            return [
+                "次: 交渉する相手を選ぶ",
+                "生産傾向と直近公開獲得は推測用。現在の手札内訳は非公開です。",
+            ]
         if self.special_phase == "domestic_trade_edit":
             action = "条件変更を送る" if self.domestic_trade_is_counter else "提案を送る"
-            return [f"次: 資源と枚数を決めて「{action}」", self.get_domestic_trade_compact_summary()]
+            if self.domestic_trade_partner is not None:
+                public_summary = self.get_trade_partner_public_summary(self.domestic_trade_partner)
+            else:
+                public_summary = self.get_domestic_trade_compact_summary()
+            return [f"次: 資源と枚数を決めて「{action}」", public_summary]
         if self.special_phase == "domestic_trade_handoff":
             return [f"次: {partner_name} に画面を渡す", "手札の内訳を隠したまま回答画面へ進みます。"]
         if self.special_phase == "domestic_trade_response":
@@ -1578,7 +1780,10 @@ class CatanGame:
         if partner is None:
             return f"国内交易: {active_player.name} が相手を選択"
         prefix = "条件変更" if self.domestic_trade_is_counter else "提案"
-        return f"{prefix}: {active_player.name} ⇄ {partner.name} / {self.get_domestic_trade_compact_summary()}"
+        return (
+            f"{prefix}: {active_player.name} ⇄ {partner.name}（手札{partner.total_resource_count()}枚）"
+            f" / {self.get_domestic_trade_compact_summary()}"
+        )
 
     def has_domestic_trade_option(self, player):
         if player is None or player.total_resource_count() <= 0:
@@ -1815,6 +2020,8 @@ class CatanGame:
                 continue
             partner.remove_resource(resource_type, amount)
             active_player.add_resource(resource_type, amount)
+        self.record_public_gain(active_player, self.domestic_trade_receive, "国内交易")
+        self.record_public_gain(partner, self.domestic_trade_give, "国内交易")
         self.play_sound("card")
         self.add_log(
             f"国内交易成立: {active_player.name} は {give_text} を渡し、"
@@ -1913,6 +2120,7 @@ class CatanGame:
             player.remove_resource(give_resource, required)
             self.bank.deposit(give_resource, required)
             player.add_resource(resource_type)
+            self.record_public_gain(player, {resource_type: 1}, "銀行交易")
             self.play_sound("card")
             self.add_log(
                 f"{player.name} が銀行交易: {RESOURCE_LABELS[give_resource]} {required} 枚を"
@@ -1947,6 +2155,9 @@ class CatanGame:
         if action == "ai_count_cycle":
             if self.initial_dice_phase:
                 self.cycle_ai_player_count()
+            return
+        if action == "ai_speed_cycle":
+            self.cycle_ai_speed()
             return
         if action == "board_mode_constrained":
             self.set_board_mode("constrained")
@@ -2447,6 +2658,7 @@ class CatanGame:
             if not self.give_resource_from_bank(player, resource_type):
                 self.notify_invalid(f"銀行に {RESOURCE_LABELS[resource_type]} が残っていません。")
                 return
+            self.record_public_gain(player, {resource_type: 1}, "収穫")
             self.resource_selection_remaining -= 1
             self.add_log(
                 f"{player.name} が {resource_type.name} を獲得しました。"
@@ -2477,6 +2689,8 @@ class CatanGame:
                 player.add_resource(resource_type, amount)
                 total_taken += amount
             self.special_phase = None
+            if total_taken > 0:
+                self.record_public_gain(player, {resource_type: total_taken}, "独占")
             self.add_log(
                 f"{player.name} が独占カードで {resource_type.name} を {total_taken} 枚獲得しました。"
             )
@@ -2560,15 +2774,17 @@ class CatanGame:
         self.largest_army_size = max_knights
 
     def grant_initial_resources(self, player, settlement_node):
-        gained_resources = []
+        gained_resources = {}
         for tile in settlement_node.tiles:
             if tile.resource_type == ResourceType.DESERT:
                 continue
             if self.give_resource_from_bank(player, tile.resource_type):
-                gained_resources.append(tile.resource_type.name)
+                gained_resources[tile.resource_type] = gained_resources.get(tile.resource_type, 0) + 1
 
         if gained_resources:
-            self.add_log(f"{player.name} は初期資源を獲得: {', '.join(gained_resources)}")
+            gain_text = self.format_resource_bundle(gained_resources)
+            self.add_log(f"{player.name} は初期資源を獲得: {gain_text}")
+            self.record_public_gain(player, gained_resources, "初期配置")
         else:
             self.add_log(f"{player.name} の2回目の開拓地は砂漠に隣接しています。")
 
@@ -2664,6 +2880,8 @@ class CatanGame:
                 level="warning",
                 actor=current_player,
             )
+            if current_player is not None and current_player.is_ai:
+                self.set_ai_status(current_player, "出目 7 を解決", "捨て札と盗賊の移動を処理します")
             self.start_robber_phase()
         else:
             gains = self.distribute_resources(dice_roll)
@@ -2675,9 +2893,17 @@ class CatanGame:
                 actor=current_player,
             )
             self.add_log("建設・交易・交渉を行うか、手番を終了してください。")
+            if current_player is not None and current_player.is_ai:
+                public_gain = self.get_recent_public_gain_text(current_player)
+                detail = (
+                    f"公開獲得: {public_gain}"
+                    if current_player.name in self.last_resource_distribution
+                    else "この出目での獲得はありません"
+                )
+                self.set_ai_status(current_player, f"出目 {dice_roll} を解決", detail)
         self.dice_rolled = True
         if current_player is not None and current_player.is_ai:
-            self.schedule_ai_action(1.35)
+            self.schedule_ai_action(1.6)
 
     def advance_initial_phase(self, current_player):
         self.add_log(f"{current_player.name} の初期配置が完了しました。")
@@ -2728,6 +2954,12 @@ class CatanGame:
         )
         if self.should_hide_for_handoff(previous_player, first_player):
             self.begin_player_handoff(first_player, context="最初の手番")
+        if first_player is not None and first_player.is_ai:
+            self.set_ai_status(
+                first_player,
+                "手番を開始",
+                f"公開手札総数 {first_player.total_resource_count()}枚",
+            )
         self.schedule_ai_action()
 
     def handle_initial_placement(self, pos):
@@ -2879,6 +3111,12 @@ class CatanGame:
             return
         self.add_log(f"{next_player.name} の手番です。")
         self.add_log("スペースでダイス、発展カードは K/B/Y/M、銀行交易は T、交渉は P です。")
+        if next_player.is_ai:
+            self.set_ai_status(
+                next_player,
+                "手番を開始",
+                f"公開手札総数 {next_player.total_resource_count()}枚",
+            )
         if self.should_hide_for_handoff(current_player, next_player):
             self.begin_player_handoff(next_player, context="手番")
 
@@ -3116,6 +3354,8 @@ class CatanGame:
         return player is not None and player.is_ai
 
     def update_ai(self):
+        if self.ai_paused:
+            return
         now = pygame.time.get_ticks()
         if now < self.ai_next_action_at:
             return
@@ -3129,8 +3369,7 @@ class CatanGame:
                 self.running = False
                 continue
 
-            if event.type == pygame.KEYDOWN and event.key == pygame.K_h:
-                self.show_help_panel = not self.show_help_panel
+            if self.handle_global_ui_event(event):
                 continue
 
             if self.phase == "finished":
@@ -3267,6 +3506,8 @@ class CatanGame:
 
     def distribute_resources(self, dice_roll):
         gain_summaries = []
+        gains_by_player = {}
+        self.last_resource_distribution = {}
         demands = {resource_type: {} for resource_type in RESOURCE_TYPES}
         tiles = self.board.get_tiles_with_number(dice_roll)
         for tile in tiles:
@@ -3307,6 +3548,11 @@ class CatanGame:
                 self.give_resource_from_bank(player, resource_type, amount)
                 self.add_log(f"{player.name} が {RESOURCE_LABELS[resource_type]} を {amount} 枚獲得しました。")
                 gain_summaries.append(f"{player.name}: {RESOURCE_LABELS[resource_type]} +{amount}")
+                player_gains = gains_by_player.setdefault(player, {})
+                player_gains[resource_type] = player_gains.get(resource_type, 0) + amount
+        for player, bundle in gains_by_player.items():
+            self.last_resource_distribution[player.name] = dict(bundle)
+            self.record_public_gain(player, bundle, f"出目{dice_roll}")
         return gain_summaries
 
     def update(self):
@@ -3338,6 +3584,8 @@ class CatanGame:
             self.log_messages,
             panel_height=log_height,
             latest_event=self.latest_event,
+            expanded=self.show_log_panel,
+            scroll_offset=self.log_scroll_offset,
         )
         help_title, help_lines, help_accent = self.get_help_panel_content()
         draw_help_panel(self.screen, help_title, help_lines, help_accent, collapsed=help_collapsed)
@@ -3371,6 +3619,10 @@ class CatanGame:
             visible_player=visible_resource_player,
             reveal_all=self.phase == "finished",
             current_player=board_active_player,
+            public_gain_by_player={
+                player.name: self.get_recent_public_gain_text(player)
+                for player in self.players
+            },
         )
         progress = self.get_progress_header_data()
         draw_progress_header(
