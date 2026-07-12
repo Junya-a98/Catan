@@ -88,7 +88,7 @@ def draw_log(
         screen.blit(panel_surface, panel_rect.topleft)
 
         compact_font = _load_font(15)
-        label = f"L: 履歴を表示  ({len(log_messages)}件)"
+        label = f"L:履歴({len(log_messages)})  F5:保存  F9:読込"
         label_surface = compact_font.render(label, True, COLORS["WARNING"])
         screen.blit(label_surface, (panel_rect.x + 14, panel_rect.y + 7))
         if latest_event:

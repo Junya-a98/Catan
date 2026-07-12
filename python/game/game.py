@@ -39,6 +39,12 @@ from game.game_board import GameBoard
 from game.guidance import GuidanceState, build_action_mode_guidance, build_help_panel_content, build_side_panel_guidance
 from game.hex_tile import get_token_pip_count
 from game.log_display import draw_log, draw_resource_counts
+from game.persistence import (
+    DEFAULT_SAVE_PATH,
+    SaveGameError,
+    load_game as load_game_file,
+    save_game as save_game_file,
+)
 from game.player import Player
 from game.resources import BUILD_COSTS, ResourceType
 from game.road import Road
@@ -114,6 +120,7 @@ class CatanGame:
         self.show_help_panel = False
         self.show_log_panel = False
         self.log_scroll_offset = 0
+        self.quick_save_path = DEFAULT_SAVE_PATH
 
         self.phase = "initial"  # "initial", "main", "finished"
         self.initial_dice_phase = True
@@ -292,6 +299,37 @@ class CatanGame:
         self.log_messages = []
         self.log_scroll_offset = 0
 
+    def quick_save(self):
+        try:
+            path = save_game_file(self, self.quick_save_path)
+        except SaveGameError as exc:
+            self.notify_invalid(str(exc))
+            return False
+        self.record_event(
+            "クイックセーブ完了",
+            path.name,
+            level="success",
+            include_in_turn=False,
+        )
+        self.notify(f"ゲームを保存しました: {path.name}", level="success")
+        return True
+
+    def quick_load(self):
+        try:
+            path = load_game_file(self, self.quick_save_path)
+        except SaveGameError as exc:
+            self.notify_invalid(str(exc))
+            return False
+        self.log_scroll_offset = 0
+        self.record_event(
+            "クイックロード完了",
+            path.name,
+            level="success",
+            include_in_turn=False,
+        )
+        self.notify(f"ゲームを読み込みました: {path.name}", level="success")
+        return True
+
     def toggle_log_panel(self):
         self.show_log_panel = not self.show_log_panel
         if not self.show_log_panel:
@@ -310,6 +348,12 @@ class CatanGame:
         )
 
     def handle_global_ui_event(self, event):
+        if event.type == pygame.KEYDOWN and event.key == pygame.K_F5:
+            self.quick_save()
+            return True
+        if event.type == pygame.KEYDOWN and event.key == pygame.K_F9:
+            self.quick_load()
+            return True
         if event.type == pygame.KEYDOWN and event.key == pygame.K_l:
             self.toggle_log_panel()
             return True
