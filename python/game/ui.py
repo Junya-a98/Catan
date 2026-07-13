@@ -367,6 +367,148 @@ def draw_progress_header(screen, title, instruction, steps, actor_color=None, is
     _draw_inline_phase_steps(screen, tracker_rect, steps)
 
 
+def draw_replay_status_card(
+    screen,
+    rect,
+    event_title,
+    event_detail,
+    frame_index,
+    total_frames,
+    *,
+    is_playing=False,
+    keyboard_hint="Space 再生/停止  ←/→ 前後  Home/End 端へ",
+):
+    """Draw a compact replay timeline card and return its measured layout.
+
+    ``frame_index`` is zero-based.  A 298 x 122 rectangle fits the standard
+    right-panel content width; wider rectangles can also replace the board
+    progress header without changing the layout contract.
+    """
+    card_rect = pygame.Rect(rect)
+    if card_rect.width < 240 or card_rect.height < 118:
+        raise ValueError("Replay status card requires at least 240 x 118 pixels")
+    card_rect.clamp_ip(screen.get_rect())
+
+    total = max(0, int(total_frames))
+    if total:
+        clamped_index = max(0, min(int(frame_index), total - 1))
+        frame_number = clamped_index + 1
+        progress = clamped_index / (total - 1) if total > 1 else 1.0
+    else:
+        clamped_index = 0
+        frame_number = 0
+        progress = 0.0
+
+    shadow_rect = card_rect.move(3, 4)
+    shadow = pygame.Surface(shadow_rect.size, pygame.SRCALPHA)
+    pygame.draw.rect(shadow, (4, 8, 14, 110), shadow.get_rect(), border_radius=16)
+    screen.blit(shadow, shadow_rect.topleft)
+
+    card_surface = pygame.Surface(card_rect.size, pygame.SRCALPHA)
+    pygame.draw.rect(card_surface, (*COLORS["PANEL_BG"], 242), card_surface.get_rect(), border_radius=14)
+    pygame.draw.rect(card_surface, COLORS["PANEL_BORDER"], card_surface.get_rect(), 2, border_radius=14)
+    screen.blit(card_surface, card_rect.topleft)
+
+    accent_color = COLORS["SUCCESS"] if is_playing else COLORS["WARNING"]
+    accent_rect = pygame.Rect(card_rect.x + 2, card_rect.y + 12, 4, card_rect.height - 24)
+    pygame.draw.rect(screen, accent_color, accent_rect, border_radius=2)
+
+    status_font = _load_font(12)
+    status_text = "▶ 再生中" if is_playing else "Ⅱ 一時停止"
+    status_surface = status_font.render(status_text, True, COLORS["WHITE"])
+    status_rect = pygame.Rect(0, 0, status_surface.get_width() + 18, 23)
+    status_rect.topleft = (card_rect.x + 14, card_rect.y + 9)
+    status_fill = (35, 91, 66) if is_playing else (76, 60, 34)
+    pygame.draw.rect(screen, status_fill, status_rect, border_radius=10)
+    pygame.draw.rect(screen, accent_color, status_rect, 1, border_radius=10)
+    screen.blit(status_surface, status_surface.get_rect(center=status_rect.center))
+
+    frame_font = _load_font(13)
+    frame_text = f"{frame_number} / {total}"
+    frame_surface = frame_font.render(frame_text, True, COLORS["WHITE"])
+    frame_rect = frame_surface.get_rect(
+        right=card_rect.right - 14,
+        centery=status_rect.centery,
+    )
+    screen.blit(frame_surface, frame_rect)
+
+    hint_font = _load_font(11)
+    detail_font = _load_font(13)
+    title_font = _load_font(16)
+    hint_y = card_rect.bottom - hint_font.get_height() - 7
+    progress_rect = pygame.Rect(card_rect.x + 14, hint_y - 14, card_rect.width - 28, 8)
+    detail_y = progress_rect.top - detail_font.get_height() - 6
+    title_y = detail_y - title_font.get_height() - 1
+
+    title_text = _truncate_text(
+        title_font,
+        event_title or "イベントなし",
+        card_rect.width - 28,
+    )
+    detail_text = _truncate_text(
+        detail_font,
+        event_detail or "記録された詳細はありません",
+        card_rect.width - 28,
+    )
+    title_surface = title_font.render(title_text, True, COLORS["WHITE"])
+    detail_surface = detail_font.render(detail_text, True, COLORS["TEXT_MUTED"])
+    title_rect = title_surface.get_rect(x=card_rect.x + 14, y=title_y)
+    detail_rect = detail_surface.get_rect(x=card_rect.x + 14, y=detail_y)
+    screen.blit(title_surface, title_rect)
+    screen.blit(detail_surface, detail_rect)
+
+    pygame.draw.rect(screen, (35, 47, 59), progress_rect, border_radius=4)
+    pygame.draw.rect(screen, COLORS["CARD_BORDER"], progress_rect, 1, border_radius=4)
+    progress_width = round(progress_rect.width * progress)
+    progress_fill_rect = pygame.Rect(
+        progress_rect.x,
+        progress_rect.y,
+        progress_width,
+        progress_rect.height,
+    )
+    if progress_fill_rect.width:
+        pygame.draw.rect(screen, COLORS["BUTTON_ACTIVE"], progress_fill_rect, border_radius=4)
+        if progress_fill_rect.width >= 5:
+            pygame.draw.line(
+                screen,
+                (139, 190, 231),
+                (progress_fill_rect.left + 2, progress_fill_rect.top + 2),
+                (progress_fill_rect.right - 2, progress_fill_rect.top + 2),
+                1,
+            )
+    scrubber_x = round(progress_rect.left + (progress_rect.width - 1) * progress)
+    scrubber_center = (scrubber_x, progress_rect.centery)
+    pygame.draw.circle(screen, (19, 27, 37), scrubber_center, 5)
+    pygame.draw.circle(screen, accent_color, scrubber_center, 4)
+    pygame.draw.circle(screen, COLORS["WHITE"], scrubber_center, 4, 1)
+
+    hint_text = _truncate_text(hint_font, keyboard_hint, card_rect.width - 28)
+    hint_surface = hint_font.render(hint_text, True, COLORS["WARNING"])
+    hint_rect = hint_surface.get_rect(x=card_rect.x + 14, y=hint_y)
+    screen.blit(hint_surface, hint_rect)
+
+    return {
+        "card_rect": card_rect,
+        "accent_rect": accent_rect,
+        "status_rect": status_rect,
+        "frame_rect": frame_rect,
+        "title_rect": title_rect,
+        "detail_rect": detail_rect,
+        "progress_rect": progress_rect,
+        "progress_fill_rect": progress_fill_rect,
+        "scrubber_center": scrubber_center,
+        "hint_rect": hint_rect,
+        "frame_index": clamped_index,
+        "frame_number": frame_number,
+        "total_frames": total,
+        "progress": progress,
+        "is_playing": bool(is_playing),
+        "title_text": title_text,
+        "detail_text": detail_text,
+        "hint_text": hint_text,
+    }
+
+
 def _draw_inline_phase_steps(screen, rect, steps):
     if not steps:
         return

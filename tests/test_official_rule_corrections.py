@@ -71,9 +71,10 @@ def test_development_purchase_log_keeps_card_type_private():
         close_game(game)
 
 
-def test_player_already_at_ten_points_wins_at_start_of_their_turn_without_rolling():
+def test_player_already_at_ten_points_wins_at_start_of_their_turn_without_rolling(tmp_path):
     game = create_game()
     try:
+        game.replay_dir = tmp_path / "replays"
         game.start_main_phase()
         next_player = game.turn_order[1]
         next_player.victory_point_cards = 10

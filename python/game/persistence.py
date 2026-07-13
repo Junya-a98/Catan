@@ -1,6 +1,7 @@
 import json
 import os
 from pathlib import Path
+import random
 
 from game.assets import PROJECT_ROOT
 from game.ai import AI_SPEED_OPTIONS
@@ -310,7 +311,7 @@ def _validate_save_header(data):
         raise SaveGameError("プレイヤー数が不正です。")
 
 
-def restore_game(game, data):
+def restore_game(game, data, *, runtime_side_effects=True):
     _validate_save_header(data)
     board_data = data["board"]
     player_data = data["players"]
@@ -339,7 +340,20 @@ def restore_game(game, data):
     if not isinstance(ai_player_count, int) or not 0 <= ai_player_count < len(player_data):
         raise SaveGameError("AIプレイヤー数が不正です。")
     game.ai_player_count = ai_player_count
-    game.configure_players(len(player_data), reset_logs=False)
+    # Rebuilding the player objects creates a shuffled placeholder development
+    # deck.  A replay seek must not consume the process-wide RNG or arm the AI
+    # timer, because historical frames are strictly read-only.
+    random_state = random.getstate() if not runtime_side_effects else None
+    try:
+        game.configure_players(
+            len(player_data),
+            reset_logs=False,
+            schedule_ai=runtime_side_effects,
+            reset_replay=False,
+        )
+    finally:
+        if random_state is not None:
+            random.setstate(random_state)
 
     for index, saved_player in enumerate(player_data):
         if not isinstance(saved_player, dict):
@@ -628,7 +642,8 @@ def restore_game(game, data):
     game.buttons = game.build_buttons()
 
     _validate_restored_game(game)
-    game.schedule_ai_action()
+    if runtime_side_effects:
+        game.schedule_ai_action()
 
 
 def _validate_restored_game(game):

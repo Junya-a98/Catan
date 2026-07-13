@@ -45,11 +45,21 @@ from game.persistence import (
     DEFAULT_SAVE_PATH,
     SaveGameError,
     load_game as load_game_file,
+    restore_game as restore_game_state,
     save_game as save_game_file,
+    serialize_game,
 )
 from game.player import Player
 from game.resources import BUILD_COSTS, ResourceType
 from game.road import Road
+from game.replay import (
+    DEFAULT_REPLAY_DIR,
+    ReplayError,
+    ReplayRecorder,
+    find_latest_replay,
+    load_replay,
+    restore_replay_frame,
+)
 from game.ui import (
     RESOURCE_LABELS,
     PhaseStep,
@@ -58,6 +68,7 @@ from game.ui import (
     draw_help_panel,
     draw_ocean_background,
     draw_progress_header,
+    draw_replay_status_card,
     draw_side_panel,
     draw_transient_message,
 )
@@ -124,6 +135,19 @@ class CatanGame:
         self.show_log_panel = False
         self.log_scroll_offset = 0
         self.quick_save_path = DEFAULT_SAVE_PATH
+        self.replay_dir = DEFAULT_REPLAY_DIR
+        self.replay_recorder = None
+        self.replay_pending_capture = None
+        self.replay_archive = None
+        self.replay_index = 0
+        self.replay_mode = False
+        self.replay_playing = False
+        self.replay_reveal_all = False
+        self.replay_help_visible = False
+        self.replay_next_frame_at = 0
+        self.replay_exit_snapshot = None
+        self.replay_runtime_state = None
+        self.latest_replay_path = None
 
         self.phase = "initial"  # "initial", "main", "finished"
         self.initial_dice_phase = True
@@ -173,6 +197,8 @@ class CatanGame:
         self.add_log("ゲーム開始: 初期配置フェーズです。")
         self.add_log("プレイヤー数は 2/3/4 キーまたは右のボタンで変更できます。")
         self.add_log("人間プレイヤーはスペースキーで初期ダイスを振ります。AIは自動で進行します。")
+        self.reset_replay_recording()
+        self.refresh_latest_replay_path()
 
     def add_log(self, message):
         if self.log_scroll_offset > 0:
@@ -184,7 +210,16 @@ class CatanGame:
         )
         print(message)
 
-    def record_event(self, title, detail="", *, level="info", actor=None, include_in_turn=True):
+    def record_event(
+        self,
+        title,
+        detail="",
+        *,
+        level="info",
+        actor=None,
+        include_in_turn=True,
+        capture_replay=True,
+    ):
         color = actor.color if actor is not None else COLORS["PANEL_BORDER"]
         self.latest_event = {
             "title": title,
@@ -197,6 +232,249 @@ class CatanGame:
             if summary and summary not in self.turn_summary_entries:
                 self.turn_summary_entries.append(summary)
                 self.turn_summary_entries = self.turn_summary_entries[-6:]
+        if capture_replay and not self.replay_mode and self.replay_recorder is not None:
+            # The actual snapshot is deferred until the action method returns.
+            # Several flows set their special phase immediately after logging.
+            self.replay_pending_capture = title
+
+    def refresh_latest_replay_path(self):
+        try:
+            self.latest_replay_path = find_latest_replay(self.replay_dir)
+        except ReplayError:
+            self.latest_replay_path = None
+        return self.latest_replay_path
+
+    def reset_replay_recording(self):
+        """Start a fresh, bounded recording from the current pre-game state."""
+        if self.replay_mode:
+            return False
+        self.replay_recorder = ReplayRecorder(
+            metadata={
+                "title": "ローカル対局リプレイ",
+                "visibility": "private-full-state",
+            }
+        )
+        self.replay_pending_capture = None
+        self.replay_archive = None
+        try:
+            self.replay_recorder.capture(self, label="対局準備", elapsed_ms=0)
+        except ReplayError:
+            self.replay_recorder = None
+            return False
+        return True
+
+    def flush_replay_capture(self, *, force_latest=False):
+        """Capture one stable semantic event, never a half-resolved dice roll."""
+        if (
+            self.replay_mode
+            or self.replay_recorder is None
+            or self.replay_pending_capture is None
+            or self.has_active_dice_animation()
+            or self.pending_dice_context is not None
+            or self.pending_dice_roll is not None
+        ):
+            return False
+        label = self.replay_pending_capture
+        self.replay_pending_capture = None
+        try:
+            self.replay_recorder.capture(
+                self,
+                label=label,
+                replace_last_if_full=force_latest,
+            )
+        except ReplayError as exc:
+            self.add_log(f"リプレイ記録を継続できません: {exc}")
+            return False
+        return True
+
+    def save_completed_replay(self):
+        if self.replay_recorder is None:
+            return None
+        self.flush_replay_capture()
+        try:
+            self.replay_archive = self.replay_recorder.archive()
+            path = self.replay_recorder.save(replay_dir=self.replay_dir)
+        except ReplayError as exc:
+            self.add_log(f"リプレイを保存できませんでした: {exc}")
+            return None
+        self.latest_replay_path = path
+        self.add_log(f"リプレイを保存しました: {path.name}")
+        return path
+
+    def get_current_replay_frame(self):
+        if self.replay_archive is None or not self.replay_archive.frames:
+            return None
+        return self.replay_archive.frames[self.replay_index]
+
+    def show_replay_frame(self, index):
+        if not self.replay_mode or self.replay_archive is None:
+            return False
+        index = max(0, min(int(index), len(self.replay_archive.frames) - 1))
+        try:
+            restore_replay_frame(
+                self,
+                self.replay_archive,
+                index,
+                validate_archive=False,
+            )
+        except ReplayError as exc:
+            self.replay_playing = False
+            self.notify_invalid(str(exc))
+            return False
+        self.replay_index = index
+        self.show_log_panel = False
+        self.show_help_panel = self.replay_help_visible
+        self.log_scroll_offset = 0
+        self.feedback.clear()
+        self.buttons = self.build_buttons()
+        return True
+
+    def start_replay(self, archive=None):
+        """Open a completed match as a read-only viewer."""
+        if self.replay_mode:
+            return True
+        if not (
+            self.phase == "finished"
+            or (self.phase == "initial" and self.initial_dice_phase)
+        ):
+            self.notify_invalid("リプレイは対局終了後か開始前に開けます。")
+            return False
+
+        try:
+            if archive is None:
+                if self.phase == "finished" and self.replay_archive is not None:
+                    archive = self.replay_archive
+                else:
+                    replay_path = self.refresh_latest_replay_path()
+                    if replay_path is None:
+                        raise ReplayError("保存済みのリプレイがありません。")
+                    # Structural limits are checked up front.  Each frame gets
+                    # full semantic validation when it is shown, avoiding a
+                    # long startup pause on large replays.
+                    archive = load_replay(replay_path)
+            origin = serialize_game(self)
+        except (ReplayError, SaveGameError) as exc:
+            self.notify_invalid(str(exc))
+            return False
+
+        now = pygame.time.get_ticks()
+        self.replay_exit_snapshot = origin
+        self.replay_runtime_state = {
+            "random_state": random.getstate(),
+            "ai_remaining_ms": max(0, self.ai_next_action_at - now),
+        }
+        self.replay_archive = archive
+        self.replay_index = 0
+        self.replay_playing = False
+        self.replay_reveal_all = False
+        self.replay_help_visible = False
+        self.replay_mode = True
+        if not self.show_replay_frame(0):
+            self.replay_mode = False
+            self.replay_archive = None
+            self.replay_exit_snapshot = None
+            self.replay_runtime_state = None
+            try:
+                restore_game_state(self, origin, runtime_side_effects=False)
+            except SaveGameError:
+                pass
+            return False
+        return True
+
+    def exit_replay(self):
+        if not self.replay_mode or self.replay_exit_snapshot is None:
+            return False
+        origin = self.replay_exit_snapshot
+        runtime_state = self.replay_runtime_state or {}
+        self.replay_playing = False
+        self.replay_mode = False
+        try:
+            restore_game_state(self, origin, runtime_side_effects=False)
+        except SaveGameError as exc:
+            self.replay_mode = True
+            self.notify_invalid(f"リプレイ終了時の復元に失敗しました: {exc}")
+            return False
+        random_state = runtime_state.get("random_state")
+        if random_state is not None:
+            random.setstate(random_state)
+        self.ai_next_action_at = pygame.time.get_ticks() + int(
+            runtime_state.get("ai_remaining_ms", 0)
+        )
+        self.replay_exit_snapshot = None
+        self.replay_runtime_state = None
+        self.replay_reveal_all = False
+        self.replay_help_visible = False
+        self.buttons = self.build_buttons()
+        return True
+
+    def toggle_replay_playback(self):
+        if not self.replay_mode or self.replay_archive is None:
+            return False
+        if not self.replay_playing and self.replay_index >= len(self.replay_archive.frames) - 1:
+            self.show_replay_frame(0)
+        self.replay_playing = not self.replay_playing
+        self.replay_next_frame_at = pygame.time.get_ticks() + 850
+        return True
+
+    def handle_replay_action(self, action):
+        if action == "replay_first":
+            self.replay_playing = False
+            return self.show_replay_frame(0)
+        if action == "replay_previous":
+            self.replay_playing = False
+            return self.show_replay_frame(self.replay_index - 1)
+        if action == "replay_play_pause":
+            return self.toggle_replay_playback()
+        if action == "replay_next":
+            self.replay_playing = False
+            return self.show_replay_frame(self.replay_index + 1)
+        if action == "replay_last":
+            self.replay_playing = False
+            return self.show_replay_frame(len(self.replay_archive.frames) - 1)
+        if action == "replay_toggle_reveal":
+            self.replay_reveal_all = not self.replay_reveal_all
+            return True
+        if action == "replay_exit":
+            return self.exit_replay()
+        return False
+
+    def handle_replay_event(self, event):
+        if event.type == pygame.KEYDOWN:
+            key_actions = {
+                pygame.K_HOME: "replay_first",
+                pygame.K_LEFT: "replay_previous",
+                pygame.K_SPACE: "replay_play_pause",
+                pygame.K_RIGHT: "replay_next",
+                pygame.K_END: "replay_last",
+                pygame.K_v: "replay_toggle_reveal",
+                pygame.K_ESCAPE: "replay_exit",
+            }
+            if event.key == pygame.K_h:
+                self.replay_help_visible = not self.replay_help_visible
+                self.show_help_panel = self.replay_help_visible
+                return True
+            action = key_actions.get(event.key)
+            if action is not None:
+                self.handle_replay_action(action)
+            return True
+        if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+            clicked_button = self.find_clicked_button(event.pos)
+            if clicked_button is not None:
+                self.handle_replay_action(clicked_button.action)
+            return True
+        return event.type in (pygame.MOUSEWHEEL, pygame.TEXTINPUT)
+
+    def update_replay(self):
+        if not self.replay_mode or not self.replay_playing or self.replay_archive is None:
+            return
+        now = pygame.time.get_ticks()
+        if now < self.replay_next_frame_at:
+            return
+        if self.replay_index >= len(self.replay_archive.frames) - 1:
+            self.replay_playing = False
+            return
+        self.show_replay_frame(self.replay_index + 1)
+        self.replay_next_frame_at = now + 850
 
     def play_sound(self, sound_name):
         self.audio.play(sound_name)
@@ -209,6 +487,7 @@ class CatanGame:
         return AI_SPEED_OPTIONS[self.ai_speed_index][0]
 
     def cycle_ai_speed(self):
+        reset_replay = self.can_edit_pre_game_settings()
         self.ai_speed_index = (self.ai_speed_index + 1) % len(AI_SPEED_OPTIONS)
         _, delay_ms = AI_SPEED_OPTIONS[self.ai_speed_index]
         self.ai_paused = delay_ms is None
@@ -216,6 +495,8 @@ class CatanGame:
             self.ai_action_delay_ms = delay_ms
             self.schedule_ai_action(0.45)
         self.add_log(f"AI速度を「{self.get_ai_speed_label()}」に変更しました。")
+        if reset_replay:
+            self.reset_replay_recording()
 
     def set_ai_status(self, player, title, detail="", *, log=False):
         if player is None or not player.is_ai:
@@ -313,6 +594,7 @@ class CatanGame:
             path.name,
             level="success",
             include_in_turn=False,
+            capture_replay=False,
         )
         self.notify(f"ゲームを保存しました: {path.name}", level="success")
         return True
@@ -324,11 +606,13 @@ class CatanGame:
             self.notify_invalid(str(exc))
             return False
         self.log_scroll_offset = 0
+        self.reset_replay_recording()
         self.record_event(
             "クイックロード完了",
             path.name,
             level="success",
             include_in_turn=False,
+            capture_replay=False,
         )
         self.notify(f"ゲームを読み込みました: {path.name}", level="success")
         return True
@@ -351,6 +635,8 @@ class CatanGame:
         )
 
     def handle_global_ui_event(self, event):
+        if self.replay_mode:
+            return self.handle_replay_event(event)
         if event.type == pygame.KEYDOWN and event.key == pygame.K_F5:
             self.quick_save()
             return True
@@ -419,13 +705,15 @@ class CatanGame:
     def get_pre_game_board_summary(self):
         mode_label = "制約付き" if self.board_mode == "constrained" else "公式ランダム"
         if self.board_mode == "constrained":
-            description = "6/8 隣接を避け、高期待値数字の資源偏りと港の噛み合いを抑えます。"
+            description = "6/8隣接と数字・港の偏りを抑制。"
         else:
-            description = "資源・数字・港をシャッフルし、公式どおり6/8の隣接だけは避けます。"
+            description = "公式条件で資源・数字・港をシャッフル。"
 
-        accent = "クリックして seed を編集します。Enter で反映、Esc で入力終了。"
-        if self.seed_input_active:
-            accent = "seed 入力中: Backspace で修正、Enter で盤面を更新します。"
+        accent = "seed欄をクリックで編集"
+        if not self.can_edit_pre_game_settings():
+            accent = "初期ダイス開始後は設定を固定"
+        elif self.seed_input_active:
+            accent = "入力中: Enterで反映 / Escで終了"
 
         return {
             "title": "盤面サマリー",
@@ -438,9 +726,19 @@ class CatanGame:
             "accent": accent,
         }
 
+    def can_edit_pre_game_settings(self):
+        return bool(
+            self.phase == "initial"
+            and self.initial_dice_phase
+            and not any(self.initial_dice_histories.values())
+            and self.pending_dice_context is None
+            and self.pending_dice_roll is None
+            and not self.has_active_dice_animation()
+        )
+
     def rebuild_pre_game_board(self, *, announcement=None):
-        if self.phase != "initial" or not self.initial_dice_phase:
-            self.notify_invalid("盤面設定はゲーム開始前のみ変更できます。")
+        if not self.can_edit_pre_game_settings():
+            self.notify_invalid("盤面設定は初期ダイスを振る前だけ変更できます。")
             return False
 
         player_count = len(self.players) or 2
@@ -456,6 +754,9 @@ class CatanGame:
         return True
 
     def apply_seed_text(self):
+        if not self.can_edit_pre_game_settings():
+            self.notify_invalid("seedは初期ダイスを振る前だけ変更できます。")
+            return False
         if not self.board_seed_text.isdigit():
             self.notify_invalid("seed は半角数字で入力してください。")
             return False
@@ -464,6 +765,9 @@ class CatanGame:
         return self.rebuild_pre_game_board(announcement="seed を反映して盤面を更新しました。")
 
     def randomize_board_seed(self):
+        if not self.can_edit_pre_game_settings():
+            self.notify_invalid("盤面は初期ダイスを振る前だけ再生成できます。")
+            return False
         self.board_seed = self.generate_board_seed()
         self.board_seed_text = str(self.board_seed)
         self.seed_input_active = False
@@ -482,32 +786,42 @@ class CatanGame:
         self.add_log("人数・AI・勝利点・盤面を確認して、初期ダイスを振ってください。")
 
     def set_board_mode(self, mode):
+        if not self.can_edit_pre_game_settings():
+            self.notify_invalid("盤面modeは初期ダイスを振る前だけ変更できます。")
+            return False
         if mode not in ("constrained", "fully_random"):
-            return
+            return False
         if self.board_mode == mode:
-            return
+            return False
         self.board_mode = mode
         self.seed_input_active = False
-        self.rebuild_pre_game_board(announcement=f"盤面 mode を {mode} に切り替えました。")
+        return self.rebuild_pre_game_board(announcement=f"盤面 mode を {mode} に切り替えました。")
 
     def set_ai_player_count(self, ai_player_count):
+        if not self.can_edit_pre_game_settings():
+            self.notify_invalid("AI人数は初期ダイスを振る前だけ変更できます。")
+            return False
         player_count = len(self.players) or 2
         self.ai_player_count = max(0, min(int(ai_player_count), player_count - 1))
         self.configure_players(player_count)
+        return True
 
     def cycle_ai_player_count(self):
         player_count = len(self.players) or 2
         self.set_ai_player_count((self.ai_player_count + 1) % player_count)
 
     def adjust_victory_point_target(self, delta):
-        if self.phase != "initial" or not self.initial_dice_phase:
+        if not self.can_edit_pre_game_settings():
             return False
         previous = self.victory_point_target
         self.victory_point_target = max(
             MIN_VICTORY_POINT_TARGET,
             min(MAX_VICTORY_POINT_TARGET, previous + int(delta)),
         )
-        return self.victory_point_target != previous
+        changed = self.victory_point_target != previous
+        if changed:
+            self.reset_replay_recording()
+        return changed
 
     def reset_pending_dice_state(self):
         self.pending_dice_context = None
@@ -604,7 +918,14 @@ class CatanGame:
         self.waiting_for_road = False
         self.last_settlement_node = None
 
-    def configure_players(self, player_count, reset_logs=True):
+    def configure_players(
+        self,
+        player_count,
+        reset_logs=True,
+        *,
+        schedule_ai=True,
+        reset_replay=True,
+    ):
         self.ai_player_count = min(self.ai_player_count, max(0, player_count - 1))
         human_player_count = player_count - self.ai_player_count
         self.players = []
@@ -644,7 +965,8 @@ class CatanGame:
         self.reset_pending_dice_state()
         self.phase = "initial"
         self.development_deck = create_development_deck()
-        self.schedule_ai_action()
+        if schedule_ai:
+            self.schedule_ai_action()
         self.buttons = self.build_buttons()
         self.show_help_panel = False
         self.seed_input_active = False
@@ -662,6 +984,8 @@ class CatanGame:
             if player_count == 2:
                 self.add_log("2人プレイは公式基本ゲーム外の簡易バリアントです。公式準拠は3〜4人です。")
             self.add_log("人間プレイヤーはスペースキーで初期ダイスを振ります。AIは自動で進行します。")
+        if reset_replay and self.replay_recorder is not None:
+            self.reset_replay_recording()
 
     def get_current_player(self):
         if not self.turn_order:
@@ -1339,6 +1663,33 @@ class CatanGame:
                 UIButton(action, label, rect, enabled=enabled, selected=selected, highlighted=highlighted)
             )
 
+        if self.replay_mode:
+            total_frames = len(self.replay_archive.frames) if self.replay_archive is not None else 0
+            at_first = self.replay_index <= 0
+            at_last = self.replay_index >= total_frames - 1
+            add("replay_first", "|◀ 先頭", 0, 0, enabled=not at_first)
+            add("replay_previous", "◀ 前へ", 0, 1, enabled=not at_first)
+            add(
+                "replay_play_pause",
+                "Ⅱ 停止" if self.replay_playing else "▶ 自動再生",
+                1,
+                0,
+                highlighted=True,
+            )
+            add("replay_next", "次へ ▶", 1, 1, enabled=not at_last)
+            add("replay_last", "末尾 ▶|", 2, 0, enabled=not at_last)
+            add("replay_exit", "終了 Esc", 2, 1)
+            add_custom(
+                "replay_toggle_reveal",
+                "全員の手札を隠す（V）" if self.replay_reveal_all else "全員の手札を公開（V）",
+                base_x,
+                base_y + 3 * (button_height + gap_y),
+                available_width,
+                button_height,
+                selected=self.replay_reveal_all,
+            )
+            return buttons
+
         current_player = self.get_current_player()
         if self.special_phase == "player_handoff":
             add_custom(
@@ -1365,9 +1716,31 @@ class CatanGame:
             return buttons
 
         if self.phase == "initial" and self.initial_dice_phase:
-            add("player_count_2", "2人（簡易）", 0, 0, selected=len(self.players) == 2)
-            add("player_count_3", "3人", 0, 1, selected=len(self.players) == 3)
-            add("player_count_4", "4人", 1, 0, selected=len(self.players) == 4)
+            settings_unlocked = self.can_edit_pre_game_settings()
+            add(
+                "player_count_2",
+                "2人（簡易）",
+                0,
+                0,
+                enabled=settings_unlocked,
+                selected=len(self.players) == 2,
+            )
+            add(
+                "player_count_3",
+                "3人",
+                0,
+                1,
+                enabled=settings_unlocked,
+                selected=len(self.players) == 3,
+            )
+            add(
+                "player_count_4",
+                "4人",
+                1,
+                0,
+                enabled=settings_unlocked,
+                selected=len(self.players) == 4,
+            )
             add(
                 "initial_roll",
                 "初期ダイス",
@@ -1376,8 +1749,22 @@ class CatanGame:
                 enabled=bool(self.players),
                 highlighted="initial_roll" in actionable_actions,
             )
-            add("board_mode_constrained", "制約付き", 2, 0, selected=self.board_mode == "constrained")
-            add("board_mode_fully_random", "公式ランダム", 2, 1, selected=self.board_mode == "fully_random")
+            add(
+                "board_mode_constrained",
+                "制約付き",
+                2,
+                0,
+                enabled=settings_unlocked,
+                selected=self.board_mode == "constrained",
+            )
+            add(
+                "board_mode_fully_random",
+                "公式ランダム",
+                2,
+                1,
+                enabled=settings_unlocked,
+                selected=self.board_mode == "fully_random",
+            )
             seed_value = self.board_seed_text or "入力..."
             seed_label = f"seed: {seed_value}"
             show_cursor = self.seed_input_active and (pygame.time.get_ticks() // 450) % 2 == 0
@@ -1390,16 +1777,17 @@ class CatanGame:
                 base_y + 3 * (button_height + gap_y),
                 available_width,
                 button_height,
-                enabled=True,
+                enabled=settings_unlocked,
                 selected=self.seed_input_active,
             )
-            add("seed_apply", "seed反映", 4, 0)
-            add("seed_randomize", "再生成", 4, 1)
+            add("seed_apply", "seed反映", 4, 0, enabled=settings_unlocked)
+            add("seed_randomize", "再生成", 4, 1, enabled=settings_unlocked)
             add(
                 "ai_count_cycle",
                 f"AI人数: {self.ai_player_count}",
                 5,
                 0,
+                enabled=settings_unlocked,
                 selected=self.ai_player_count > 0,
             )
             add(
@@ -1414,32 +1802,53 @@ class CatanGame:
                 f"勝利点 −（{self.victory_point_target}）",
                 6,
                 0,
-                enabled=self.victory_point_target > MIN_VICTORY_POINT_TARGET,
+                enabled=settings_unlocked
+                and self.victory_point_target > MIN_VICTORY_POINT_TARGET,
             )
             add(
                 "victory_target_increase",
                 f"勝利点 ＋（{self.victory_point_target}）",
                 6,
                 1,
-                enabled=self.victory_point_target < MAX_VICTORY_POINT_TARGET,
+                enabled=settings_unlocked
+                and self.victory_point_target < MAX_VICTORY_POINT_TARGET,
+            )
+            replay_path = self.latest_replay_path
+            add_custom(
+                "replay_open",
+                "直前の対局をリプレイ" if replay_path is not None else "保存済みリプレイなし",
+                base_x,
+                base_y + 7 * (button_height + gap_y),
+                available_width,
+                button_height,
+                enabled=replay_path is not None,
             )
             return buttons
 
         if self.phase == "finished":
             add_custom(
-                "restart_same_board",
-                "同じ盤面でもう一度",
+                "replay_open",
+                "対局をリプレイ",
                 base_x,
                 base_y,
                 available_width,
                 button_height,
-                highlighted=True,
+                enabled=self.replay_archive is not None,
+                highlighted=self.replay_archive is not None,
+            )
+            add_custom(
+                "restart_same_board",
+                "同じ盤面でもう一度",
+                base_x,
+                base_y + button_height + gap_y,
+                available_width,
+                button_height,
             )
             add_custom(
                 "restart_new_board",
                 "新しい盤面で遊ぶ",
                 base_x,
-                base_y + button_height + gap_y,
+                base_y + 2 * (button_height + gap_y),
                 available_width,
                 button_height,
             )
@@ -2393,8 +2802,14 @@ class CatanGame:
         self.add_log("行動選択をキャンセルしました。")
 
     def handle_button_action(self, action):
+        if action == "replay_open":
+            self.start_replay()
+            return
+        if action.startswith("replay_"):
+            self.handle_replay_action(action)
+            return
         if action.startswith("player_count_"):
-            if self.initial_dice_phase:
+            if self.can_edit_pre_game_settings():
                 self.configure_players(int(action.rsplit("_", 1)[1]))
             return
         if action == "ai_count_cycle":
@@ -2417,7 +2832,8 @@ class CatanGame:
             self.set_board_mode("fully_random")
             return
         if action == "seed_input_focus":
-            self.seed_input_active = True
+            if self.can_edit_pre_game_settings():
+                self.seed_input_active = True
             return
         if action == "seed_apply":
             self.apply_seed_text()
@@ -3597,6 +4013,8 @@ class CatanGame:
                 actor=player,
                 include_in_turn=False,
             )
+            self.flush_replay_capture(force_latest=True)
+            self.save_completed_replay()
 
     def is_ai_input_locked(self):
         if self.special_phase == "player_handoff":
@@ -3620,7 +4038,7 @@ class CatanGame:
         return player is not None and player.is_ai
 
     def update_ai(self):
-        if self.ai_paused:
+        if self.replay_mode or self.ai_paused:
             return
         now = pygame.time.get_ticks()
         if now < self.ai_next_action_at:
@@ -3633,6 +4051,10 @@ class CatanGame:
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 self.running = False
+                continue
+
+            if self.replay_mode:
+                self.handle_replay_event(event)
                 continue
 
             if self.handle_global_ui_event(event):
@@ -3667,7 +4089,11 @@ class CatanGame:
                     if event.type == pygame.KEYDOWN and self.seed_input_active:
                         self.handle_seed_input_key(event)
                         continue
-                    if event.type == pygame.KEYDOWN and event.key in (pygame.K_2, pygame.K_3, pygame.K_4):
+                    if (
+                        event.type == pygame.KEYDOWN
+                        and event.key in (pygame.K_2, pygame.K_3, pygame.K_4)
+                        and self.can_edit_pre_game_settings()
+                    ):
                         self.configure_players(int(event.unicode))
                     elif event.type == pygame.KEYDOWN and event.key == pygame.K_SPACE:
                         self.handle_initial_key_roll()
@@ -3822,8 +4248,13 @@ class CatanGame:
         return gain_summaries
 
     def update(self):
+        if self.replay_mode:
+            self.update_replay()
+            self.buttons = self.build_buttons()
+            return
         self.update_dice_animation()
         self.update_ai()
+        self.flush_replay_capture()
         self.buttons = self.build_buttons()
 
     def render(self):
@@ -3831,7 +4262,16 @@ class CatanGame:
         self.screen.fill(COLORS["BACKGROUND"])
         draw_ocean_background(self.screen)
         self.board.draw(self.screen)
-        highlight_data = self.get_board_highlight_data()
+        if self.replay_mode:
+            highlight_data = {
+                "settlement_nodes": [],
+                "city_nodes": [],
+                "target_nodes": [],
+                "edge_highlights": [],
+                "tile_highlights": [],
+            }
+        else:
+            highlight_data = self.get_board_highlight_data()
         draw_board_highlights(
             self.screen,
             settlement_nodes=highlight_data["settlement_nodes"],
@@ -3852,8 +4292,24 @@ class CatanGame:
             latest_event=self.latest_event,
             expanded=self.show_log_panel,
             scroll_offset=self.log_scroll_offset,
+            compact_label=(
+                f"リプレイ {self.replay_index + 1}/{len(self.replay_archive.frames)}  V:手札  Esc:終了"
+                if self.replay_mode and self.replay_archive is not None
+                else None
+            ),
         )
-        help_title, help_lines, help_accent = self.get_help_panel_content()
+        if self.replay_mode:
+            help_title = "リプレイ操作"
+            help_lines = [
+                "← / →: 1イベントずつ前後へ移動",
+                "Home / End: 最初 / 最後のイベントへ移動",
+                "Space: 自動再生 / 一時停止",
+                "V: 全員の手札を公開 / 非公開",
+                "Esc: 閲覧前の画面へ戻る",
+            ]
+            help_accent = "リプレイは閲覧専用です。過去の状態から対局を再開することはできません。"
+        else:
+            help_title, help_lines, help_accent = self.get_help_panel_content()
         draw_help_panel(self.screen, help_title, help_lines, help_accent, collapsed=help_collapsed)
         domestic_actor = self.get_domestic_trade_actor() if self.is_domestic_trade_phase() else None
         handoff_phase = self.special_phase in (
@@ -3861,7 +4317,9 @@ class CatanGame:
             "domestic_trade_handoff",
             "domestic_trade_counter_handoff",
         )
-        if handoff_phase:
+        if self.replay_mode:
+            visible_resource_player = None
+        elif handoff_phase:
             visible_resource_player = None
         elif self.is_domestic_trade_phase():
             visible_resource_player = None if handoff_phase else domestic_actor
@@ -3876,14 +4334,27 @@ class CatanGame:
         board_active_player = self.get_current_player() if self.phase == "main" else visible_resource_player
         if self.special_phase == "player_handoff":
             board_active_player = self.handoff_player
+        if self.replay_mode and self.replay_reveal_all:
+            display_points = {
+                player.name: self.get_player_victory_points(player)
+                for player in self.players
+            }
+        elif self.replay_mode:
+            display_points = {
+                player.name: self.get_player_public_victory_points(player)
+                for player in self.players
+            }
+        else:
+            display_points = self.get_points_by_player()
         draw_resource_counts(
             self.screen,
             self.players,
-            points_by_player=self.get_points_by_player(),
+            points_by_player=display_points,
             longest_road_owner=self.longest_road_owner,
             largest_army_owner=self.largest_army_owner,
             visible_player=visible_resource_player,
-            reveal_all=self.phase == "finished",
+            reveal_all=(self.phase == "finished" and not self.replay_mode)
+            or (self.replay_mode and self.replay_reveal_all),
             current_player=board_active_player,
             public_gain_by_player={
                 player.name: self.get_recent_public_gain_text(player)
@@ -3891,19 +4362,30 @@ class CatanGame:
             },
             victory_point_target=self.victory_point_target,
         )
-        progress = self.get_progress_header_data()
-        draw_progress_header(
-            self.screen,
-            progress["title"],
-            progress["instruction"],
-            progress["steps"],
-            actor_color=progress["actor_color"],
-            is_ai=progress["is_ai"],
-        )
-        tracker_title, tracker_subtitle, tracker_steps = self.get_phase_tracker_data()
+        if self.replay_mode:
+            tracker_title, tracker_subtitle, tracker_steps = (
+                "リプレイビューアー",
+                "閲覧専用",
+                [],
+            )
+        else:
+            progress = self.get_progress_header_data()
+            draw_progress_header(
+                self.screen,
+                progress["title"],
+                progress["instruction"],
+                progress["steps"],
+                actor_color=progress["actor_color"],
+                is_ai=progress["is_ai"],
+            )
+            tracker_title, tracker_subtitle, tracker_steps = self.get_phase_tracker_data()
         panel_title = "操作パネル"
         panel_subtitle = ""
-        if self.special_phase == "player_handoff":
+        if self.replay_mode:
+            panel_title = "リプレイビューアー"
+            visibility = "全手札を公開中" if self.replay_reveal_all else "公開情報のみ表示"
+            panel_subtitle = f"閲覧専用 / {visibility}"
+        elif self.special_phase == "player_handoff":
             panel_title = "プレイヤー交代"
             panel_subtitle = f"{self.handoff_player.name} / {self.handoff_context}"
         elif self.phase == "initial" and self.initial_dice_phase:
@@ -3952,13 +4434,16 @@ class CatanGame:
         if not panel_subtitle:
             panel_subtitle = tracker_subtitle
         panel_player = self.get_current_player() if self.phase == "main" else None
-        if self.special_phase == "player_handoff":
+        if self.replay_mode:
+            panel_player = None
+        elif self.special_phase == "player_handoff":
             panel_player = None
         elif self.is_domestic_trade_phase():
             panel_player = None if handoff_phase else domestic_actor
         current_player = self.get_current_player()
         show_main_details = bool(
             self.phase == "main"
+            and not self.replay_mode
             and self.special_phase is None
             and current_player is not None
             and not current_player.is_ai
@@ -3968,19 +4453,46 @@ class CatanGame:
             panel_title,
             panel_subtitle,
             tracker_steps,
-            self.get_side_panel_guidance(),
+            (
+                []
+                if self.replay_mode
+                else self.get_side_panel_guidance()
+            ),
             panel_player,
             self.players,
             self.buttons,
-            self.get_points_by_player(),
+            display_points,
             self.get_all_point_breakdowns(),
             self.get_trade_rates(self.get_current_player()) if show_main_details else {},
             self.get_current_player_development_summary() if show_main_details else "",
             len(self.development_deck),
             self.get_build_affordability(self.get_current_player()) if show_main_details and self.get_current_player() else [],
-            self.get_pre_game_board_summary() if self.phase == "initial" and self.initial_dice_phase else None,
+            self.get_pre_game_board_summary()
+            if not self.replay_mode and self.phase == "initial" and self.initial_dice_phase
+            else None,
             bank_resources=dict(self.bank.resources),
         )
+        if self.replay_mode and self.replay_archive is not None:
+            current_frame = self.get_current_replay_frame()
+            event_title = self.latest_event.get("title", "")
+            event_detail = self.latest_event.get("detail", "")
+            if not event_title and current_frame is not None:
+                event_title = current_frame.label
+            draw_replay_status_card(
+                self.screen,
+                pygame.Rect(
+                    SIDE_PANEL_X + 14,
+                    82,
+                    SIDE_PANEL_WIDTH - 28,
+                    122,
+                ),
+                event_title,
+                event_detail,
+                self.replay_index,
+                len(self.replay_archive.frames),
+                is_playing=self.replay_playing,
+                keyboard_hint="Space 再生/停止  ←/→ 前後  V 手札  Esc 終了",
+            )
         draw_transient_message(self.screen, self.get_active_feedback())
         if self.dice_overlay.is_active:
             self.dice_overlay.draw(self.screen)

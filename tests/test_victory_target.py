@@ -12,10 +12,11 @@ from game.persistence import SaveGameError, load_game, save_game, serialize_game
 
 
 @pytest.fixture
-def game():
+def game(tmp_path):
     pygame.init()
     pygame.display.set_mode((1, 1))
     instance = CatanGame(board_seed=5150)
+    instance.replay_dir = tmp_path / "replays"
     yield instance
     instance.audio.stop()
     pygame.quit()
