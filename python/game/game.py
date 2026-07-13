@@ -74,6 +74,36 @@ from game.ui import (
 )
 
 
+class _SilentAudio:
+    """No-op audio backend used by deterministic headless simulations."""
+
+    def start_bgm(self):
+        return None
+
+    def play(self, _name):
+        return None
+
+    def stop(self):
+        return None
+
+
+class _HeadlessDiceOverlay:
+    """Minimal overlay contract for games that resolve dice immediately."""
+
+    def __init__(self):
+        self.state = "idle"
+
+    @property
+    def is_active(self):
+        return False
+
+    def update(self, _now):
+        return False
+
+    def draw(self, _screen):
+        return None
+
+
 class CatanGame:
     def __init__(
         self,
@@ -82,11 +112,17 @@ class CatanGame:
         *,
         ai_player_count=0,
         ai_action_delay_ms=AI_ACTION_DELAY_MS,
+        headless=False,
     ):
-        pygame.init()
-        self.screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT))
-        pygame.display.set_caption(WINDOW_TITLE)
-        self.clock = pygame.time.Clock()
+        self.headless = bool(headless)
+        if self.headless:
+            self.screen = None
+            self.clock = None
+        else:
+            pygame.init()
+            self.screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT))
+            pygame.display.set_caption(WINDOW_TITLE)
+            self.clock = pygame.time.Clock()
         self.board_mode = "constrained" if board_mode == "balanced" else board_mode
         self.board_seed = self.normalize_board_seed(board_seed)
         self.board_seed_text = str(self.board_seed)
@@ -95,8 +131,8 @@ class CatanGame:
         self.board = GameBoard(mode=self.board_mode, seed=self.board_seed)
         self.board_rules = BoardRules(self.board)
         self.running = True
-        self.audio = GameAudio()
-        self.dice_overlay = DiceAnimationOverlay()
+        self.audio = _SilentAudio() if self.headless else GameAudio()
+        self.dice_overlay = _HeadlessDiceOverlay() if self.headless else DiceAnimationOverlay()
         self.feedback = FeedbackManager()
         self.bank = ResourceBank()
         self.ai = SimpleAI()
@@ -120,7 +156,8 @@ class CatanGame:
         }
         self.last_resource_distribution = {}
         self.public_gain_history = {}
-        self.audio.start_bgm()
+        if not self.headless:
+            self.audio.start_bgm()
 
         self.player_palette = [
             ("Player1", COLORS["RED"]),
@@ -193,14 +230,22 @@ class CatanGame:
         self.pending_dice_context = None
         self.pending_dice_roll = None
         self.pending_dice_player_name = ""
-        self.configure_players(2, reset_logs=False)
+        self.configure_players(
+            2,
+            reset_logs=False,
+            schedule_ai=not self.headless,
+            reset_replay=not self.headless,
+        )
         self.add_log("ゲーム開始: 初期配置フェーズです。")
         self.add_log("プレイヤー数は 2/3/4 キーまたは右のボタンで変更できます。")
         self.add_log("人間プレイヤーはスペースキーで初期ダイスを振ります。AIは自動で進行します。")
-        self.reset_replay_recording()
-        self.refresh_latest_replay_path()
+        if not self.headless:
+            self.reset_replay_recording()
+            self.refresh_latest_replay_path()
 
     def add_log(self, message):
+        if self.headless:
+            return
         if self.log_scroll_offset > 0:
             self.log_scroll_offset += 1
         self.log_messages.append(message)
@@ -238,6 +283,9 @@ class CatanGame:
             self.replay_pending_capture = title
 
     def refresh_latest_replay_path(self):
+        if self.headless:
+            self.latest_replay_path = None
+            return None
         try:
             self.latest_replay_path = find_latest_replay(self.replay_dir)
         except ReplayError:
@@ -246,7 +294,7 @@ class CatanGame:
 
     def reset_replay_recording(self):
         """Start a fresh, bounded recording from the current pre-game state."""
-        if self.replay_mode:
+        if self.headless or self.replay_mode:
             return False
         self.replay_recorder = ReplayRecorder(
             metadata={
@@ -326,7 +374,7 @@ class CatanGame:
         self.show_help_panel = self.replay_help_visible
         self.log_scroll_offset = 0
         self.feedback.clear()
-        self.buttons = self.build_buttons()
+        self.buttons = [] if self.headless else self.build_buttons()
         return True
 
     def start_replay(self, archive=None):
@@ -967,7 +1015,7 @@ class CatanGame:
         self.development_deck = create_development_deck()
         if schedule_ai:
             self.schedule_ai_action()
-        self.buttons = self.build_buttons()
+        self.buttons = [] if self.headless else self.build_buttons()
         self.show_help_panel = False
         self.seed_input_active = False
         self.feedback.clear()
@@ -1474,6 +1522,13 @@ class CatanGame:
         return self.pending_dice_context is not None and self.dice_overlay.is_active
 
     def start_dice_animation(self, context, dice_values, player_name, title):
+        if self.headless:
+            dice_roll = sum(dice_values)
+            if context == "initial":
+                self.resolve_initial_key_roll(dice_roll)
+            elif context == "main":
+                self.resolve_main_dice_roll(dice_roll)
+            return
         self.pending_dice_context = context
         self.pending_dice_roll = sum(dice_values)
         self.pending_dice_player_name = player_name
@@ -4250,14 +4305,16 @@ class CatanGame:
     def update(self):
         if self.replay_mode:
             self.update_replay()
-            self.buttons = self.build_buttons()
+            self.buttons = [] if self.headless else self.build_buttons()
             return
         self.update_dice_animation()
         self.update_ai()
         self.flush_replay_capture()
-        self.buttons = self.build_buttons()
+        self.buttons = [] if self.headless else self.build_buttons()
 
     def render(self):
+        if self.headless:
+            raise RuntimeError("ヘッドレスゲームは描画できません。")
         self.buttons = self.build_buttons()
         self.screen.fill(COLORS["BACKGROUND"])
         draw_ocean_background(self.screen)
@@ -4499,6 +4556,8 @@ class CatanGame:
         pygame.display.flip()
 
     def run(self):
+        if self.headless:
+            raise RuntimeError("ヘッドレスゲームは対話ループを開始できません。")
         while self.running:
             self.handle_events()
             self.update()

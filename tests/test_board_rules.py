@@ -27,6 +27,23 @@ def test_board_rules_requires_connected_road_for_main_settlement():
     assert message == ""
 
 
+def test_adjacent_nodes_have_a_stable_coordinate_order():
+    board = GameBoard(mode="fully_random", seed=33)
+    rules = BoardRules(board)
+    node = max(board.nodes, key=lambda candidate: len(candidate.tiles))
+
+    coordinates = [
+        (candidate.y, candidate.x)
+        for candidate in rules.get_adjacent_nodes(node)
+    ]
+
+    assert coordinates == sorted(coordinates)
+    assert coordinates == [
+        (candidate.y, candidate.x)
+        for candidate in rules.get_adjacent_nodes(node)
+    ]
+
+
 def test_board_rules_returns_initial_road_highlights_from_last_settlement():
     board = GameBoard(seed=4)
     rules = BoardRules(board)

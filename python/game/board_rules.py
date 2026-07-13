@@ -72,7 +72,10 @@ class BoardRules:
             node_index = tile.corners.index(node)
             adjacent.add(tile.corners[(node_index - 1) % len(tile.corners)])
             adjacent.add(tile.corners[(node_index + 1) % len(tile.corners)])
-        return list(adjacent)
+        # Sets are useful for de-duplication, but their iteration order is not a
+        # gameplay rule.  A coordinate order keeps AI tie-breaks reproducible
+        # across processes and Python hash seeds.
+        return sorted(adjacent, key=lambda candidate: (candidate.y, candidate.x))
 
     def road_exists_between(self, node1, node2):
         return any({road.node1, road.node2} == {node1, node2} for road in self.board.roads)
