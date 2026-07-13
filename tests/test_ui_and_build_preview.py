@@ -183,8 +183,8 @@ def test_pre_game_board_summary_describes_current_mode_and_seed():
     try:
         summary = game.get_pre_game_board_summary()
 
-        assert summary["rows"][0] == ("現在の mode", "制約付き")
-        assert summary["rows"][1] == ("現在の seed", "77")
+        assert summary["rows"][0] == ("盤面", "制約 / seed 77")
+        assert summary["rows"][1] == ("AI", "なし")
         assert "6/8" in summary["description"]
     finally:
         game.audio.stop()
@@ -264,7 +264,7 @@ def test_progress_header_keeps_actor_and_next_step_visible():
 
         game.get_current_player().is_ai = True
         ai_header = game.get_progress_header_data()
-        assert ai_header["title"] == "Player1の手番"
+        assert ai_header["title"] == "Player1（標準）の手番"
         assert ai_header["is_ai"] is True
     finally:
         game.audio.stop()

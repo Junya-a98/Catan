@@ -1,3 +1,10 @@
+from game.ai_personality import (
+    DISRUPTOR,
+    EXPANSION,
+    STANDARD,
+    TRADER,
+    get_ai_personality_profile,
+)
 from game.development_cards import DevelopmentCardType
 from game.hex_tile import get_token_pip_count
 from game.resources import BUILD_COSTS, ResourceType
@@ -39,6 +46,7 @@ class SimpleAI:
         player = game.get_current_player()
         if player is None or not player.is_ai:
             return False
+        profile = self._profile(player)
 
         if game.special_phase is not None:
             return self._step_special(game, player)
@@ -51,25 +59,43 @@ class SimpleAI:
         if not game.development_card_used_this_turn and self._play_development_card(game, player):
             return True
 
-        city_nodes = game.get_buildable_city_nodes(player)
-        if city_nodes:
-            node = max(city_nodes, key=lambda candidate: self._node_score(game, candidate, player))
-            self._set_status(game, player, "都市を建設", "生産力が最も高くなる開拓地を都市化します")
-            game.build_city((node.x, node.y))
+        buildable_node_getters = {
+            "city": game.get_buildable_city_nodes,
+            "settlement": game.get_buildable_settlement_nodes,
+        }
+        for build_type in profile.build_order:
+            candidates = buildable_node_getters[build_type](player)
+            if not candidates:
+                continue
+            node = max(
+                candidates,
+                key=lambda candidate: self._node_score(game, candidate, player),
+            )
+            if build_type == "city":
+                self._set_status(
+                    game,
+                    player,
+                    "都市を建設",
+                    "生産力が最も高くなる開拓地を都市化します",
+                )
+                game.build_city((node.x, node.y))
+            else:
+                self._set_status(
+                    game,
+                    player,
+                    "開拓地を建設",
+                    "出目の強さ・資源の種類・港を比較しました",
+                )
+                game.build_settlement((node.x, node.y))
             return True
 
-        settlement_nodes = game.get_buildable_settlement_nodes(player)
-        if settlement_nodes:
-            node = max(settlement_nodes, key=lambda candidate: self._node_score(game, candidate, player))
-            self._set_status(game, player, "開拓地を建設", "出目の強さ・資源の種類・港を比較しました")
-            game.build_settlement((node.x, node.y))
-            return True
+        priority_goals = profile.goal_order[:2]
 
         if not game.ai_domestic_trade_attempted:
             domestic_trade = self._choose_domestic_trade(
                 game,
                 player,
-                goals=("city", "settlement"),
+                goals=priority_goals,
             )
             if domestic_trade is not None:
                 game.ai_domestic_trade_attempted = True
@@ -86,7 +112,7 @@ class SimpleAI:
         priority_trade = self._choose_bank_trade(
             game,
             player,
-            goals=("city", "settlement"),
+            goals=priority_goals,
         )
         if priority_trade is not None:
             give_resource, receive_resource = priority_trade
@@ -106,9 +132,18 @@ class SimpleAI:
         can_buy_development = bool(
             game.development_deck and player.can_afford(BUILD_COSTS["development"])
         )
+        if can_buy_development and profile.development_before_road:
+            self._set_status(
+                game,
+                player,
+                "発展カードを購入",
+                "騎士と特殊効果で相手の生産を抑えます",
+            )
+            game.buy_development_card()
+            return True
         should_expand_road = best_road is not None and (
-            best_road_score >= 48
-            or game.get_player_longest_road_length(player) < 2
+            best_road_score >= profile.road_score_threshold
+            or game.get_player_longest_road_length(player) < profile.minimum_road_length
             or not can_buy_development
         )
         if should_expand_road:
@@ -191,23 +226,38 @@ class SimpleAI:
 
     def _step_special(self, game, player):
         if game.special_phase == "move_robber":
+            profile_key = self._profile(player).key
             tile = max(
                 game.robber_tile_candidates,
                 key=lambda candidate: self._robber_score(game, candidate, player),
             )
-            self._set_status(game, player, "盗賊を移動", "自分の生産を避け、得点上位を妨害します")
+            detail = {
+                STANDARD: "自分の生産を避け、得点上位を妨害します",
+                EXPANSION: "自分の開拓網を守り、生産力の高い相手を抑えます",
+                TRADER: "自分の生産を避け、公開手札が多い相手を狙います",
+                DISRUPTOR: "得点上位の高確率タイルを優先して封鎖します",
+            }[profile_key]
+            self._set_status(game, player, "盗賊を移動", detail)
             game.relocate_robber(tile)
             return True
 
         if game.special_phase == "steal":
+            profile_key = self._profile(player).key
             victim = max(
                 game.robber_target_players,
-                key=lambda candidate: (
-                    game.get_player_public_victory_points(candidate),
-                    candidate.total_resource_count(),
+                key=lambda candidate: self._steal_target_score(
+                    game,
+                    candidate,
+                    player,
                 ),
             )
-            self._set_status(game, player, "略奪相手を選択", "公開得点が高い相手を優先します")
+            detail = {
+                STANDARD: "公開得点が高い相手を優先します",
+                EXPANSION: "公開得点と手札枚数を合わせて比較します",
+                TRADER: "公開手札枚数が多い相手を優先します",
+                DISRUPTOR: "公開得点と騎士数が高い相手を重点的に狙います",
+            }[profile_key]
+            self._set_status(game, player, "略奪相手を選択", detail)
             game.steal_random_resource(victim)
             game.complete_robber_phase()
             return True
@@ -248,10 +298,11 @@ class SimpleAI:
         game.set_ai_status(player, title, detail, log=True)
 
     def _play_development_card(self, game, player):
+        profile = self._profile(player)
         monopoly_resource = self._choose_monopoly_resource(game, player)
         monopoly_public_score = self._monopoly_public_score(game, player, monopoly_resource)
         if (
-            monopoly_public_score >= 6
+            monopoly_public_score >= profile.monopoly_threshold
             and player.has_playable_development_card(DevelopmentCardType.MONOPOLY)
         ):
             self._set_status(game, player, "独占カードを使用", "公開生産量が多い資源を狙います")
@@ -259,7 +310,7 @@ class SimpleAI:
             return True
 
         if player.has_playable_development_card(DevelopmentCardType.YEAR_OF_PLENTY):
-            for cost_name in ("city", "settlement", "development", "road"):
+            for cost_name in profile.goal_order:
                 missing = self._missing_cards(player, BUILD_COSTS[cost_name])
                 if 0 < sum(missing.values()) <= 2 and all(
                     game.bank.available(resource_type) >= amount
@@ -275,7 +326,8 @@ class SimpleAI:
         if (
             player.has_playable_development_card(DevelopmentCardType.ROAD_BUILDING)
             and game.has_legal_road_placement(player)
-            and legal_road_count >= min(2, player.roads_remaining)
+            and legal_road_count
+            >= min(profile.road_building_min_options, player.roads_remaining)
         ):
             self._set_status(game, player, "街道建設カードを使用", "2本の街道で開拓範囲を広げます")
             game.use_road_building_card()
@@ -308,15 +360,17 @@ class SimpleAI:
         leader_threat = max(
             (game.get_player_public_victory_points(candidate) for candidate in opponents),
             default=0,
-        ) >= 7
+        ) >= self._profile(player).knight_leader_threshold
         return can_claim_largest_army or robber_blocks_self or leader_threat
 
     def _choose_bank_trade(
         self,
         game,
         player,
-        goals=("city", "settlement", "development", "road"),
+        goals=None,
     ):
+        if goals is None:
+            goals = self._profile(player).goal_order
         rates = game.get_trade_rates(player)
         for cost_name in goals:
             cost = BUILD_COSTS[cost_name]
@@ -342,14 +396,17 @@ class SimpleAI:
         self,
         game,
         player,
-        goals=("city", "settlement", "development", "road"),
+        goals=None,
     ):
+        profile = self._profile(player)
+        if goals is None:
+            goals = profile.goal_order
         for cost_name in goals:
             cost = BUILD_COSTS[cost_name]
             missing = self._missing_cards(player, cost)
             if not missing:
                 continue
-            if sum(missing.values()) > 2:
+            if sum(missing.values()) > profile.domestic_trade_max_missing:
                 continue
             for receive_resource in missing:
                 partners = sorted(
@@ -363,6 +420,7 @@ class SimpleAI:
                         game,
                         candidate,
                         receive_resource,
+                        requester=player,
                     ),
                     reverse=True,
                 )
@@ -371,7 +429,11 @@ class SimpleAI:
                     for give_resource, amount in player.resources.items():
                         if give_resource == receive_resource:
                             continue
-                        reserve = cost.get(give_resource, 0)
+                        reserve = max(
+                            0,
+                            cost.get(give_resource, 0)
+                            - profile.trade_reserve_relaxation,
+                        )
                         surplus = amount - reserve
                         if surplus <= 0:
                             continue
@@ -381,7 +443,14 @@ class SimpleAI:
                         return partner, {give_resource: 1}, {receive_resource: 1}
         return None
 
-    def _public_trade_partner_score(self, game, partner, resource_type):
+    def _public_trade_partner_score(
+        self,
+        game,
+        partner,
+        resource_type,
+        *,
+        requester=None,
+    ):
         """Estimate supply from public facts, never from the partner's hand types."""
         production = self._player_production_scores(game, partner).get(
             resource_type,
@@ -391,13 +460,17 @@ class SimpleAI:
         recent_bundle = recent_distribution.get(partner.name, {})
         recent_gain = recent_bundle.get(resource_type, 0)
         likelihood = production + recent_gain * 20
+        leader_penalty = 0
+        if requester is not None and self._profile(requester).key == DISRUPTOR:
+            leader_penalty = game.get_player_public_victory_points(partner) * 25
         return (
-            likelihood,
+            likelihood - leader_penalty,
             int(partner.is_ai),
             partner.total_resource_count(),
         )
 
     def evaluate_domestic_trade(self, player, *, incoming, outgoing):
+        profile = self._profile(player)
         if not incoming or not outgoing:
             return "reject"
         if any(player.resources[resource_type] < amount for resource_type, amount in outgoing.items()):
@@ -409,7 +482,22 @@ class SimpleAI:
         for resource_type, amount in incoming.items():
             after_resources[resource_type] += amount
 
-        priority_goals = ("city", "settlement")
+        protected_goals = ("city", "settlement")
+        protected_before = {
+            goal: self._resource_distance(before_resources, BUILD_COSTS[goal])
+            for goal in protected_goals
+        }
+        protected_after = {
+            goal: self._resource_distance(after_resources, BUILD_COSTS[goal])
+            for goal in protected_goals
+        }
+        if any(
+            protected_before[goal] == 0 and protected_after[goal] > 0
+            for goal in protected_goals
+        ):
+            return "reject"
+
+        priority_goals = profile.goal_order[:2]
         before_distances = {
             goal: self._resource_distance(before_resources, BUILD_COSTS[goal])
             for goal in priority_goals
@@ -418,12 +506,6 @@ class SimpleAI:
             goal: self._resource_distance(after_resources, BUILD_COSTS[goal])
             for goal in priority_goals
         }
-        if any(
-            before_distances[goal] == 0 and after_distances[goal] > 0
-            for goal in priority_goals
-        ):
-            return "reject"
-
         incoming_value = sum(
             self._trade_resource_value(player, resource_type) * amount
             for resource_type, amount in incoming.items()
@@ -442,13 +524,22 @@ class SimpleAI:
             before_distances[goal] > 0 and after_distances[goal] == 0
             for goal in priority_goals
         )
-        if completes_priority_goal and incoming_value >= outgoing_value * 0.65:
+        if (
+            completes_priority_goal
+            and incoming_value >= outgoing_value * profile.trade_complete_ratio
+        ):
             return "accept"
-        if improves_priority_goal and incoming_value >= outgoing_value * 0.78:
+        if (
+            improves_priority_goal
+            and incoming_value >= outgoing_value * profile.trade_improve_ratio
+        ):
             return "accept"
-        if incoming_value >= outgoing_value * 0.95:
+        if incoming_value >= outgoing_value * profile.trade_fair_ratio:
             return "accept"
-        if improves_priority_goal or incoming_value >= outgoing_value * 0.62:
+        if (
+            improves_priority_goal
+            or incoming_value >= outgoing_value * profile.trade_counter_ratio
+        ):
             return "counter"
         return "reject"
 
@@ -493,7 +584,14 @@ class SimpleAI:
         value = 10
         if player.resources[resource_type] == 0:
             value += 3
-        for weight, cost_name in ((6, "city"), (5, "settlement"), (3, "development"), (2, "road")):
+        profile_key = self._profile(player).key
+        goal_weights = {
+            STANDARD: ((6, "city"), (5, "settlement"), (3, "development"), (2, "road")),
+            EXPANSION: ((7, "settlement"), (5, "road"), (4, "city"), (1, "development")),
+            TRADER: ((6, "city"), (5, "settlement"), (3, "road"), (2, "development")),
+            DISRUPTOR: ((7, "development"), (5, "city"), (3, "settlement"), (1, "road")),
+        }[profile_key]
+        for weight, cost_name in goal_weights:
             cost = BUILD_COSTS[cost_name]
             if cost.get(resource_type, 0) > player.resources[resource_type]:
                 value += weight
@@ -530,7 +628,7 @@ class SimpleAI:
         if not available:
             return None
 
-        for cost_name in ("city", "settlement", "development", "road"):
+        for cost_name in self._profile(player).goal_order:
             missing = self._missing_cards(player, BUILD_COSTS[cost_name])
             for resource_type in missing:
                 if resource_type in available:
@@ -538,7 +636,15 @@ class SimpleAI:
         return min(available, key=lambda resource_type: player.resources[resource_type])
 
     def _choose_discard(self, player):
-        keep_cost = BUILD_COSTS["city"] if player.cities_remaining > 0 else BUILD_COSTS["settlement"]
+        preferred_goal = next(
+            (
+                goal
+                for goal in self._profile(player).goal_order
+                if goal != "city" or player.cities_remaining > 0
+            ),
+            "settlement",
+        )
+        keep_cost = BUILD_COSTS[preferred_goal]
         return max(
             player.resources,
             key=lambda resource_type: (
@@ -563,22 +669,69 @@ class SimpleAI:
 
     def _resource_need_weights(self, game, player):
         public_points = game.get_player_public_victory_points(player)
+        profile_key = self._profile(player).key
         if public_points < 5:
             weights = {
-                ResourceType.WOOD: 1.25,
-                ResourceType.BRICK: 1.25,
-                ResourceType.SHEEP: 1.05,
-                ResourceType.WHEAT: 1.10,
-                ResourceType.ORE: 0.85,
-            }
+                STANDARD: {
+                    ResourceType.WOOD: 1.25,
+                    ResourceType.BRICK: 1.25,
+                    ResourceType.SHEEP: 1.05,
+                    ResourceType.WHEAT: 1.10,
+                    ResourceType.ORE: 0.85,
+                },
+                EXPANSION: {
+                    ResourceType.WOOD: 1.65,
+                    ResourceType.BRICK: 1.65,
+                    ResourceType.SHEEP: 1.10,
+                    ResourceType.WHEAT: 1.05,
+                    ResourceType.ORE: 0.65,
+                },
+                TRADER: {
+                    ResourceType.WOOD: 1.20,
+                    ResourceType.BRICK: 1.05,
+                    ResourceType.SHEEP: 1.25,
+                    ResourceType.WHEAT: 1.20,
+                    ResourceType.ORE: 0.90,
+                },
+                DISRUPTOR: {
+                    ResourceType.WOOD: 0.80,
+                    ResourceType.BRICK: 0.75,
+                    ResourceType.SHEEP: 1.35,
+                    ResourceType.WHEAT: 1.45,
+                    ResourceType.ORE: 1.35,
+                },
+            }[profile_key]
         else:
             weights = {
-                ResourceType.WOOD: 0.85,
-                ResourceType.BRICK: 0.80,
-                ResourceType.SHEEP: 0.95,
-                ResourceType.WHEAT: 1.35,
-                ResourceType.ORE: 1.45,
-            }
+                STANDARD: {
+                    ResourceType.WOOD: 0.85,
+                    ResourceType.BRICK: 0.80,
+                    ResourceType.SHEEP: 0.95,
+                    ResourceType.WHEAT: 1.35,
+                    ResourceType.ORE: 1.45,
+                },
+                EXPANSION: {
+                    ResourceType.WOOD: 1.35,
+                    ResourceType.BRICK: 1.30,
+                    ResourceType.SHEEP: 1.05,
+                    ResourceType.WHEAT: 1.10,
+                    ResourceType.ORE: 1.00,
+                },
+                TRADER: {
+                    ResourceType.WOOD: 1.00,
+                    ResourceType.BRICK: 0.90,
+                    ResourceType.SHEEP: 1.10,
+                    ResourceType.WHEAT: 1.30,
+                    ResourceType.ORE: 1.30,
+                },
+                DISRUPTOR: {
+                    ResourceType.WOOD: 0.65,
+                    ResourceType.BRICK: 0.60,
+                    ResourceType.SHEEP: 1.35,
+                    ResourceType.WHEAT: 1.45,
+                    ResourceType.ORE: 1.55,
+                },
+            }[profile_key]
         production = self._player_production_scores(game, player)
         strongest = max(production.values(), default=0)
         for resource_type in weights:
@@ -590,6 +743,7 @@ class SimpleAI:
         return weights
 
     def _node_score(self, game, node, player):
+        profile = self._profile(player)
         need_weights = self._resource_need_weights(game, player)
         pip_score = sum(
             get_token_pip_count(tile.number) * need_weights[tile.resource_type]
@@ -605,20 +759,28 @@ class SimpleAI:
         harbor_bonus = 0
         for harbor in node.harbors:
             if harbor.resource_type is None:
-                harbor_bonus = max(harbor_bonus, 5)
+                harbor_bonus = max(harbor_bonus, profile.generic_harbor_bonus)
             else:
                 synergy = min(6, production.get(harbor.resource_type, 0) * 0.4)
-                harbor_bonus = max(harbor_bonus, 4 + synergy)
-        return pip_score * 4 + len(resources) * 5 + harbor_bonus
+                harbor_bonus = max(
+                    harbor_bonus,
+                    profile.specific_harbor_bonus + synergy,
+                )
+        return (
+            pip_score * profile.pip_weight
+            + len(resources) * profile.diversity_weight
+            + harbor_bonus
+        )
 
     def _edge_score(self, game, edge, player):
+        profile = self._profile(player)
         open_nodes = [node for node in edge if node.building is None]
         if not open_nodes:
             return -50
         score = max(self._node_score(game, node, player) for node in open_nodes)
         for node in open_nodes:
             if game.is_spacing_rule_satisfied(node):
-                score += 10
+                score += profile.edge_spacing_bonus
             lookahead = [
                 adjacent
                 for adjacent in game.get_adjacent_nodes(node)
@@ -628,12 +790,20 @@ class SimpleAI:
                 score += max(
                     self._node_score(game, adjacent, player)
                     for adjacent in lookahead
-                ) * 0.18
+                ) * profile.edge_lookahead_weight
+            if profile.opponent_contact_bonus:
+                opponent_contacts = sum(
+                    adjacent.building is not None
+                    and adjacent.building.owner is not player
+                    for adjacent in game.get_adjacent_nodes(node)
+                )
+                score += opponent_contacts * profile.opponent_contact_bonus
         if game.get_player_longest_road_length(player) >= 4:
-            score += 6
+            score += profile.longest_road_bonus
         return score
 
     def _robber_score(self, game, tile, player):
+        profile = self._profile(player)
         score = 0
         pip_value = max(1, get_token_pip_count(tile.number))
         opponent_points = {
@@ -647,17 +817,40 @@ class SimpleAI:
                 continue
             value = node.building.resource_multiplier * pip_value
             if node.building.owner is player:
-                score -= value * 8
+                score -= value * profile.robber_self_penalty
             else:
                 public_points = opponent_points.get(node.building.owner, 0)
-                leader_bonus = 5 if public_points == leading_score and leading_score > 0 else 0
+                leader_bonus = (
+                    profile.robber_leader_bonus
+                    if public_points == leading_score and leading_score > 0
+                    else 0
+                )
                 score += (
-                    value * 4
-                    + public_points * 2
+                    value * profile.robber_production_weight
+                    + public_points * profile.robber_point_weight
                     + leader_bonus
                     + node.building.owner.total_resource_count()
+                    * profile.robber_hand_weight
                 )
         return score
+
+    def _steal_target_score(self, game, candidate, player):
+        public_points = game.get_player_public_victory_points(candidate)
+        public_hand_size = candidate.total_resource_count()
+        profile_key = self._profile(player).key
+        if profile_key == TRADER:
+            return public_hand_size, public_points
+        if profile_key == DISRUPTOR:
+            return (
+                public_points * 10
+                + min(public_hand_size, 4)
+                + candidate.played_knights * 3,
+                public_points,
+                public_hand_size,
+            )
+        if profile_key == EXPANSION:
+            return public_points * 2 + public_hand_size, public_points, public_hand_size
+        return public_points, public_hand_size
 
     def _missing_cards(self, player, cost):
         return {
@@ -669,3 +862,9 @@ class SimpleAI:
     def _edge_midpoint(self, edge):
         node1, node2 = edge
         return ((node1.x + node2.x) / 2, (node1.y + node2.y) / 2)
+
+    @staticmethod
+    def _profile(player):
+        return get_ai_personality_profile(
+            getattr(player, "ai_personality", STANDARD)
+        )

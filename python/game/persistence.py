@@ -5,6 +5,10 @@ import random
 
 from game.assets import PROJECT_ROOT
 from game.ai import AI_SPEED_OPTIONS
+from game.ai_personality import (
+    normalize_ai_personality,
+    normalize_ai_personality_mode,
+)
 from game.bank import BANK_RESOURCE_COUNT, RESOURCE_TYPES
 from game.building import Building, BuildingType
 from game.constants import (
@@ -168,6 +172,9 @@ def serialize_game(game):
                 "name": player.name,
                 "color": list(player.color),
                 "is_ai": bool(player.is_ai),
+                "ai_personality": normalize_ai_personality(
+                    getattr(player, "ai_personality", "standard")
+                ),
                 "piece_pattern": int(player.piece_pattern),
                 "marker": player.marker,
                 "resources": _resource_map_to_json(player.resources),
@@ -278,6 +285,9 @@ def serialize_game(game):
         },
         "ai": {
             "player_count": int(game.ai_player_count),
+            "personality_mode": normalize_ai_personality_mode(
+                getattr(game, "ai_personality_mode", "standard")
+            ),
             "action_delay_ms": int(game.ai_action_delay_ms),
             "speed_index": int(game.ai_speed_index),
             "paused": bool(game.ai_paused),
@@ -340,6 +350,9 @@ def restore_game(game, data, *, runtime_side_effects=True):
     if not isinstance(ai_player_count, int) or not 0 <= ai_player_count < len(player_data):
         raise SaveGameError("AIプレイヤー数が不正です。")
     game.ai_player_count = ai_player_count
+    game.ai_personality_mode = normalize_ai_personality_mode(
+        ai_data.get("personality_mode", "standard")
+    )
     # Rebuilding the player objects creates a shuffled placeholder development
     # deck.  A replay seek must not consume the process-wide RNG or arm the AI
     # timer, because historical frames are strictly read-only.
@@ -367,6 +380,9 @@ def restore_game(game, data, *, runtime_side_effects=True):
         if any(channel < 0 or channel > 255 for channel in player.color):
             raise SaveGameError("プレイヤー色の範囲が不正です。")
         player.is_ai = bool(saved_player.get("is_ai", False))
+        player.ai_personality = normalize_ai_personality(
+            saved_player.get("ai_personality", "standard")
+        )
         player.piece_pattern = int(saved_player.get("piece_pattern", index))
         player.marker = str(saved_player.get("marker", player.marker))
         player.resources = _resource_map_from_json(

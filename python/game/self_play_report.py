@@ -22,6 +22,7 @@ import re
 import statistics
 import tempfile
 from typing import Any, Iterable, Mapping, Optional, Sequence
+import unicodedata
 
 
 __all__ = (
@@ -42,6 +43,32 @@ MAX_HTML_MATCH_ROWS = 1_000
 MAX_INPUT_BYTES = 64 * 1024 * 1024
 _SAFE_BASENAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$")
 _MISSING = object()
+_ACTION_METRIC_KEYS = (
+    "domestic_trade_offers",
+    "domestic_trades_completed",
+    "bank_trades",
+    "robber_moves",
+    "knights_used",
+)
+_PERSONALITY_DISPLAY_LABELS = {
+    "standard": "標準",
+    "balanced": "標準",
+    "expansion": "拡大重視",
+    "builder": "拡大重視",
+    "trader": "交渉重視",
+    "disruptor": "妨害重視",
+    "blocker": "妨害重視",
+}
+_PERSONALITY_ALIASES = {
+    "standard": "standard",
+    "balanced": "standard",
+    "expansion": "expansion",
+    "builder": "expansion",
+    "trader": "trader",
+    "disruptor": "disruptor",
+    "blocker": "disruptor",
+}
+_BUILD_METRIC_KEYS = ("roads", "settlements", "cities")
 
 
 class ReportError(ValueError):
@@ -88,6 +115,7 @@ def build_report_data(
 
     seat_rows = _seat_statistics(matches)
     personality_rows = _personality_statistics(matches)
+    personality_seat_rows = _personality_seat_statistics(matches)
     starting_seat_rows = _starting_seat_statistics(matches)
     turn_position_rows = _turn_position_statistics(matches)
     initial_placement_rows = _initial_placement_statistics(matches)
@@ -108,6 +136,7 @@ def build_report_data(
         "dice_total_variation": dice_gap,
         "seat_statistics": seat_rows,
         "personality_statistics": personality_rows,
+        "personality_seat_statistics": personality_seat_rows,
         "starting_seat_statistics": starting_seat_rows,
         "turn_position_statistics": turn_position_rows,
         "initial_placement_statistics": initial_placement_rows,
@@ -171,9 +200,16 @@ def render_terminal_summary(report: Mapping[str, Any]) -> str:
         lines.append("  AI性格別勝率:")
         for row in personality_rows:
             lines.append(
-                f"    {row['personality']}: {row['wins']}勝/"
+                f"    {_personality_display_label(row['personality'])}: {row['wins']}勝/"
                 f"{row['completed_appearances']}出場 / "
-                f"{_percent(row['win_rate'])}"
+                f"{_percent(row['win_rate'])} / "
+                "平均交易 "
+                f"{_number(row.get('average_domestic_trade_offers'))}提案・"
+                f"{_number(row.get('average_domestic_trades_completed'))}成立 / "
+                "平均建設 "
+                f"道{_number(row.get('average_roads'))}・"
+                f"開{_number(row.get('average_settlements'))}・"
+                f"都{_number(row.get('average_cities'))}"
             )
     return "\n".join(lines)
 
@@ -197,12 +233,14 @@ def render_html_dashboard(report: Mapping[str, Any]) -> str:
         ("board_mode", "盤面mode"),
         ("victory_target", "勝利点"),
         ("player_count", "人数"),
+        ("personality_lineup", "AI性格"),
         ("duration_seconds", "実行秒"),
     )
     for key, label in metadata_labels:
         if key in metadata and metadata[key] is not None:
+            value = _metadata_display_value(key, metadata[key])
             meta_chips.append(
-                f'<span class="chip"><b>{_h(label)}</b> {_h(metadata[key])}</span>'
+                f'<span class="chip"><b>{_h(label)}</b> {_h(value)}</span>'
             )
 
     cards = (
@@ -234,10 +272,11 @@ def render_html_dashboard(report: Mapping[str, Any]) -> str:
         label_key="seat_label",
         empty="席順データがありません。",
     )
-    personality_table = _statistics_table(
-        summary.get("personality_statistics", []),
-        label_key="personality",
-        empty="AI性格データがありません。",
+    personality_table = _personality_table(
+        summary.get("personality_statistics", [])
+    )
+    personality_seat_table = _personality_seat_table(
+        summary.get("personality_seat_statistics", [])
     )
     start_table = _simple_win_table(
         summary.get("starting_seat_statistics", []),
@@ -334,6 +373,7 @@ def render_html_dashboard(report: Mapping[str, Any]) -> str:
   <div class="layout">
     <section class="panel"><h2>席順別</h2>{seat_table}</section>
     <section class="panel"><h2>AI性格別</h2>{personality_table}</section>
+    <section class="panel wide"><h2>AI性格 × 席</h2>{personality_seat_table}</section>
     <section class="panel"><h2>初手番だった席</h2>{start_table}</section>
     <section class="panel"><h2>手番位置別</h2>{position_table}</section>
     <section class="panel"><h2>初期配置の6・8接触</h2>{initial_placement_table}</section>
@@ -392,6 +432,7 @@ def _extract_batch(source: Any) -> tuple[list[Any], dict[str, Any]]:
             "board_mode",
             "victory_target",
             "player_count",
+            "personality_lineup",
             "duration_seconds",
         ):
             if key in source and key not in metadata:
@@ -532,9 +573,7 @@ def _normalise_match(raw: Any, index: int) -> dict[str, Any]:
         "termination_reason": str(termination or ""),
         "winner_seat": winner_seat,
         "winner_name": None if winner_name is None else str(winner_name),
-        "winner_personality": (
-            None if winner_personality in (None, "") else str(winner_personality)
-        ),
+        "winner_personality": _normalise_personality(winner_personality),
         "starting_player_seat": starting_player_seat,
         "turn_order": turn_order,
         "turns": turns,
@@ -584,11 +623,17 @@ def _normalise_players(raw: Any, match_index: int) -> list[dict[str, Any]]:
             )
             for resource, amount in raw_resources.items()
         }
+        action_counts = _normalise_action_counts(
+            _first(player, "action_counts", default={}),
+            match_index,
+            fallback_seat,
+        )
         players.append(
             {
                 "seat": seat,
                 "name": str(_first(player, "name", default=f"Player{seat}")),
-                "personality": None if personality in (None, "") else str(personality),
+                "personality": _normalise_personality(personality),
+                "action_counts": action_counts,
                 "vp": _optional_non_negative_int(
                     vp, f"matches[{match_index}].players[{fallback_seat}].vp"
                 ),
@@ -672,6 +717,27 @@ def _normalise_dice_counts(raw: Any, match_index: int) -> dict[str, int]:
     return result
 
 
+def _normalise_action_counts(
+    raw: Any,
+    match_index: int,
+    player_index: int,
+) -> dict[str, Optional[int]]:
+    if raw is None:
+        raw = {}
+    if not isinstance(raw, Mapping):
+        raise ReportError(
+            f"matches[{match_index}].players[{player_index}].action_countsは辞書にしてください。"
+        )
+    result: dict[str, Optional[int]] = {key: None for key in _ACTION_METRIC_KEYS}
+    for key in _ACTION_METRIC_KEYS:
+        if key in raw:
+            result[key] = _non_negative_int(
+                raw[key],
+                f"matches[{match_index}].players[{player_index}].action_counts[{key}]",
+            )
+    return result
+
+
 def _seat_statistics(matches: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
     seats = sorted(
         {
@@ -727,6 +793,12 @@ def _personality_statistics(matches: Sequence[Mapping[str, Any]]) -> list[dict[s
     completed_appearances: Counter[str] = Counter()
     wins: Counter[str] = Counter()
     vp_values: dict[str, list[int]] = defaultdict(list)
+    action_values: dict[str, dict[str, list[int]]] = {
+        key: defaultdict(list) for key in _ACTION_METRIC_KEYS
+    }
+    build_values: dict[str, dict[str, list[int]]] = {
+        key: defaultdict(list) for key in _BUILD_METRIC_KEYS
+    }
     for match in matches:
         for player in match["players"]:
             personality = player["personality"]
@@ -737,6 +809,15 @@ def _personality_statistics(matches: Sequence[Mapping[str, Any]]) -> list[dict[s
                 completed_appearances[personality] += 1
             if match["completed"] and player["vp"] is not None:
                 vp_values[personality].append(player["vp"])
+            if match["completed"]:
+                for key in _ACTION_METRIC_KEYS:
+                    value = player["action_counts"].get(key)
+                    if value is not None:
+                        action_values[key][personality].append(value)
+                for key in _BUILD_METRIC_KEYS:
+                    value = player.get(key)
+                    if value is not None:
+                        build_values[key][personality].append(value)
             if match["completed"] and match["winner_seat"] == player["seat"]:
                 wins[personality] += 1
     return [
@@ -747,9 +828,65 @@ def _personality_statistics(matches: Sequence[Mapping[str, Any]]) -> list[dict[s
             "wins": wins[personality],
             "win_rate": _ratio(wins[personality], completed_appearances[personality]),
             "average_vp": _mean_or_none(vp_values[personality]),
+            **{
+                f"average_{key}": (
+                    _mean_or_none(action_values[key][personality])
+                    if len(action_values[key][personality])
+                    == completed_appearances[personality]
+                    else None
+                )
+                for key in _ACTION_METRIC_KEYS
+            },
+            **{
+                f"average_{key}": (
+                    _mean_or_none(build_values[key][personality])
+                    if len(build_values[key][personality])
+                    == completed_appearances[personality]
+                    else None
+                )
+                for key in _BUILD_METRIC_KEYS
+            },
         }
         for personality in sorted(appearances)
     ]
+
+
+def _personality_seat_statistics(
+    matches: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    observations: dict[tuple[str, int], list[tuple[Mapping[str, Any], Mapping[str, Any]]]] = (
+        defaultdict(list)
+    )
+    for match in matches:
+        for player in match["players"]:
+            personality = player["personality"]
+            if personality:
+                observations[(personality, player["seat"])].append((match, player))
+
+    rows = []
+    for (personality, seat), entries in sorted(observations.items()):
+        completed = [entry for entry in entries if entry[0]["completed"]]
+        wins = sum(
+            match["winner_seat"] == player["seat"]
+            for match, player in completed
+        )
+        vp_values = [
+            player["vp"]
+            for _match, player in completed
+            if player["vp"] is not None
+        ]
+        rows.append(
+            {
+                "personality": personality,
+                "seat": seat,
+                "appearances": len(entries),
+                "completed_appearances": len(completed),
+                "wins": wins,
+                "win_rate": _ratio(wins, len(completed)),
+                "average_vp": _mean_or_none(vp_values),
+            }
+        )
+    return rows
 
 
 def _starting_seat_statistics(matches: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
@@ -912,6 +1049,57 @@ def _dice_statistics(
         )
     variation = None if not total_rolls else absolute_delta / 2
     return rows, total_rolls, variation
+
+
+def _personality_table(rows: Sequence[Mapping[str, Any]]) -> str:
+    if not rows:
+        return '<p class="empty">AI性格データがありません。</p>'
+    body = []
+    for row in rows:
+        body.append(
+            "<tr>"
+            f"<td>{_h(_personality_display_label(row['personality']))}</td>"
+            f"<td>{row.get('completed_appearances', 0)}/{row.get('appearances', 0)}</td>"
+            f"<td>{row['wins']}</td><td>{_percent(row.get('win_rate'))}</td>"
+            f"<td>{_number(row.get('average_vp'))}</td>"
+            f"<td>{_number(row.get('average_domestic_trade_offers'))}</td>"
+            f"<td>{_number(row.get('average_domestic_trades_completed'))}</td>"
+            f"<td>{_number(row.get('average_bank_trades'))}</td>"
+            f"<td>{_number(row.get('average_robber_moves'))}</td>"
+            f"<td>{_number(row.get('average_knights_used'))}</td>"
+            f"<td>{_number(row.get('average_roads'))}</td>"
+            f"<td>{_number(row.get('average_settlements'))}</td>"
+            f"<td>{_number(row.get('average_cities'))}</td>"
+            "</tr>"
+        )
+    return (
+        '<div class="scroll"><table><thead><tr><th>性格</th><th>完走/全</th>'
+        '<th>勝</th><th>勝率</th><th>平均VP</th><th>提案</th><th>成立</th>'
+        '<th>銀行交易</th><th>盗賊移動</th><th>騎士</th>'
+        '<th>街道</th><th>開拓地</th><th>都市</th></tr></thead>'
+        f"<tbody>{''.join(body)}</tbody></table></div>"
+    )
+
+
+def _personality_seat_table(rows: Sequence[Mapping[str, Any]]) -> str:
+    if not rows:
+        return '<p class="empty">AI性格と席の組み合わせデータがありません。</p>'
+    body = []
+    for row in rows:
+        body.append(
+            "<tr>"
+            f"<td>{_h(_personality_display_label(row['personality']))}</td>"
+            f"<td>席{row['seat']}</td>"
+            f"<td>{row.get('completed_appearances', 0)}/{row.get('appearances', 0)}</td>"
+            f"<td>{row['wins']}</td><td>{_percent(row.get('win_rate'))}</td>"
+            f"<td>{_number(row.get('average_vp'))}</td>"
+            "</tr>"
+        )
+    return (
+        '<div class="scroll"><table><thead><tr><th>性格</th><th>席</th>'
+        '<th>完走/全</th><th>勝</th><th>勝率</th><th>平均VP</th></tr></thead>'
+        f"<tbody>{''.join(body)}</tbody></table></div>"
+    )
 
 
 def _statistics_table(rows: Sequence[Mapping[str, Any]], *, label_key: str, empty: str) -> str:
@@ -1160,6 +1348,7 @@ def _has_small_sample(summary: Mapping[str, Any]) -> bool:
     row_groups = (
         "seat_statistics",
         "personality_statistics",
+        "personality_seat_statistics",
         "starting_seat_statistics",
         "turn_position_statistics",
         "initial_placement_statistics",
@@ -1184,6 +1373,46 @@ def _mean_or_none(values: Iterable[int]) -> Optional[float]:
 def _median_or_none(values: Iterable[int]) -> Optional[float]:
     values = list(values)
     return None if not values else float(statistics.median(values))
+
+
+def _personality_display_label(value: Any) -> str:
+    text = str(value)
+    return _PERSONALITY_DISPLAY_LABELS.get(text, text)
+
+
+def _normalise_personality(value: Any) -> Optional[str]:
+    """Return a safe canonical personality name for reports and terminals."""
+
+    if value in (None, ""):
+        return None
+    text = "".join(
+        character
+        for character in str(value).strip()
+        if not unicodedata.category(character).startswith("C")
+    )[:80]
+    if not text:
+        return None
+    return _PERSONALITY_ALIASES.get(text.casefold(), text)
+
+
+def _metadata_display_value(key: str, value: Any) -> Any:
+    if key != "personality_lineup":
+        return value
+    if isinstance(value, str):
+        items = [item.strip() for item in value.split("/")]
+        if items and all(item.casefold() in _PERSONALITY_ALIASES for item in items):
+            return " / ".join(
+                _personality_display_label(_normalise_personality(item) or "")
+                for item in items
+            )
+        return value
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        labels = [
+            _personality_display_label(_normalise_personality(item) or "")
+            for item in value
+        ]
+        return " / ".join(label for label in labels if label)
+    return value
 
 
 def _number(value: Any) -> str:

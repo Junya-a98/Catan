@@ -1,5 +1,7 @@
 import json
 
+import pytest
+
 from simulate import main
 
 
@@ -19,6 +21,10 @@ def test_simulate_cli_writes_dashboard_and_json(tmp_path, capsys):
                 "fully_random",
                 "--target",
                 "5",
+                "--players",
+                "2",
+                "--personalities",
+                "trader,disruptor",
                 "--output-dir",
                 str(output_dir),
                 "--basename",
@@ -35,5 +41,31 @@ def test_simulate_cli_writes_dashboard_and_json(tmp_path, capsys):
     assert payload["summary"]["matches"] == 2
     assert payload["summary"]["completed"] == 2
     assert payload["metadata"]["board_seed"] == 404
+    assert payload["metadata"]["personality_lineup"] == "trader / disruptor"
+    assert [
+        player["personality"] for player in payload["matches"][0]["players"]
+    ] == ["trader", "disruptor"]
+    assert [
+        player["personality"] for player in payload["matches"][1]["players"]
+    ] == ["disruptor", "trader"]
     assert "AI自己対戦レポート" in output
     assert "CATAN風 AI自己対戦ダッシュボード" in html
+
+
+def test_simulate_cli_rejects_personality_count_mismatch(tmp_path):
+    with pytest.raises(SystemExit) as error:
+        main(
+            [
+                "--games",
+                "1",
+                "--players",
+                "3",
+                "--personalities",
+                "standard,trader",
+                "--output-dir",
+                str(tmp_path),
+                "--quiet",
+            ]
+        )
+
+    assert error.value.code == 2

@@ -658,7 +658,8 @@ def draw_button(screen, button):
         return
 
     font = _load_font(17)
-    text_surface = font.render(button.label, True, text_color)
+    label = _truncate_text(font, button.label, button.rect.width - 12)
+    text_surface = font.render(label, True, text_color)
     screen.blit(text_surface, text_surface.get_rect(center=button.rect.center))
 
 

@@ -37,6 +37,46 @@ def test_ai_configuration_marks_last_players_as_cpu():
         close_game(game)
 
 
+def test_mixed_ai_mode_assigns_distinct_personalities_and_can_be_cycled():
+    game = create_game(ai_player_count=1)
+    try:
+        assert game.set_ai_personality_mode("mixed") is True
+        game.configure_players(4, reset_logs=False)
+        game.set_ai_player_count(3)
+
+        assert [player.ai_personality for player in game.players] == [
+            "standard",
+            "expansion",
+            "trader",
+            "disruptor",
+        ]
+        buttons = {button.action: button for button in game.build_buttons()}
+        assert buttons["ai_personality_cycle"].label == "性格 混合"
+
+        game.handle_button_action("ai_personality_cycle")
+
+        assert game.ai_personality_mode == "expansion"
+        assert all(
+            player.ai_personality == "expansion"
+            for player in game.players
+            if player.is_ai
+        )
+        assert "AI 3人（拡大重視）" in game.get_board_configuration_summary()
+    finally:
+        close_game(game)
+
+
+def test_ai_personality_mode_is_locked_after_initial_roll_starts():
+    game = create_game(ai_player_count=1)
+    try:
+        game.initial_dice_histories[game.players[0].name].append(6)
+
+        assert game.set_ai_personality_mode("disruptor") is False
+        assert game.ai_personality_mode == "standard"
+    finally:
+        close_game(game)
+
+
 def test_ai_places_legal_initial_settlement_and_road():
     game = create_game(ai_player_count=1)
     try:

@@ -20,6 +20,7 @@ from game.self_play import (
     DEFAULT_MAX_TURNS,
     SUPPORTED_BOARD_MODES,
     SUPPORTED_PLAYER_COUNTS,
+    parse_personality_lineup,
     run_batch,
 )
 from game.self_play_report import (
@@ -44,6 +45,15 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--mode", choices=SUPPORTED_BOARD_MODES, default="constrained")
     parser.add_argument("--players", type=int, choices=SUPPORTED_PLAYER_COUNTS, default=4)
+    parser.add_argument(
+        "--personalities",
+        type=parse_personality_lineup,
+        default=None,
+        help=(
+            "席1から順にAI性格をカンマ区切りで指定。"
+            "省略時は人数に応じてstandard,expansion,trader,disruptorの先頭から使用"
+        ),
+    )
     parser.add_argument(
         "--target",
         type=int,
@@ -86,6 +96,7 @@ def main(argv: list[str] | None = None) -> int:
             victory_target=args.target,
             max_turns=args.max_turns,
             max_action_steps=args.max_actions,
+            personalities=args.personalities,
             progress=show_progress,
         )
         duration = time.perf_counter() - started
@@ -98,6 +109,8 @@ def main(argv: list[str] | None = None) -> int:
             "board_mode": args.mode,
             "victory_target": args.target,
             "player_count": args.players,
+            "personality_lineup": " / ".join(batch.personality_lineup),
+            "personality_seat_rotation": True,
             "duration_seconds": round(duration, 3),
             "max_turns": args.max_turns,
             "max_action_steps": args.max_actions,

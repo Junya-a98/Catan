@@ -3,6 +3,17 @@ import random
 import pygame
 
 from game.ai import AI_ACTION_DELAY_MS, AI_SPEED_OPTIONS, SimpleAI
+from game.ai_personality import (
+    AI_PERSONALITY_MODES,
+    AI_PERSONALITY_PROFILES,
+    DISRUPTOR,
+    EXPANSION,
+    MIXED,
+    STANDARD,
+    TRADER,
+    normalize_ai_personality,
+    normalize_ai_personality_mode,
+)
 from game.audio import GameAudio
 from game.bank import BANK_RESOURCE_COUNT, RESOURCE_TYPES, ResourceBank
 from game.board_rules import BoardHighlightState, BoardRules
@@ -104,6 +115,9 @@ class _HeadlessDiceOverlay:
         return None
 
 
+MIXED_AI_PERSONALITIES = (EXPANSION, TRADER, DISRUPTOR)
+
+
 class CatanGame:
     def __init__(
         self,
@@ -112,6 +126,7 @@ class CatanGame:
         *,
         ai_player_count=0,
         ai_action_delay_ms=AI_ACTION_DELAY_MS,
+        ai_personality_mode=STANDARD,
         headless=False,
     ):
         self.headless = bool(headless)
@@ -137,6 +152,9 @@ class CatanGame:
         self.bank = ResourceBank()
         self.ai = SimpleAI()
         self.ai_player_count = max(0, int(ai_player_count))
+        self.ai_personality_mode = normalize_ai_personality_mode(
+            ai_personality_mode
+        )
         self.ai_action_delay_ms = max(0, int(ai_action_delay_ms))
         timed_speed_indices = [
             index
@@ -534,6 +552,73 @@ class CatanGame:
     def get_ai_speed_label(self):
         return AI_SPEED_OPTIONS[self.ai_speed_index][0]
 
+    def get_ai_speed_compact_label(self):
+        return {
+            "ゆっくり": "低速",
+            "標準": "標準",
+            "高速": "高速",
+            "一時停止": "停止",
+        }[self.get_ai_speed_label()]
+
+    def get_ai_personality_mode_label(self):
+        if self.ai_personality_mode == MIXED:
+            return "混合"
+        return AI_PERSONALITY_PROFILES[
+            normalize_ai_personality(self.ai_personality_mode)
+        ].label
+
+    def get_ai_personality_mode_compact_label(self):
+        labels = {
+            STANDARD: "標準",
+            MIXED: "混合",
+            EXPANSION: "拡大",
+            TRADER: "交渉",
+            DISRUPTOR: "妨害",
+        }
+        return labels[self.ai_personality_mode]
+
+    def get_player_ai_personality_label(self, player):
+        if player is None or not player.is_ai:
+            return ""
+        return AI_PERSONALITY_PROFILES[
+            normalize_ai_personality(getattr(player, "ai_personality", STANDARD))
+        ].label
+
+    def assign_ai_personalities(self):
+        """Apply the selected pre-game personality mode without rebuilding seats."""
+        cpu_index = 0
+        for player in self.players:
+            if not player.is_ai:
+                player.ai_personality = STANDARD
+                continue
+            if self.ai_personality_mode == MIXED:
+                personality = MIXED_AI_PERSONALITIES[
+                    cpu_index % len(MIXED_AI_PERSONALITIES)
+                ]
+            else:
+                personality = normalize_ai_personality(self.ai_personality_mode)
+            player.ai_personality = personality
+            cpu_index += 1
+
+    def set_ai_personality_mode(self, mode):
+        if not self.can_edit_pre_game_settings():
+            self.notify_invalid("AI性格は初期ダイスを振る前だけ変更できます。")
+            return False
+        if mode not in AI_PERSONALITY_MODES or mode == self.ai_personality_mode:
+            return False
+        self.ai_personality_mode = mode
+        self.assign_ai_personalities()
+        self.add_log(f"AI性格を「{self.get_ai_personality_mode_label()}」に変更しました。")
+        self.reset_replay_recording()
+        return True
+
+    def cycle_ai_personality_mode(self):
+        current_index = AI_PERSONALITY_MODES.index(self.ai_personality_mode)
+        next_mode = AI_PERSONALITY_MODES[
+            (current_index + 1) % len(AI_PERSONALITY_MODES)
+        ]
+        return self.set_ai_personality_mode(next_mode)
+
     def cycle_ai_speed(self):
         reset_replay = self.can_edit_pre_game_settings()
         self.ai_speed_index = (self.ai_speed_index + 1) % len(AI_SPEED_OPTIONS)
@@ -552,12 +637,16 @@ class CatanGame:
         previous = (self.ai_status.get("player_name"), self.ai_status.get("title"))
         self.ai_status = {
             "player_name": player.name,
+            "personality": normalize_ai_personality(player.ai_personality),
             "title": title,
             "detail": detail,
         }
         if log and previous != (player.name, title):
             suffix = f" — {detail}" if detail else ""
-            self.add_log(f"{player.name} の判断: {title}{suffix}")
+            personality_label = self.get_player_ai_personality_label(player)
+            self.add_log(
+                f"{player.name}（{personality_label}）の判断: {title}{suffix}"
+            )
 
     def record_public_gain(self, player, bundle, source):
         if player is None:
@@ -736,8 +825,9 @@ class CatanGame:
 
     def get_board_configuration_summary(self):
         mode_label = "制約付き" if self.board_mode == "constrained" else "公式ランダム"
+        ai_label = self.get_ai_personality_mode_label() if self.ai_player_count else "なし"
         return (
-            f"{mode_label} / seed {self.board_seed} / AI {self.ai_player_count}人 / "
+            f"{mode_label} / seed {self.board_seed} / AI {self.ai_player_count}人（{ai_label}）/ "
             f"勝利{self.victory_point_target}点"
         )
 
@@ -751,7 +841,7 @@ class CatanGame:
         return board_rules
 
     def get_pre_game_board_summary(self):
-        mode_label = "制約付き" if self.board_mode == "constrained" else "公式ランダム"
+        compact_mode_label = "制約" if self.board_mode == "constrained" else "公式"
         if self.board_mode == "constrained":
             description = "6/8隣接と数字・港の偏りを抑制。"
         else:
@@ -766,8 +856,16 @@ class CatanGame:
         return {
             "title": "盤面サマリー",
             "rows": [
-                ("現在の mode", mode_label),
-                ("現在の seed", str(self.board_seed)),
+                ("盤面", f"{compact_mode_label} / seed {self.board_seed}"),
+                (
+                    "AI",
+                    (
+                        f"{self.ai_player_count}人 / "
+                        f"{self.get_ai_personality_mode_label()}"
+                    )
+                    if self.ai_player_count
+                    else "なし",
+                ),
                 ("勝利条件", f"{self.victory_point_target} VP"),
             ],
             "description": description,
@@ -993,6 +1091,7 @@ class CatanGame:
             )
             if is_ai:
                 cpu_index += 1
+        self.assign_ai_personalities()
         self.public_gain_history = {player.name: [] for player in self.players}
         self.last_resource_distribution = {}
         self.ai_status = {
@@ -1423,7 +1522,9 @@ class CatanGame:
         elif self.phase == "initial":
             title = f"{tracker_title} — {actor.name}"
         elif actor.is_ai:
-            title = f"{actor.name}の手番"
+            title = (
+                f"{actor.name}（{self.get_player_ai_personality_label(actor)}）の手番"
+            )
         else:
             title = f"あなたの手番 — {actor.name}"
 
@@ -1493,7 +1594,11 @@ class CatanGame:
                     status_title = "次の行動を検討中"
                 detail = self.ai_status.get("detail", "")
                 secondary = detail or "盤面・公開情報・自分の手札から合法手を比較します。"
-                return [f"{active_ai.name}: {status_title}", secondary]
+                personality_label = self.get_player_ai_personality_label(active_ai)
+                return [
+                    f"{active_ai.name}（{personality_label}）: {status_title}",
+                    secondary,
+                ]
         action_guidance = self.get_action_mode_guidance(player)
         if action_guidance:
             return build_side_panel_guidance(self.get_guidance_state(), action_guidance, [])
@@ -1837,20 +1942,37 @@ class CatanGame:
             )
             add("seed_apply", "seed反映", 4, 0, enabled=settings_unlocked)
             add("seed_randomize", "再生成", 4, 1, enabled=settings_unlocked)
-            add(
+            compact_gap = 8
+            compact_width = int((available_width - compact_gap * 2) / 3)
+            compact_y = base_y + 5 * (button_height + gap_y)
+            add_custom(
                 "ai_count_cycle",
-                f"AI人数: {self.ai_player_count}",
-                5,
-                0,
+                f"AI {self.ai_player_count}人",
+                base_x,
+                compact_y,
+                compact_width,
+                button_height,
                 enabled=settings_unlocked,
                 selected=self.ai_player_count > 0,
             )
-            add(
+            add_custom(
                 "ai_speed_cycle",
-                f"AI速度: {self.get_ai_speed_label()}",
-                5,
-                1,
+                f"速度 {self.get_ai_speed_compact_label()}",
+                base_x + compact_width + compact_gap,
+                compact_y,
+                compact_width,
+                button_height,
                 selected=self.get_ai_speed_label() != "標準",
+            )
+            add_custom(
+                "ai_personality_cycle",
+                f"性格 {self.get_ai_personality_mode_compact_label()}",
+                base_x + (compact_width + compact_gap) * 2,
+                compact_y,
+                compact_width,
+                button_height,
+                enabled=settings_unlocked,
+                selected=self.ai_personality_mode != STANDARD,
             )
             add(
                 "victory_target_decrease",
@@ -2873,6 +2995,9 @@ class CatanGame:
             return
         if action == "ai_speed_cycle":
             self.cycle_ai_speed()
+            return
+        if action == "ai_personality_cycle":
+            self.cycle_ai_personality_mode()
             return
         if action == "victory_target_decrease":
             self.adjust_victory_point_target(-1)

@@ -32,8 +32,38 @@ def _batch():
                 "turns": 50,
                 "dice_counts": {6: 5, 7: 6, 8: 5},
                 "players": [
-                    {"seat": 1, "name": "CPU1", "personality": "builder", "vp": 10},
-                    {"seat": 2, "name": "CPU2", "personality": "trader", "vp": 7},
+                    {
+                        "seat": 1,
+                        "name": "CPU1",
+                        "personality": "builder",
+                        "vp": 10,
+                        "roads": 8,
+                        "settlements": 3,
+                        "cities": 2,
+                        "action_counts": {
+                            "domestic_trade_offers": 2,
+                            "domestic_trades_completed": 1,
+                            "bank_trades": 3,
+                            "robber_moves": 2,
+                            "knights_used": 1,
+                        },
+                    },
+                    {
+                        "seat": 2,
+                        "name": "CPU2",
+                        "personality": "trader",
+                        "vp": 7,
+                        "roads": 5,
+                        "settlements": 4,
+                        "cities": 1,
+                        "action_counts": {
+                            "domestic_trade_offers": 4,
+                            "domestic_trades_completed": 2,
+                            "bank_trades": 1,
+                            "robber_moves": 0,
+                            "knights_used": 0,
+                        },
+                    },
                 ],
             },
             {
@@ -47,8 +77,38 @@ def _batch():
                 "turns": 70,
                 "dice_counts": [1, 2, 3, 4, 5, 6, 5, 4, 3, 2, 1],
                 "players": [
-                    {"seat": 1, "name": "CPU1", "personality": "builder", "vp": 8},
-                    {"seat": 2, "name": "CPU2", "personality": "trader", "vp": 10},
+                    {
+                        "seat": 1,
+                        "name": "CPU1",
+                        "personality": "expansion",
+                        "vp": 8,
+                        "roads": 10,
+                        "settlements": 2,
+                        "cities": 3,
+                        "action_counts": {
+                            "domestic_trade_offers": 4,
+                            "domestic_trades_completed": 1,
+                            "bank_trades": 1,
+                            "robber_moves": 1,
+                            "knights_used": 0,
+                        },
+                    },
+                    {
+                        "seat": 2,
+                        "name": "CPU2",
+                        "personality": "trader",
+                        "vp": 10,
+                        "roads": 6,
+                        "settlements": 3,
+                        "cities": 2,
+                        "action_counts": {
+                            "domestic_trade_offers": 2,
+                            "domestic_trades_completed": 1,
+                            "bank_trades": 3,
+                            "robber_moves": 3,
+                            "knights_used": 2,
+                        },
+                    },
                 ],
             },
             {
@@ -87,9 +147,22 @@ def test_build_report_calculates_completion_seat_personality_and_turn_stats():
     assert seats[2]["average_vp"] == pytest.approx(8.5)
 
     personalities = {row["personality"]: row for row in summary["personality_statistics"]}
-    assert personalities["builder"]["wins"] == 1
+    assert personalities["expansion"]["wins"] == 1
     assert personalities["trader"]["wins"] == 1
-    assert personalities["builder"]["win_rate"] == pytest.approx(0.5)
+    assert personalities["expansion"]["win_rate"] == pytest.approx(0.5)
+    assert personalities["expansion"]["average_domestic_trade_offers"] == 3
+    assert personalities["expansion"]["average_roads"] == 9
+    assert personalities["expansion"]["average_settlements"] == 2.5
+    assert personalities["expansion"]["average_cities"] == 2.5
+    assert personalities["trader"]["average_domestic_trades_completed"] == 1.5
+    assert personalities["trader"]["average_knights_used"] == 1
+
+    personality_seats = {
+        (row["personality"], row["seat"]): row
+        for row in summary["personality_seat_statistics"]
+    }
+    assert personality_seats[("expansion", 1)]["wins"] == 1
+    assert personality_seats[("trader", 2)]["average_vp"] == pytest.approx(8.5)
 
     starts = {row["seat"]: row for row in summary["starting_seat_statistics"]}
     assert starts[1]["appearances"] == 2
@@ -111,8 +184,38 @@ def test_html_is_offline_responsive_and_escapes_untrusted_result_text():
     assert 'src="https://bad.example' not in rendered
     assert "&lt;script src=&quot;https://bad.example/x&quot;&gt;" in rendered
     assert "席順別" in rendered
+    assert "AI性格 × 席" in rendered
+    assert "銀行交易" in rendered
     assert "ダイス分布" in rendered
     assert "100戦未満" in rendered
+
+
+@pytest.mark.parametrize(
+    "lineup",
+    [
+        "balanced / builder / trader / blocker",
+        ["balanced", "builder", "trader", "blocker"],
+    ],
+)
+def test_personality_aliases_metadata_and_control_characters_are_normalised(lineup):
+    batch = _batch()
+    batch["personality_lineup"] = lineup
+    batch["matches"][2]["players"][1]["personality"] = "\x1b[31m\u202ecustom\n"
+
+    report = build_report_data(batch, generated_at="fixed")
+    rendered = render_html_dashboard(report)
+    terminal = render_terminal_summary(report)
+    personalities = {
+        row["personality"] for row in report["summary"]["personality_statistics"]
+    }
+
+    assert "builder" not in personalities
+    assert "expansion" in personalities
+    assert report["matches"][2]["players"][1]["personality"] == "[31mcustom"
+    assert "標準 / 拡大重視 / 交渉重視 / 妨害重視" in rendered
+    assert "balanced / builder" not in rendered
+    assert "\x1b" not in terminal
+    assert "\n" not in report["matches"][2]["players"][1]["personality"]
 
 
 def test_write_report_creates_round_trip_json_and_static_html(tmp_path):
@@ -202,6 +305,15 @@ def test_winner_only_legacy_input_has_consistent_seat_appearances():
         {
             "matches": [
                 {
+                    "players": [
+                        {"seat": 1, "action_counts": {"bank_trades": -1}}
+                    ]
+                }
+            ]
+        },
+        {
+            "matches": [
+                {
                     "players": [{"seat": 1}, {"seat": 2}],
                     "turn_order": [1],
                     "starting_player_seat": 1,
@@ -267,6 +379,22 @@ def test_completed_match_without_a_winner_is_not_used_as_a_win_sample():
     assert report["summary"]["seat_statistics"][0]["completed_appearances"] == 0
 
 
+def test_partial_legacy_action_metrics_are_not_shown_as_full_sample_averages():
+    batch = _batch()
+    del batch["matches"][1]["players"][1]["action_counts"]
+
+    report = build_report_data(batch, generated_at="fixed")
+    trader = next(
+        row
+        for row in report["summary"]["personality_statistics"]
+        if row["personality"] == "trader"
+    )
+
+    assert trader["completed_appearances"] == 2
+    assert trader["average_domestic_trade_offers"] is None
+    assert trader["average_bank_trades"] is None
+
+
 def test_html_bounds_the_individual_match_table(monkeypatch):
     monkeypatch.setattr(report_module, "MAX_HTML_MATCH_ROWS", 1)
 
@@ -274,6 +402,8 @@ def test_html_bounds_the_individual_match_table(monkeypatch):
 
     assert "個別試合 1 / 3件" in rendered
     assert "全結果はJSONに保存" in rendered
+    assert "拡大重視" in rendered
+    assert "交渉重視" in rendered
 
 
 def test_terminal_summary_and_cli_are_human_readable(tmp_path, capsys):
@@ -287,7 +417,9 @@ def test_terminal_summary_and_cli_are_human_readable(tmp_path, capsys):
     assert "HTML:" in output
 
     report = build_report_data(_batch(), generated_at="fixed")
-    assert "完走: 2 (66.7%)" in render_terminal_summary(report)
+    summary_text = render_terminal_summary(report)
+    assert "完走: 2 (66.7%)" in summary_text
+    assert "拡大重視" in summary_text
 
 
 def test_basename_cannot_escape_output_directory(tmp_path):
@@ -313,7 +445,16 @@ def test_real_self_play_batch_dataclass_is_directly_accepted():
     assert report["summary"]["integrity_rate"] == 1.0
     assert report["summary"]["initial_placement_statistics"]
     assert report["summary"]["initial_pip_statistics"]
-    assert report["summary"]["personality_statistics"][0]["personality"] == "standard"
+    assert {
+        row["personality"] for row in report["summary"]["personality_statistics"]
+    } == {"standard", "expansion"}
+    assert report["summary"]["personality_seat_statistics"]
+    assert all(
+        row["average_roads"] is not None
+        and row["average_settlements"] is not None
+        and row["average_cities"] is not None
+        for row in report["summary"]["personality_statistics"]
+    )
     assert report["matches"][0]["winner_seat"] in (1, 2)
     assert report["matches"][0]["turns"] == sum(
         report["matches"][0]["dice_counts"].values()

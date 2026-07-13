@@ -1,7 +1,18 @@
 import json
 import random
 
-from game.self_play import _prepare_game, _validate_completed_state, run_batch, run_match
+import pytest
+
+from game.self_play import (
+    ACTION_COUNT_KEYS,
+    SUPPORTED_AI_PERSONALITIES,
+    _prepare_game,
+    _validate_completed_state,
+    normalise_personalities,
+    parse_personality_lineup,
+    run_batch,
+    run_match,
+)
 
 
 def test_self_play_is_reproducible_and_returns_structured_results():
@@ -29,7 +40,22 @@ def test_self_play_is_reproducible_and_returns_structured_results():
     assert len(first.players) == 4
     assert sum(player.won for player in first.players) == 1
     assert first.validation_errors == ()
-    assert all(player.personality == "standard" for player in first.players)
+    assert tuple(player.personality for player in first.players) == (
+        "standard",
+        "expansion",
+        "trader",
+        "disruptor",
+    )
+    assert all(set(player.action_counts) == set(ACTION_COUNT_KEYS) for player in first.players)
+    assert all(
+        player.action_counts["knights_used"] == player.played_knights
+        for player in first.players
+    )
+    assert all(
+        player.action_counts["domestic_trades_completed"]
+        <= player.action_counts["domestic_trade_offers"]
+        for player in first.players
+    )
     assert all(player.initial_pips > 0 for player in first.players)
     assert all(1 <= player.initial_resource_diversity <= 5 for player in first.players)
     assert json.loads(json.dumps(first.to_dict()))["winner_seat"] == first.winner_seat
@@ -98,6 +124,71 @@ def test_batch_can_hold_a_board_seed_fixed_across_match_seeds():
     assert sum(result.win_counts.values()) == 2
     assert progress == [(1, 2, 40), (2, 2, 41)]
     json.dumps(result.to_dict())
+
+
+def test_batch_rotates_personalities_across_seats_deterministically():
+    first = run_batch(
+        match_seeds=(10, 11, 12, 13),
+        player_count=4,
+        victory_target=10,
+        max_turns=1,
+    )
+    second = run_batch(
+        match_seeds=(10, 11, 12, 13),
+        player_count=4,
+        victory_target=10,
+        max_turns=1,
+    )
+
+    assert first == second
+    lineups = [
+        tuple(player.personality for player in match.players)
+        for match in first.matches
+    ]
+    assert lineups == [
+        ("standard", "expansion", "trader", "disruptor"),
+        ("expansion", "trader", "disruptor", "standard"),
+        ("trader", "disruptor", "standard", "expansion"),
+        ("disruptor", "standard", "expansion", "trader"),
+    ]
+    for seat in range(4):
+        assert {lineup[seat] for lineup in lineups} == set(SUPPORTED_AI_PERSONALITIES)
+
+
+def test_custom_personality_lineup_allows_mirror_matches_and_rotates():
+    result = run_batch(
+        match_seeds=(20, 21),
+        player_count=2,
+        personalities=("trader", "trader"),
+        victory_target=10,
+        max_turns=1,
+    )
+
+    assert result.personality_lineup == ("trader", "trader")
+    assert all(
+        tuple(player.personality for player in match.players) == ("trader", "trader")
+        for match in result.matches
+    )
+
+
+@pytest.mark.parametrize(
+    ("personalities", "player_count", "error"),
+    [
+        (("standard",), 2, ValueError),
+        (("standard", "unknown"), 2, ValueError),
+        ("standard,trader", 2, TypeError),
+        (("standard", 1), 2, TypeError),
+    ],
+)
+def test_personality_lineup_validation(personalities, player_count, error):
+    with pytest.raises(error):
+        normalise_personalities(personalities, player_count)
+
+
+def test_personality_cli_parser_trims_names_and_rejects_empty_values():
+    assert parse_personality_lineup("standard, trader") == ("standard", "trader")
+    with pytest.raises(ValueError):
+        parse_personality_lineup("standard,")
 
 
 def test_self_play_integrity_check_detects_piece_count_corruption():

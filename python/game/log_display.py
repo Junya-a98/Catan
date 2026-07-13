@@ -1,6 +1,7 @@
 import pygame
 
 from game.assets import get_font
+from game.ai_personality import get_ai_personality_profile
 from game.constants import COLORS, LOG_PANEL_HEIGHT, LOG_PANEL_WIDTH, SIDE_PANEL_X
 from game.resources import ResourceType
 
@@ -10,6 +11,12 @@ RESOURCE_LABELS = {
     ResourceType.WHEAT: "麦",
     ResourceType.BRICK: "土",
     ResourceType.ORE: "鉄",
+}
+AI_PERSONALITY_CARD_LABELS = {
+    "standard": "標準",
+    "expansion": "拡大",
+    "trader": "交渉",
+    "disruptor": "妨害",
 }
 
 PROHIBITED_LINE_START = frozenset("、。，．・：；？！)]｝〕〉》」』】〙〗〟’”")
@@ -236,17 +243,6 @@ def draw_resource_counts(
         pygame.draw.rect(card_surface, player.color, pygame.Rect(0, 0, 8, card_rect.height), border_radius=16)
         screen.blit(card_surface, card_rect.topleft)
 
-        if getattr(player, "is_ai", False):
-            role_label = "CPU"
-        elif player is visible_player:
-            role_label = "あなた"
-        else:
-            role_label = "人間"
-        marker = getattr(player, "marker", "●")
-        name_label = f"{marker} {player.name}・{role_label}"
-        name_surface = title_font.render(name_label, True, COLORS["WHITE"])
-        screen.blit(name_surface, (card_rect.x + 18, card_rect.y + 10))
-
         vp_value = points_by_player.get(player.name, 0) if points_by_player is not None else 0
         vp_label = (
             f"VP {vp_value}/{victory_point_target}"
@@ -254,6 +250,26 @@ def draw_resource_counts(
             else f"VP {vp_value}"
         )
         vp_surface = title_font.render(vp_label, True, (255, 236, 178))
+
+        if getattr(player, "is_ai", False):
+            personality = get_ai_personality_profile(
+                getattr(player, "ai_personality", "standard")
+            )
+            role_label = AI_PERSONALITY_CARD_LABELS.get(
+                personality.key,
+                personality.label,
+            )
+        elif player is visible_player:
+            role_label = "あなた"
+        else:
+            role_label = "人間"
+        marker = getattr(player, "marker", "●")
+        name_label = f"{marker} {player.name}・{role_label}"
+        name_width = card_rect.width - 18 - 10 - vp_surface.get_width() - 16
+        name_label = _truncate_message(title_font, name_label, name_width)
+        name_surface = title_font.render(name_label, True, COLORS["WHITE"])
+        screen.blit(name_surface, (card_rect.x + 18, card_rect.y + 10))
+
         screen.blit(vp_surface, (card_rect.right - vp_surface.get_width() - 16, card_rect.y + 10))
 
         show_resource_types = reveal_all or player is visible_player

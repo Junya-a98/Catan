@@ -6,12 +6,21 @@ import pygame
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 FONT_PATH = (PROJECT_ROOT / "Noto_Sans_JP" / "NotoSansJP-VariableFont_wght.ttf").resolve()
+_display_surface = None
+_display_generation = 0
 
 
 def _display_session_key():
     """Keep cached pygame objects scoped to the active display session."""
+    global _display_generation, _display_surface
     surface = pygame.display.get_surface()
-    return id(surface) if surface is not None else None
+    # Object ids can be reused after ``pygame.quit()``.  Retaining the last
+    # surface and advancing a generation on identity changes prevents a stale
+    # Font object from leaking into the next display session.
+    if surface is not _display_surface:
+        _display_surface = surface
+        _display_generation += 1
+    return _display_generation
 
 
 @lru_cache(maxsize=96)
