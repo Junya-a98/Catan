@@ -4,6 +4,7 @@ import re
 import struct
 from copy import deepcopy
 
+from game.custom_map import CustomMapError, CustomMapSpec
 from game.persistence import serialize_game
 
 
@@ -329,7 +330,7 @@ def build_board_manifest(game):
         "min_y": min(position["y"] for position in positions),
         "max_y": max(position["y"] for position in positions),
     }
-    return {
+    manifest = {
         "format": "catan-board-manifest",
         "version": 1,
         "mode": str(board.mode),
@@ -343,11 +344,36 @@ def build_board_manifest(game):
         "edges": edges,
         "harbors": harbors,
     }
+    if board.mode == "custom":
+        custom_map = getattr(board, "custom_map", None)
+        if not isinstance(custom_map, CustomMapSpec):
+            raise NetworkProtocolError(
+                "カスタム盤面の公開identityがありません。"
+            )
+        try:
+            live_map = CustomMapSpec.from_board(board, name=custom_map.name)
+        except CustomMapError as exc:
+            raise NetworkProtocolError(
+                "カスタム盤面を公開manifestへ変換できません。"
+            ) from exc
+        if live_map.fingerprint != custom_map.fingerprint:
+            raise NetworkProtocolError(
+                "カスタム盤面の公開identityが現在の盤面と一致しません。"
+            )
+        manifest["custom_map_fingerprint"] = custom_map.fingerprint
+    return manifest
 
 
 def build_state_snapshot(game, *, viewer_player_index=None, revision=0):
     """Build a viewer-specific state without leaking other players' private cards."""
     state = deepcopy(serialize_game(game))
+    board_state = state.get("board")
+    if isinstance(board_state, dict):
+        # The manifest already carries every public tile/harbor needed by LAN
+        # and Web renderers.  Keep only the stable fingerprint in network
+        # state; repeating the editable map document on every live snapshot
+        # wastes bandwidth and enlarges the untrusted client input surface.
+        board_state.pop("custom_map", None)
     player_count = len(state["players"])
     if viewer_player_index is not None and (
         isinstance(viewer_player_index, bool)

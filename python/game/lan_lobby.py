@@ -21,8 +21,12 @@ import math
 import re
 import secrets
 import time
+from collections.abc import Mapping
 from typing import Any, Callable, Optional
 import unicodedata
+
+from game.custom_map import CustomMapError, CustomMapSpec
+from game.house_rules import HouseRules
 
 
 __all__ = (
@@ -95,28 +99,68 @@ class RoomSettings:
     victory_target: int = 10
     board_mode: str = "constrained"
     board_seed: int = 0
+    custom_map: CustomMapSpec | Mapping[str, Any] | None = None
+    house_rules: HouseRules | Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
         _bounded_int(self.player_count, "player_count", minimum=2, maximum=4)
         _bounded_int(self.victory_target, "victory_target", minimum=5, maximum=15)
-        if self.board_mode not in ("constrained", "fully_random"):
+        if self.board_mode not in ("constrained", "fully_random", "custom"):
             raise LobbyValidationError(
-                "board_mode must be 'constrained' or 'fully_random'"
+                "board_mode must be 'constrained', 'fully_random', or 'custom'"
             )
         if isinstance(self.board_seed, bool) or not isinstance(self.board_seed, int):
             raise LobbyValidationError("board_seed must be an integer")
         if abs(self.board_seed) > MAX_SAFE_BOARD_SEED:
             raise LobbyValidationError("board_seed must be a JSON-safe integer")
 
+        custom_map = self.custom_map
+        if isinstance(custom_map, Mapping):
+            try:
+                custom_map = CustomMapSpec.from_document(custom_map)
+            except CustomMapError as exc:
+                raise LobbyValidationError("custom_map is invalid") from exc
+        elif custom_map is not None and not isinstance(custom_map, CustomMapSpec):
+            raise LobbyValidationError(
+                "custom_map must be a validated map document"
+            )
+        if self.board_mode == "custom":
+            if custom_map is None:
+                raise LobbyValidationError("custom board mode requires custom_map")
+        elif custom_map is not None:
+            raise LobbyValidationError("custom_map is only valid in custom mode")
+
+        house_rules = self.house_rules
+        if isinstance(house_rules, Mapping) or house_rules is None:
+            try:
+                house_rules = HouseRules.from_document(house_rules)
+            except ValueError as exc:
+                raise LobbyValidationError("house_rules is invalid") from exc
+        elif not isinstance(house_rules, HouseRules):
+            raise LobbyValidationError(
+                "house_rules must be a validated house-rule document"
+            )
+
+        # Never retain caller-owned mutable documents inside a room.  LAN
+        # snapshots and the authority factory now share immutable domain
+        # values validated at the trust boundary.
+        object.__setattr__(self, "custom_map", custom_map)
+        object.__setattr__(self, "house_rules", house_rules)
+
     def to_public_dict(self) -> dict[str, Any]:
         """Return the JSON-safe settings shared with every lobby viewer."""
 
-        return {
+        public = {
             "player_count": self.player_count,
             "victory_target": self.victory_target,
             "board_mode": self.board_mode,
             "board_seed": self.board_seed,
         }
+        if self.custom_map is not None:
+            public["custom_map"] = self.custom_map.to_document()
+        if self.house_rules != HouseRules.standard():
+            public["house_rules"] = self.house_rules.to_document()
+        return public
 
 
 @dataclass(frozen=True)

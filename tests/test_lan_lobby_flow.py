@@ -7,7 +7,10 @@ import pytest
 
 from game import lan_lobby_display as display
 from game.building import Building
+from game.custom_map import CustomMapSpec
 from game.game import CatanGame
+from game.game_board import GameBoard
+from game.house_rules import HouseRules
 from game.lan_lobby_flow import (
     ACTION_BACK,
     ACTION_CLOSE,
@@ -306,7 +309,11 @@ def test_create_host_is_async_advertises_lan_address_and_pumps_before_poll():
     assert flow.handle_action(ACTION_CREATE_ROOM)
     assert flow.connecting
 
-    wait_for(flow, lambda: flow.mode == "connected")
+    wait_for(
+        flow,
+        lambda: flow.mode == "connected"
+        and flow.display_state.lobby_snapshot is not None,
+    )
 
     runtime = runtimes[0]
     assert runtime.requested == ("0.0.0.0", 47624)
@@ -329,6 +336,52 @@ def test_create_host_is_async_advertises_lan_address_and_pumps_before_poll():
     flow.leave()
     assert session.close_calls == 1
     assert runtime.stop_calls == 1
+
+
+def test_create_flow_forwards_and_validates_custom_room_documents():
+    custom_map = CustomMapSpec.from_board(GameBoard(seed=3030))
+    house_rules = HouseRules(skip_discard_on_seven=True)
+    custom_settings = {
+        "player_count": 2,
+        "victory_target": 9,
+        "board_mode": "custom",
+        "board_seed": 3030,
+        "custom_map": custom_map.to_document(),
+        "house_rules": house_rules.to_document(),
+    }
+    custom_lobby = lobby_snapshot()
+    custom_lobby["settings"] = custom_settings
+    session = FakeSession(
+        events=(
+            welcome(),
+            message("lobby_snapshot", lobby=custom_lobby),
+        )
+    )
+    runtime = FakeRuntime(
+        "0.0.0.0",
+        47624,
+        bound=("0.0.0.0", 51234),
+    )
+    flow = LanLobbyFlow(
+        session_factory=lambda: session,
+        runtime_factory=lambda _host, _port: runtime,
+        room_settings_provider=lambda: custom_settings,
+        default_name="Host",
+        default_address="0.0.0.0:47624",
+    )
+    flow.open()
+    assert flow.handle_action(ACTION_MODE_CREATE)
+    assert flow.handle_action(ACTION_CREATE_ROOM)
+
+    wait_for(
+        flow,
+        lambda: flow.mode == "connected"
+        and flow.display_state.lobby_snapshot is not None,
+    )
+
+    assert session.create_calls == [("Host", custom_settings)]
+    assert flow.display_state.lobby_snapshot["settings"] == custom_settings
+    flow.leave()
 
 
 def test_advertised_host_resolver_failure_falls_back_to_loopback():

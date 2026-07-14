@@ -3,6 +3,10 @@ import random
 
 import pytest
 
+from game.custom_map import CustomMapSpec
+from game.development_cards import DevelopmentCardType
+from game.game_board import GameBoard
+from game.house_rules import HouseRules
 from game.lan_controller import LanControllerError, LanServerController
 from game.network_actions import NetworkActionError
 from game.network_protocol import (
@@ -94,6 +98,92 @@ def test_create_join_ready_start_and_viewer_specific_snapshots():
     assert host["command_options"] == [{"command": "roll_dice", "args": {}}]
     assert guest["command_options"] == []
     assert viewer["command_options"] == []
+
+
+def test_custom_room_settings_reach_authority_and_public_board_identity():
+    custom_map = CustomMapSpec.from_board(GameBoard(seed=8765))
+    house_rules = HouseRules(
+        skip_discard_on_seven=True,
+        disabled_development_cards=frozenset(
+            {DevelopmentCardType.YEAR_OF_PLENTY}
+        ),
+    )
+    controller = LanServerController()
+    created = controller.handle(
+        "host",
+        message(
+            "create_room",
+            display_name="Host",
+            settings={
+                "player_count": 2,
+                "victory_target": 8,
+                "board_mode": "custom",
+                "board_seed": 8765,
+                "custom_map": custom_map.to_document(),
+                "house_rules": house_rules.to_document(),
+            },
+        ),
+    )
+    welcome = next(
+        item.message
+        for item in created
+        if item.message["type"] == "session_welcome"
+    )
+    lobby = next(
+        item.message["lobby"]
+        for item in created
+        if item.message["type"] == "lobby_snapshot"
+    )
+    assert lobby["settings"]["custom_map"] == custom_map.to_document()
+    assert lobby["settings"]["house_rules"] == house_rules.to_document()
+
+    join_player(controller, welcome["room_code"])
+    started = ready_and_start(controller, welcome["room_code"])
+    snapshot = next(
+        item.message
+        for item in started
+        if item.connection_id == "host"
+        and item.message["type"] == "state_snapshot"
+    )
+
+    assert snapshot["state"]["board"]["mode"] == "custom"
+    assert (
+        snapshot["board_manifest"]["custom_map_fingerprint"]
+        == custom_map.fingerprint
+    )
+    assert snapshot["state"]["rules"]["house_rules"] == (
+        house_rules.to_document()
+    )
+
+
+@pytest.mark.parametrize(
+    "settings_patch",
+    [
+        {"board_mode": "custom"},
+        {"house_rules": {}},
+        {"unexpected": True},
+    ],
+)
+def test_create_room_rejects_malformed_custom_setting_boundaries(settings_patch):
+    settings = {
+        "player_count": 2,
+        "victory_target": 8,
+        "board_mode": "constrained",
+        "board_seed": 8765,
+        **settings_patch,
+    }
+
+    outbound = LanServerController().handle(
+        "host",
+        message(
+            "create_room",
+            display_name="Host",
+            settings=settings,
+        ),
+    )
+
+    assert [item.message["type"] for item in outbound] == ["request_error"]
+    assert outbound[0].message["code"] == "invalid_request"
 
 
 def test_command_options_follow_authoritative_actor_after_each_revision():

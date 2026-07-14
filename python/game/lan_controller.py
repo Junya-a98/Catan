@@ -112,6 +112,8 @@ def _default_game_factory(
     game = CatanGame(
         board_mode=settings.board_mode,
         board_seed=settings.board_seed,
+        custom_map=settings.custom_map,
+        house_rules=settings.house_rules,
         ai_player_count=0,
         headless=True,
     )
@@ -298,13 +300,20 @@ class LanServerController:
         raw_settings = message["settings"]
         if type(raw_settings) is not dict:
             raise LanControllerError("invalid_request", "settingsが不正です。")
-        self._expect_fields(
-            raw_settings,
+        required_settings = {
             "player_count",
             "victory_target",
             "board_mode",
             "board_seed",
-        )
+        }
+        optional_settings = {"custom_map", "house_rules"}
+        if not required_settings.issubset(raw_settings) or not set(
+            raw_settings
+        ).issubset(required_settings | optional_settings):
+            raise LanControllerError(
+                "invalid_request",
+                "settingsのfieldが不正です。",
+            )
         settings = RoomSettings(**raw_settings)
         code = self._new_room_code()
         lobby, grant = LobbyRoom.create(

@@ -4,6 +4,9 @@ import time
 
 import pytest
 
+from game.custom_map import CustomMapSpec
+from game.game_board import GameBoard
+from game.house_rules import HouseRules
 from game.lan_runtime import LanClientSession, LanServerRuntime
 from game.lan_transport import LanTransportError, LanTransportEvent
 from game.network_protocol import (
@@ -399,5 +402,47 @@ def test_client_explicit_leave_uses_versioned_room_command():
         {
             "type": "leave_room",
             "protocol_version": NETWORK_PROTOCOL_VERSION,
+        }
+    ]
+
+
+def test_client_create_room_canonicalizes_optional_custom_settings():
+    class StubTransport:
+        is_connected = True
+
+        def __init__(self):
+            self.sent = []
+
+        def send(self, message):
+            self.sent.append(message)
+
+    custom_map = CustomMapSpec.from_board(GameBoard(seed=1414))
+    house_rules = HouseRules(bank_trade_3_to_1=True)
+    transport = StubTransport()
+    session = LanClientSession(transport=transport)
+
+    session.create_room(
+        "Host",
+        player_count=2,
+        victory_target=8,
+        board_mode="custom",
+        board_seed=1414,
+        custom_map=custom_map,
+        house_rules=house_rules,
+    )
+
+    assert transport.sent == [
+        {
+            "type": "create_room",
+            "protocol_version": NETWORK_PROTOCOL_VERSION,
+            "display_name": "Host",
+            "settings": {
+                "player_count": 2,
+                "victory_target": 8,
+                "board_mode": "custom",
+                "board_seed": 1414,
+                "custom_map": custom_map.to_document(),
+                "house_rules": house_rules.to_document(),
+            },
         }
     ]

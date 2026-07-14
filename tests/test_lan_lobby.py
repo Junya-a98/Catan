@@ -4,6 +4,10 @@ import re
 
 import pytest
 
+from game.custom_map import CustomMapSpec
+from game.development_cards import DevelopmentCardType
+from game.game_board import GameBoard
+from game.house_rules import HouseRules
 from game.lan_lobby import (
     DEFAULT_SEAT_RESERVATION_SECONDS,
     LobbyAuthenticationError,
@@ -95,6 +99,52 @@ def test_room_settings_are_json_safe_and_allow_both_modes_and_integer_seeds():
         "board_seed": -42,
     }
     assert json.loads(json.dumps(settings.to_public_dict()))["board_seed"] == -42
+
+
+def test_room_settings_canonicalize_custom_map_and_house_rule_documents():
+    custom_map = CustomMapSpec.from_board(GameBoard(seed=73))
+    house_rules = HouseRules(
+        bank_trade_3_to_1=True,
+        disabled_development_cards=frozenset({DevelopmentCardType.MONOPOLY}),
+    )
+    map_document = custom_map.to_document()
+    rules_document = house_rules.to_document()
+
+    settings = RoomSettings(
+        player_count=2,
+        victory_target=9,
+        board_mode="custom",
+        board_seed=73,
+        custom_map=map_document,
+        house_rules=rules_document,
+    )
+    map_document["tiles"][0]["resource"] = "DESERT"
+    rules_document["bank_trade_3_to_1"] = False
+
+    assert settings.custom_map == custom_map
+    assert settings.house_rules == house_rules
+    public = settings.to_public_dict()
+    assert public["custom_map"] == custom_map.to_document()
+    assert public["house_rules"] == house_rules.to_document()
+    assert json.loads(json.dumps(public)) == public
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"board_mode": "custom"},
+        {
+            "board_mode": "constrained",
+            "custom_map": CustomMapSpec.from_board(GameBoard(seed=4)),
+        },
+        {"house_rules": {}},
+        {"house_rules": {"bank_trade_3_to_1": True}},
+        {"custom_map": {"format": "not-a-custom-map"}},
+    ],
+)
+def test_room_settings_reject_incomplete_or_cross_mode_custom_settings(kwargs):
+    with pytest.raises(LobbyValidationError):
+        RoomSettings(**kwargs)
 
 
 def test_room_code_and_reconnect_tokens_use_safe_production_shapes():

@@ -128,11 +128,31 @@ def test_initial_setup_buttons_include_board_configuration_controls():
         assert {
             "board_mode_constrained",
             "board_mode_fully_random",
+            "pre_game_settings_open",
             "seed_input_focus",
             "seed_apply",
             "seed_randomize",
             "ai_count_cycle",
         }.issubset(actions)
+    finally:
+        game.audio.stop()
+        pygame.quit()
+
+
+def test_initial_setup_buttons_do_not_overlap_or_run_below_summary_area():
+    pygame.init()
+    pygame.display.set_mode((1, 1))
+    game = CatanGame()
+    try:
+        buttons = game.build_buttons()
+
+        for index, first in enumerate(buttons):
+            assert first.rect.bottom <= 552
+            for second in buttons[index + 1 :]:
+                assert not first.rect.colliderect(second.rect), (
+                    first.action,
+                    second.action,
+                )
     finally:
         game.audio.stop()
         pygame.quit()
@@ -279,7 +299,9 @@ def test_turn_change_keeps_history_and_exposes_completed_turn_summary():
         game.start_main_phase()
         game.dice_rolled = True
         game.add_log("確認用の過去イベント")
-        game.record_event("Player1のダイス: 8", "木 +2", actor=game.get_current_player())
+        game.record_event(
+            "Player1のダイス: 8", "木 +2", actor=game.get_current_player()
+        )
 
         game.finish_current_turn()
 

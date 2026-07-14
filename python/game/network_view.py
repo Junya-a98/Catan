@@ -80,8 +80,9 @@ _DEVELOPMENT_KEYS = (
 _PHASES = frozenset(("initial", "main", "finished"))
 _ACTION_MODES = frozenset((None, "road", "settlement", "city"))
 _BUILDING_TYPES = frozenset(("settlement", "city"))
-_BOARD_MODES = frozenset(("constrained", "fully_random"))
+_BOARD_MODES = frozenset(("constrained", "fully_random", "custom"))
 _DOMESTIC_TRADE_EDIT_SIDES = frozenset(("give", "receive"))
+_FINGERPRINT_PATTERN = re.compile(r"[0-9a-f]{64}\Z")
 _ID_PATTERNS = {
     "tile": re.compile(r"tile-[0-9]{1,4}\Z"),
     "node": re.compile(r"node-[0-9]{1,4}\Z"),
@@ -204,6 +205,9 @@ class BoardView:
     _edge_by_id: Mapping[str, EdgeView] = field(repr=False, compare=False)
     _harbor_by_id: Mapping[str, HarborView] = field(repr=False, compare=False)
     _position_by_id: Mapping[str, PointView] = field(repr=False, compare=False)
+    # Appended with a default to preserve the original positional constructor
+    # for generated-board consumers.
+    custom_map_fingerprint: Optional[str] = None
 
     @property
     def tile_by_id(self) -> Mapping[str, TileView]:
@@ -436,6 +440,10 @@ def parse_network_view(envelope: Any) -> NetworkGameView:
         _required(state, "board", "snapshot.state"),
         "snapshot.state.board",
     )
+    if "custom_map" in board_state:
+        raise NetworkViewError(
+            "network snapshot board must not embed a custom map document"
+        )
     mode = _enum_text(
         _required(board_state, "mode", "snapshot.state.board"),
         _BOARD_MODES,
@@ -447,11 +455,27 @@ def parse_network_view(envelope: Any) -> NetworkGameView:
         minimum=-MAX_SAFE_JSON_INTEGER,
         maximum=MAX_SAFE_JSON_INTEGER,
     )
+    if mode == "custom":
+        custom_map_fingerprint = _fingerprint(
+            _required(
+                board_state,
+                "custom_map_fingerprint",
+                "snapshot.state.board",
+            ),
+            "snapshot.state.board.custom_map_fingerprint",
+        )
+    else:
+        if "custom_map_fingerprint" in board_state:
+            raise NetworkViewError(
+                "generated snapshot board cannot contain a custom map fingerprint"
+            )
+        custom_map_fingerprint = None
     board = _parse_board_manifest(
         _required(envelope, "board_manifest", "snapshot"),
         player_count=player_count,
         expected_mode=mode,
         expected_seed=seed,
+        expected_custom_map_fingerprint=custom_map_fingerprint,
     )
 
     public_points = [0] * player_count
@@ -883,6 +907,7 @@ def _parse_board_manifest(
     player_count: int,
     expected_mode: str,
     expected_seed: int,
+    expected_custom_map_fingerprint: Optional[str],
 ) -> BoardView:
     manifest = _mapping(raw, "snapshot.board_manifest")
     _validate_manifest_size(manifest)
@@ -903,6 +928,25 @@ def _parse_board_manifest(
     )
     if mode != expected_mode or seed != expected_seed:
         raise NetworkViewError("board manifest mode/seed does not match snapshot state")
+    if mode == "custom":
+        custom_map_fingerprint = _fingerprint(
+            _required(
+                manifest,
+                "custom_map_fingerprint",
+                "snapshot.board_manifest",
+            ),
+            "snapshot.board_manifest.custom_map_fingerprint",
+        )
+        if custom_map_fingerprint != expected_custom_map_fingerprint:
+            raise NetworkViewError(
+                "board manifest custom map fingerprint does not match snapshot state"
+            )
+    else:
+        if "custom_map_fingerprint" in manifest:
+            raise NetworkViewError(
+                "generated board manifest cannot contain a custom map fingerprint"
+            )
+        custom_map_fingerprint = None
 
     coordinate_space = _mapping(
         _required(manifest, "coordinate_space", "snapshot.board_manifest"),
@@ -988,6 +1032,7 @@ def _parse_board_manifest(
     return BoardView(
         mode=mode,
         seed=seed,
+        custom_map_fingerprint=custom_map_fingerprint,
         bounds=bounds,
         tiles=tiles,
         nodes=nodes,
@@ -1376,6 +1421,12 @@ def _id_list(
 def _target_id(value: Any, kind: str, label: str) -> str:
     if not isinstance(value, str) or not _ID_PATTERNS[kind].fullmatch(value):
         raise NetworkViewError(f"{label} is not a stable {kind} ID")
+    return value
+
+
+def _fingerprint(value: Any, label: str) -> str:
+    if not isinstance(value, str) or not _FINGERPRINT_PATTERN.fullmatch(value):
+        raise NetworkViewError(f"{label} must be a lowercase SHA-256 fingerprint")
     return value
 
 

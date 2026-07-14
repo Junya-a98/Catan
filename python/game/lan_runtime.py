@@ -7,7 +7,10 @@ import threading
 import time
 from typing import Any, Mapping
 
+from game.custom_map import CustomMapSpec
+from game.house_rules import HouseRules
 from game.lan_controller import LanServerController, OutboundMessage
+from game.lan_lobby import RoomSettings
 from game.lan_transport import (
     DEFAULT_LAN_HOST,
     DEFAULT_LAN_PORT,
@@ -161,17 +164,22 @@ class LanClientSession:
         victory_target: int = 10,
         board_mode: str = "constrained",
         board_seed: int = 0,
+        custom_map: CustomMapSpec | Mapping[str, Any] | None = None,
+        house_rules: HouseRules | Mapping[str, Any] | None = None,
     ) -> None:
+        settings = RoomSettings(
+            player_count=player_count,
+            victory_target=victory_target,
+            board_mode=board_mode,
+            board_seed=board_seed,
+            custom_map=custom_map,
+            house_rules=house_rules,
+        ).to_public_dict()
         self._begin_session_sync()
         self._send(
             "create_room",
             display_name=display_name,
-            settings={
-                "player_count": player_count,
-                "victory_target": victory_target,
-                "board_mode": board_mode,
-                "board_seed": board_seed,
-            },
+            settings=settings,
         )
 
     def join_room(

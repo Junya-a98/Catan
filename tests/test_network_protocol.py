@@ -10,6 +10,8 @@ import pytest
 
 from game.game import CatanGame
 from game.building import Building, BuildingType
+from game.custom_map import CustomMapSpec
+from game.game_board import GameBoard
 from game.network_protocol import (
     MAX_GAME_COMMAND_NAME_LENGTH,
     MAX_GAME_COMMAND_STRING_LENGTH,
@@ -254,6 +256,37 @@ def test_board_manifest_is_deterministic_for_the_same_board_seed(game):
     second = build_state_snapshot(other, viewer_player_index=None)["board_manifest"]
 
     assert first == second
+
+
+def test_custom_board_manifest_publishes_verified_map_identity_only_for_custom_mode(
+    game,
+):
+    custom_map = CustomMapSpec.from_board(GameBoard(seed=151))
+    custom_game = CatanGame(
+        board_mode="custom",
+        board_seed=151,
+        custom_map=custom_map,
+        ai_player_count=0,
+        headless=True,
+    )
+    custom_game.configure_players(2, reset_logs=False)
+
+    snapshot = build_state_snapshot(custom_game, viewer_player_index=None)
+
+    assert snapshot["board_manifest"]["mode"] == "custom"
+    assert (
+        snapshot["board_manifest"]["custom_map_fingerprint"]
+        == custom_map.fingerprint
+    )
+    assert (
+        snapshot["state"]["board"]["custom_map_fingerprint"]
+        == custom_map.fingerprint
+    )
+    assert "custom_map" not in snapshot["state"]["board"]
+    assert "custom_map_fingerprint" not in build_state_snapshot(
+        game,
+        viewer_player_index=None,
+    )["board_manifest"]
 
 
 def test_board_manifest_and_command_reference_index_share_the_same_ids(game):

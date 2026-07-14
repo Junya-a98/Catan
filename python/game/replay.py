@@ -19,6 +19,8 @@ import time
 from typing import Any, Callable, Dict, Optional, Tuple, Union
 
 from game.assets import PROJECT_ROOT
+from game.custom_map import CustomMapError, CustomMapSpec
+from game.house_rules import HouseRules
 from game.persistence import (
     SAVE_FORMAT,
     SAVE_VERSION,
@@ -192,10 +194,17 @@ class ReplayRecorder:
 
     def _fill_game_metadata(self, game: Any) -> None:
         players = getattr(game, "players", ())
+        house_rules = getattr(game, "house_rules", None)
+        if house_rules is None:
+            house_rules = HouseRules.standard()
+        if not isinstance(house_rules, HouseRules):
+            raise ReplayError("ハウスルール設定を記録できません。")
+        board_mode = getattr(game, "board_mode", "")
         defaults = {
-            "board_mode": getattr(game, "board_mode", ""),
+            "board_mode": board_mode,
             "board_seed": getattr(game, "board_seed", None),
             "victory_point_target": getattr(game, "victory_point_target", None),
+            "house_rules_fingerprint": house_rules.fingerprint(),
             "players": [
                 {
                     "name": str(getattr(player, "name", "")),
@@ -206,6 +215,11 @@ class ReplayRecorder:
             "snapshot_history": "latest-event-only",
             "development_deck_order": "canonicalized",
         }
+        if board_mode == "custom":
+            custom_map = getattr(game, "custom_map_spec", None)
+            if not isinstance(custom_map, CustomMapSpec):
+                raise ReplayError("カスタム盤面設定を記録できません。")
+            defaults["custom_map_fingerprint"] = custom_map.fingerprint
         candidate = copy.deepcopy(self._metadata)
         for key, value in defaults.items():
             candidate.setdefault(key, value)
@@ -608,13 +622,25 @@ def _snapshot_identity(snapshot: Dict[str, Any], sequence: int) -> Tuple[Any, ..
     board_seed = board.get("seed")
     victory_target = rules.get("victory_point_target")
     if (
-        board_mode not in ("constrained", "fully_random")
+        board_mode not in ("constrained", "fully_random", "custom")
         or isinstance(board_seed, bool)
         or not isinstance(board_seed, int)
         or isinstance(victory_target, bool)
         or not isinstance(victory_target, int)
     ):
         raise ReplayError(f"リプレイのフレーム {sequence} の対局設定が不正です。")
+    custom_map_fingerprint = _snapshot_custom_map_fingerprint(
+        board,
+        sequence,
+    )
+    try:
+        house_rules = HouseRules.from_document(rules.get("house_rules"))
+    except (TypeError, ValueError) as exc:
+        raise ReplayError(
+            f"リプレイのフレーム {sequence} の"
+            "ハウスルール設定が不正です。"
+        ) from exc
+    house_rules_fingerprint = house_rules.fingerprint()
     seats = []
     for player in players:
         if (
@@ -624,10 +650,48 @@ def _snapshot_identity(snapshot: Dict[str, Any], sequence: int) -> Tuple[Any, ..
         ):
             raise ReplayError(f"リプレイのフレーム {sequence} の参加者情報が不正です。")
         seats.append((player["name"], player["is_ai"]))
-    return board_mode, board_seed, victory_target, tuple(seats)
+    return (
+        board_mode,
+        board_seed,
+        victory_target,
+        custom_map_fingerprint,
+        house_rules_fingerprint,
+        tuple(seats),
+    )
 
 
 def _metadata_identity(metadata: Dict[str, Any]) -> Tuple[Any, ...]:
+    board_mode = metadata.get("board_mode")
+    board_seed = metadata.get("board_seed")
+    victory_target = metadata.get("victory_point_target")
+    if (
+        board_mode not in ("constrained", "fully_random", "custom")
+        or isinstance(board_seed, bool)
+        or not isinstance(board_seed, int)
+        or isinstance(victory_target, bool)
+        or not isinstance(victory_target, int)
+    ):
+        raise ReplayError("リプレイの対局設定メタデータが不正です。")
+    if board_mode == "custom":
+        custom_map_fingerprint = _required_fingerprint(
+            metadata.get("custom_map_fingerprint"),
+            label="カスタム盤面",
+        )
+    else:
+        if "custom_map_fingerprint" in metadata:
+            raise ReplayError(
+                "生成盤面のリプレイにカスタム盤面識別子が混在しています。"
+            )
+        custom_map_fingerprint = None
+    if "house_rules_fingerprint" in metadata:
+        house_rules_fingerprint = _required_fingerprint(
+            metadata["house_rules_fingerprint"],
+            label="ハウスルール",
+        )
+    else:
+        # Replays created before house-rule settings existed represent the
+        # official/default rules.
+        house_rules_fingerprint = HouseRules.standard().fingerprint()
     players = metadata.get("players")
     if not isinstance(players, list):
         raise ReplayError("リプレイの参加者メタデータが不正です。")
@@ -641,11 +705,62 @@ def _metadata_identity(metadata: Dict[str, Any]) -> Tuple[Any, ...]:
             raise ReplayError("リプレイの参加者メタデータが不正です。")
         seats.append((player["name"], player["is_ai"]))
     return (
-        metadata.get("board_mode"),
-        metadata.get("board_seed"),
-        metadata.get("victory_point_target"),
+        board_mode,
+        board_seed,
+        victory_target,
+        custom_map_fingerprint,
+        house_rules_fingerprint,
         tuple(seats),
     )
+
+
+def _snapshot_custom_map_fingerprint(
+    board: Dict[str, Any],
+    sequence: int,
+) -> Optional[str]:
+    mode = board.get("mode")
+    has_document = "custom_map" in board
+    has_fingerprint = "custom_map_fingerprint" in board
+    if mode != "custom":
+        if has_document or has_fingerprint:
+            raise ReplayError(
+                f"リプレイのフレーム {sequence} の生成盤面に"
+                "カスタムマップ設定が混在しています。"
+            )
+        return None
+    if not has_document or not has_fingerprint:
+        raise ReplayError(
+            f"リプレイのフレーム {sequence} に"
+            "カスタム盤面の完全な設定がありません。"
+        )
+    fingerprint = _required_fingerprint(
+        board["custom_map_fingerprint"],
+        label=f"フレーム {sequence} のカスタム盤面",
+    )
+    try:
+        custom_map = CustomMapSpec.from_document(board["custom_map"])
+    except (CustomMapError, TypeError, ValueError) as exc:
+        raise ReplayError(
+            f"リプレイのフレーム {sequence} の"
+            "カスタム盤面設定が不正です。"
+        ) from exc
+    if custom_map.fingerprint != fingerprint:
+        raise ReplayError(
+            f"リプレイのフレーム {sequence} の"
+            "カスタム盤面と識別子が一致しません。"
+        )
+    return fingerprint
+
+
+def _required_fingerprint(value: Any, *, label: str) -> str:
+    if (
+        not isinstance(value, str)
+        or len(value) != 64
+        or value != value.lower()
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        raise ReplayError(f"{label}の識別子が不正です。")
+    return value
 
 
 def _validated_metadata(metadata: Any) -> Dict[str, Any]:

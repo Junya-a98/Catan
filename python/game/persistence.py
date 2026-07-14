@@ -16,8 +16,10 @@ from game.constants import (
     MIN_VICTORY_POINT_TARGET,
     WINNING_VICTORY_POINTS,
 )
+from game.custom_map import CustomMapError, CustomMapSpec
 from game.development_cards import DevelopmentCardType
 from game.game_board import GameBoard
+from game.house_rules import HouseRules
 from game.match_metrics import (
     MatchMetrics,
     MatchMetricsError,
@@ -150,6 +152,61 @@ def _restore_match_metrics(data):
         raise SaveGameError("対局メトリクスが不正です。") from exc
 
 
+def _house_rules_for_game(game):
+    house_rules = getattr(game, "house_rules", None)
+    if house_rules is None:
+        return HouseRules.standard()
+    if not isinstance(house_rules, HouseRules):
+        raise SaveGameError("ハウスルール設定を保存できません。")
+    return house_rules
+
+
+def _custom_map_for_game(game):
+    if getattr(game, "board_mode", None) != "custom":
+        return None
+    custom_map = getattr(game, "custom_map_spec", None)
+    if not isinstance(custom_map, CustomMapSpec):
+        raise SaveGameError("カスタム盤面設定を保存できません。")
+    try:
+        board_map = CustomMapSpec.from_board(game.board, name=custom_map.name)
+    except (CustomMapError, TypeError, ValueError) as exc:
+        raise SaveGameError("カスタム盤面設定を保存できません。") from exc
+    if board_map.fingerprint != custom_map.fingerprint:
+        raise SaveGameError("カスタム盤面設定と現在の盤面が一致しません。")
+    return custom_map
+
+
+def _valid_fingerprint(value):
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and value == value.lower()
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def _custom_map_from_board_document(board):
+    mode = board.get("mode")
+    has_document = "custom_map" in board
+    has_fingerprint = "custom_map_fingerprint" in board
+    if mode != "custom":
+        if has_document or has_fingerprint:
+            raise SaveGameError("生成盤面にカスタムマップ設定が混在しています。")
+        return None
+    if not has_document or not has_fingerprint:
+        raise SaveGameError("カスタム盤面の完全な設定がありません。")
+    fingerprint = board["custom_map_fingerprint"]
+    if not _valid_fingerprint(fingerprint):
+        raise SaveGameError("カスタム盤面の識別子が不正です。")
+    try:
+        custom_map = CustomMapSpec.from_document(board["custom_map"])
+    except (CustomMapError, TypeError, ValueError) as exc:
+        raise SaveGameError("カスタム盤面設定が不正です。") from exc
+    if custom_map.fingerprint != fingerprint:
+        raise SaveGameError("カスタム盤面の内容と識別子が一致しません。")
+    return custom_map
+
+
 def serialize_game(game):
     players = list(game.players)
     nodes = list(game.board.nodes)
@@ -183,20 +240,31 @@ def serialize_game(game):
     if "color" in latest_event:
         latest_event["color"] = list(latest_event["color"])
 
+    house_rules = _house_rules_for_game(game)
+    rules_document = {
+        "victory_point_target": int(game.victory_point_target),
+    }
+    if house_rules != HouseRules.standard():
+        rules_document["house_rules"] = house_rules.to_document()
+
+    board_document = {
+        "mode": game.board_mode,
+        "seed": game.board_seed,
+        "robber_tile": tile_indices.get(game.board.robber_tile),
+        "buildings": buildings,
+        "roads": roads,
+    }
+    custom_map = _custom_map_for_game(game)
+    if custom_map is not None:
+        board_document["custom_map"] = custom_map.to_document()
+        board_document["custom_map_fingerprint"] = custom_map.fingerprint
+
     return {
         "format": SAVE_FORMAT,
         "version": SAVE_VERSION,
-        "rules": {
-            "victory_point_target": int(game.victory_point_target),
-        },
+        "rules": rules_document,
         "match_metrics": _serialize_match_metrics(game),
-        "board": {
-            "mode": game.board_mode,
-            "seed": game.board_seed,
-            "robber_tile": tile_indices.get(game.board.robber_tile),
-            "buildings": buildings,
-            "roads": roads,
-        },
+        "board": board_document,
         "players": [
             {
                 "name": player.name,
@@ -343,10 +411,15 @@ def _validate_save_header(data):
         )
     board = data.get("board")
     players = data.get("players")
-    if not isinstance(board, dict) or board.get("mode") not in ("constrained", "fully_random"):
+    if not isinstance(board, dict) or board.get("mode") not in (
+        "constrained",
+        "fully_random",
+        "custom",
+    ):
         raise SaveGameError("盤面設定が不正です。")
-    if not isinstance(board.get("seed"), int):
+    if isinstance(board.get("seed"), bool) or not isinstance(board.get("seed"), int):
         raise SaveGameError("盤面seedが不正です。")
+    _custom_map_from_board_document(board)
     if not isinstance(players, list) or not 2 <= len(players) <= 4:
         raise SaveGameError("プレイヤー数が不正です。")
 
@@ -355,10 +428,15 @@ def restore_game(game, data, *, runtime_side_effects=True):
     _validate_save_header(data)
     restored_match_metrics = _restore_match_metrics(data)
     board_data = data["board"]
+    custom_map = _custom_map_from_board_document(board_data)
     player_data = data["players"]
     rules_data = data.get("rules", {})
     if not isinstance(rules_data, dict):
         raise SaveGameError("ルール設定が不正です。")
+    try:
+        house_rules = HouseRules.from_document(rules_data.get("house_rules"))
+    except (TypeError, ValueError) as exc:
+        raise SaveGameError("ハウスルール設定が不正です。") from exc
     victory_point_target = rules_data.get(
         "victory_point_target",
         WINNING_VICTORY_POINTS,
@@ -369,11 +447,20 @@ def restore_game(game, data, *, runtime_side_effects=True):
     ):
         raise SaveGameError("勝利点の目標値が不正です。")
     game.victory_point_target = victory_point_target
+    game.house_rules = house_rules
 
     game.board_mode = board_data["mode"]
     game.board_seed = board_data["seed"]
     game.board_seed_text = str(game.board_seed)
-    game.board = GameBoard(mode=game.board_mode, seed=game.board_seed)
+    game.custom_map_spec = custom_map
+    if custom_map is None:
+        game.board = GameBoard(mode=game.board_mode, seed=game.board_seed)
+    else:
+        game.board = GameBoard(
+            mode=game.board_mode,
+            seed=game.board_seed,
+            custom_map=custom_map,
+        )
     game.get_board_rules().set_board(game.board)
 
     ai_data = data.get("ai", {})

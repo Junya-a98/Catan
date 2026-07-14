@@ -6,8 +6,10 @@ from pathlib import Path
 import pytest
 
 from game.building import Building, BuildingType
+from game.custom_map import CustomMapSpec
 from game.development_cards import DevelopmentCardType
 from game.game import CatanGame
+from game.game_board import GameBoard
 from game.network_protocol import build_state_snapshot
 from game import network_view as network_view_module
 from game.network_view import (
@@ -230,6 +232,54 @@ def test_board_dtos_have_stable_immutable_id_and_coordinate_lookups(player_snaps
         view.players[0].resources["WOOD"] = 99
     with pytest.raises(FrozenInstanceError):
         view.revision = 99
+
+
+def test_custom_board_view_requires_matching_state_and_manifest_fingerprints():
+    custom_map = CustomMapSpec.from_board(GameBoard(seed=2026))
+    authority = CatanGame(
+        board_mode="custom",
+        board_seed=2026,
+        custom_map=custom_map,
+        ai_player_count=0,
+        headless=True,
+    )
+    authority.configure_players(2, reset_logs=False)
+    snapshot = build_state_snapshot(
+        authority,
+        viewer_player_index=None,
+        revision=3,
+    )
+
+    view = parse_state_snapshot(snapshot)
+    assert view.board.mode == "custom"
+    assert view.board.custom_map_fingerprint == custom_map.fingerprint
+
+    mismatched = deepcopy(snapshot)
+    mismatched["board_manifest"]["custom_map_fingerprint"] = "0" * 64
+    with pytest.raises(NetworkViewError, match="fingerprint.*does not match"):
+        parse_state_snapshot(mismatched)
+
+    missing = deepcopy(snapshot)
+    del missing["board_manifest"]["custom_map_fingerprint"]
+    with pytest.raises(NetworkViewError, match="custom_map_fingerprint"):
+        parse_state_snapshot(missing)
+
+    embedded = deepcopy(snapshot)
+    embedded["state"]["board"]["custom_map"] = custom_map.to_document()
+    with pytest.raises(NetworkViewError, match="must not embed"):
+        parse_state_snapshot(embedded)
+
+
+def test_generated_board_view_rejects_custom_fingerprint_fields(player_snapshot):
+    state_leak = deepcopy(player_snapshot)
+    state_leak["state"]["board"]["custom_map_fingerprint"] = "0" * 64
+    with pytest.raises(NetworkViewError, match="generated snapshot"):
+        parse_state_snapshot(state_leak)
+
+    manifest_leak = deepcopy(player_snapshot)
+    manifest_leak["board_manifest"]["custom_map_fingerprint"] = "0" * 64
+    with pytest.raises(NetworkViewError, match="generated board manifest"):
+        parse_state_snapshot(manifest_leak)
 
 
 @pytest.mark.parametrize(

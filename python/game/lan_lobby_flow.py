@@ -25,6 +25,7 @@ from types import MappingProxyType
 from typing import Any, Protocol
 import unicodedata
 
+from game.lan_lobby import LobbyValidationError, RoomSettings
 from game.network_view import (
     NetworkGameView,
     NetworkViewError,
@@ -1100,27 +1101,19 @@ def _validated_room_code(value: str) -> str:
 def _validated_room_settings(value: Mapping[str, Any]) -> dict[str, Any]:
     if not isinstance(value, Mapping):
         raise TypeError("room settings provider must return a mapping")
-    expected = {"player_count", "victory_target", "board_mode", "board_seed"}
-    if set(value) != expected:
+    required = {"player_count", "victory_target", "board_mode", "board_seed"}
+    optional = {"custom_map", "house_rules"}
+    if not required.issubset(value) or not set(value).issubset(required | optional):
         raise ValueError("部屋設定の項目が不足または過剰です。")
-    player_count = value["player_count"]
-    victory_target = value["victory_target"]
-    board_mode = value["board_mode"]
-    board_seed = value["board_seed"]
-    if type(player_count) is not int or not 2 <= player_count <= 4:
-        raise ValueError("player_countは2〜4で指定してください。")
-    if type(victory_target) is not int or not 5 <= victory_target <= 15:
-        raise ValueError("victory_targetは5〜15で指定してください。")
-    if board_mode not in ("constrained", "fully_random"):
-        raise ValueError("board_modeが不正です。")
-    if type(board_seed) is not int or abs(board_seed) > _MAX_SAFE_JSON_INTEGER:
-        raise ValueError("board_seedは安全な範囲の整数で指定してください。")
-    return {
-        "player_count": player_count,
-        "victory_target": victory_target,
-        "board_mode": board_mode,
-        "board_seed": board_seed,
-    }
+    try:
+        # Lobby snapshots are frozen to tuples/MappingProxyType before this
+        # validator runs.  Restore plain JSON containers so the shared strict
+        # CustomMapSpec/HouseRules parsers see the same document shapes as the
+        # server trust boundary.
+        settings = RoomSettings(**_deep_thaw(value))
+    except (LobbyValidationError, TypeError, ValueError) as exc:
+        raise ValueError(str(exc)) from exc
+    return settings.to_public_dict()
 
 
 def _validated_bound_address(value: Any) -> tuple[str, int]:
