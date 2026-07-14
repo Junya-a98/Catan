@@ -459,3 +459,187 @@ def test_real_self_play_batch_dataclass_is_directly_accepted():
     assert report["matches"][0]["turns"] == sum(
         report["matches"][0]["dice_counts"].values()
     )
+
+
+def _analytics_match(
+    *,
+    board_seed=4242,
+    winner_seat=1,
+    expansion_vp=10,
+    trader_vp=7,
+    turns=30,
+    validation_errors=None,
+):
+    return {
+        "board_mode": "constrained",
+        "board_seed": board_seed,
+        "completed": True,
+        "winner_seat": winner_seat,
+        "turns": turns,
+        "players": [
+            {
+                "seat": 1,
+                "name": "Builder",
+                "personality": "expansion",
+                "vp": expansion_vp,
+            },
+            {
+                "seat": 2,
+                "name": "Trader",
+                "personality": "trader",
+                "vp": trader_vp,
+            },
+        ],
+        "validation_errors": validation_errors or [],
+    }
+
+
+def test_personality_matchups_are_directionally_consistent_and_ignore_bad_samples():
+    matches = [
+        _analytics_match(expansion_vp=10, trader_vp=7, winner_seat=1),
+        _analytics_match(expansion_vp=8, trader_vp=10, winner_seat=2),
+        _analytics_match(expansion_vp=9, trader_vp=9, winner_seat=1),
+        _analytics_match(expansion_vp=10, trader_vp=9, winner_seat=1),
+        _analytics_match(
+            expansion_vp=99,
+            trader_vp=0,
+            winner_seat=1,
+            validation_errors=["broken"],
+        ),
+        {
+            **_analytics_match(expansion_vp=10, trader_vp=7),
+            "completed": False,
+        },
+        {
+            **_analytics_match(expansion_vp=10, trader_vp=7),
+            "players": [
+                {"seat": 1, "name": "Unknown", "personality": None, "vp": 10},
+                {"seat": 2, "name": "No VP", "personality": "trader"},
+            ],
+        },
+    ]
+
+    summary = build_report_data({"matches": matches}, generated_at="fixed")["summary"]
+    rows = {
+        (row["personality_a"], row["personality_b"]): row
+        for row in summary["personality_matchup_statistics"]
+    }
+    forward = rows[("expansion", "trader")]
+    reverse = rows[("trader", "expansion")]
+
+    assert forward["comparisons"] == 4
+    assert (forward["wins"], forward["ties"], forward["losses"]) == (2, 1, 1)
+    assert forward["score_rate"] == pytest.approx(0.625)
+    assert forward["average_vp_margin"] == pytest.approx(0.5)
+    assert reverse["wins"] == forward["losses"]
+    assert reverse["ties"] == forward["ties"]
+    assert reverse["losses"] == forward["wins"]
+    assert reverse["score_rate"] == pytest.approx(1 - forward["score_rate"])
+    assert reverse["average_vp_margin"] == pytest.approx(
+        -forward["average_vp_margin"]
+    )
+    assert forward["score_rate_ci95"]["lower"] == pytest.approx(
+        1 - reverse["score_rate_ci95"]["upper"]
+    )
+    assert forward["score_rate_ci95"]["upper"] == pytest.approx(
+        1 - reverse["score_rate_ci95"]["lower"]
+    )
+
+
+def test_board_fairness_groups_repeated_boards_and_summarises_one_off_seeds():
+    matches = [
+        _analytics_match(winner_seat=1, turns=10),
+        _analytics_match(winner_seat=1, turns=20),
+        _analytics_match(winner_seat=2, turns=30),
+        _analytics_match(winner_seat=2, turns=40),
+        _analytics_match(board_seed=9999, winner_seat=1, turns=50),
+        _analytics_match(
+            board_seed=4242,
+            winner_seat=1,
+            turns=1,
+            validation_errors=["invalid"],
+        ),
+    ]
+
+    summary = build_report_data({"matches": matches}, generated_at="fixed")["summary"]
+    overview = summary["board_fairness_overview"]
+    rows = summary["board_fairness_statistics"]
+
+    assert overview == {
+        "valid_completed_matches": 5,
+        "eligible_matches": 5,
+        "ungrouped_matches": 0,
+        "board_groups": 2,
+        "repeated_board_groups": 1,
+        "repeated_board_matches": 4,
+        "single_match_board_groups": 1,
+        "single_match_matches": 1,
+        "small_sample_repeated_board_groups": 1,
+    }
+    assert len(rows) == 1
+    board = rows[0]
+    assert board["board_seed"] == 4242
+    assert board["player_count"] == 2
+    assert board["matches"] == 4
+    assert board["average_turns"] == 25
+    assert board["max_seat_win_rate_gap"] == 0
+    assert board["normalized_winner_entropy"] == pytest.approx(1)
+    assert board["small_sample"] is True
+    seats = {row["seat"]: row for row in board["seat_statistics"]}
+    assert seats[1]["wins"] == seats[2]["wins"] == 2
+    assert seats[1]["win_rate"] == pytest.approx(0.5)
+    assert seats[1]["win_rate_ci95"]["lower"] == pytest.approx(0.15003899)
+    assert seats[1]["win_rate_ci95"]["upper"] == pytest.approx(0.84996101)
+
+
+def test_board_fairness_marks_twenty_match_sample_and_html_escapes_seed():
+    unsafe_seed = '<img src="https://bad.example/x">'
+    matches = [
+        _analytics_match(
+            board_seed=unsafe_seed,
+            winner_seat=1 if index % 2 == 0 else 2,
+        )
+        for index in range(20)
+    ]
+    report = build_report_data({"matches": matches}, generated_at="fixed")
+    board = report["summary"]["board_fairness_statistics"][0]
+    rendered = render_html_dashboard(report)
+
+    assert board["small_sample"] is False
+    assert "AI性格相性表" in rendered
+    assert "A \\ B" in rendered
+    assert "盤面公平性" in rendered
+    assert "Wilson score interval" in rendered
+    assert ".panel { min-width:0;" in rendered
+    assert ".scroll { max-width:100%; overflow:auto;" in rendered
+    assert rendered.count('class="seat-line"') == 2
+    assert 'class="seat-stats"' in rendered
+    assert ">1.000</td>" in rendered
+    assert ">0.0pt</td>" in rendered
+    assert unsafe_seed not in rendered
+    assert "&lt;img src=&quot;https://bad.example/x&quot;&gt;" in rendered
+    assert '<script src="http' not in rendered
+
+
+def test_new_dashboard_sections_are_backward_compatible_with_old_report_payload():
+    old_report = {
+        "generated_at": "old",
+        "metadata": {},
+        "matches": [],
+        "summary": {
+            "matches": 0,
+            "completed": 0,
+            "completion_rate": None,
+            "average_turns": None,
+            "median_turns": None,
+            "total_rolls": 0,
+            "dice_total_variation": None,
+            "integrity_failures": 0,
+            "integrity_rate": None,
+        },
+    }
+
+    rendered = render_html_dashboard(old_report)
+
+    assert "AI性格相性データがありません。" in rendered
+    assert "盤面seed付きの完走データがありません。" in rendered

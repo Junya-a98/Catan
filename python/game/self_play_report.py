@@ -40,6 +40,7 @@ __all__ = (
 DICE_WEIGHTS = {2: 1, 3: 2, 4: 3, 5: 4, 6: 5, 7: 6, 8: 5, 9: 4, 10: 3, 11: 2, 12: 1}
 MAX_REPORT_MATCHES = 100_000
 MAX_HTML_MATCH_ROWS = 1_000
+MAX_HTML_BOARD_ROWS = 200
 MAX_INPUT_BYTES = 64 * 1024 * 1024
 _SAFE_BASENAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$")
 _MISSING = object()
@@ -116,11 +117,13 @@ def build_report_data(
     seat_rows = _seat_statistics(matches)
     personality_rows = _personality_statistics(matches)
     personality_seat_rows = _personality_seat_statistics(matches)
+    personality_matchup_rows = _personality_matchup_statistics(matches)
     starting_seat_rows = _starting_seat_statistics(matches)
     turn_position_rows = _turn_position_statistics(matches)
     initial_placement_rows = _initial_placement_statistics(matches)
     initial_pip_rows = _initial_pip_statistics(matches)
     dice_rows, total_rolls, dice_gap = _dice_statistics(matches)
+    board_fairness_overview, board_fairness_rows = _board_fairness_statistics(matches)
     integrity_failures = sum(bool(match["validation_errors"]) for match in matches)
 
     summary: dict[str, Any] = {
@@ -137,11 +140,14 @@ def build_report_data(
         "seat_statistics": seat_rows,
         "personality_statistics": personality_rows,
         "personality_seat_statistics": personality_seat_rows,
+        "personality_matchup_statistics": personality_matchup_rows,
         "starting_seat_statistics": starting_seat_rows,
         "turn_position_statistics": turn_position_rows,
         "initial_placement_statistics": initial_placement_rows,
         "initial_pip_statistics": initial_pip_rows,
         "dice_statistics": dice_rows,
+        "board_fairness_overview": board_fairness_overview,
+        "board_fairness_statistics": board_fairness_rows,
     }
 
     report: dict[str, Any] = {
@@ -211,6 +217,25 @@ def render_terminal_summary(report: Mapping[str, Any]) -> str:
                 f"開{_number(row.get('average_settlements'))}・"
                 f"都{_number(row.get('average_cities'))}"
             )
+
+    matchup_rows = summary.get("personality_matchup_statistics", [])
+    if matchup_rows:
+        lines.append("  AI性格相性（引分けは0.5勝）:")
+        for row in matchup_rows:
+            lines.append(
+                f"    {_personality_display_label(row['personality_a'])} vs "
+                f"{_personality_display_label(row['personality_b'])}: "
+                f"{_percent(row.get('score_rate'))} / {row['comparisons']}比較 / "
+                f"平均VP差 {_signed_number(row.get('average_vp_margin'))}"
+            )
+
+    fairness = summary.get("board_fairness_overview", {})
+    if isinstance(fairness, Mapping) and fairness.get("eligible_matches", 0):
+        lines.append(
+            "  盤面公平性: "
+            f"反復盤面 {fairness.get('repeated_board_groups', 0)}種 / "
+            f"単発盤面 {fairness.get('single_match_board_groups', 0)}種"
+        )
     return "\n".join(lines)
 
 
@@ -234,6 +259,8 @@ def render_html_dashboard(report: Mapping[str, Any]) -> str:
         ("victory_target", "勝利点"),
         ("player_count", "人数"),
         ("personality_lineup", "AI性格"),
+        ("workers_requested", "並列指定"),
+        ("workers_used", "並列数"),
         ("duration_seconds", "実行秒"),
     )
     for key, label in metadata_labels:
@@ -277,6 +304,14 @@ def render_html_dashboard(report: Mapping[str, Any]) -> str:
     )
     personality_seat_table = _personality_seat_table(
         summary.get("personality_seat_statistics", [])
+    )
+    personality_matchup_table = _personality_matchup_table(
+        summary.get("personality_matchup_statistics", []),
+        summary.get("personality_statistics", []),
+    )
+    board_fairness_table = _board_fairness_table(
+        summary.get("board_fairness_overview", {}),
+        summary.get("board_fairness_statistics", []),
     )
     start_table = _simple_win_table(
         summary.get("starting_seat_statistics", []),
@@ -341,14 +376,16 @@ def render_html_dashboard(report: Mapping[str, Any]) -> str:
     .card {{ padding:16px; }} .card small {{ color:var(--muted); }}
     .value {{ display:block; margin:4px 0 2px; color:var(--gold); font-size:1.65rem; font-weight:750; }}
     .layout {{ display:grid; grid-template-columns:1fr 1fr; gap:14px; }}
-    .panel {{ padding:18px; overflow:hidden; }} .wide {{ grid-column:1/-1; }}
-    .scroll {{ overflow:auto; border-radius:9px; }}
+    .panel {{ min-width:0; padding:18px; overflow:hidden; }} .wide {{ grid-column:1/-1; }}
+    .scroll {{ max-width:100%; overflow:auto; border-radius:9px; }}
     table {{ width:100%; border-collapse:collapse; font-variant-numeric:tabular-nums; }}
     th,td {{ border-bottom:1px solid #294158; padding:9px 8px; text-align:right; white-space:nowrap; }}
     th:first-child,td:first-child {{ text-align:left; }} th {{ color:var(--muted); font-size:.8rem; }}
     tbody tr:last-child td {{ border-bottom:0; }}
     .bar-track {{ min-width:100px; height:8px; border-radius:99px; background:#07111d; overflow:hidden; }}
     .bar {{ height:100%; border-radius:inherit; background:linear-gradient(90deg,var(--sea),var(--green)); }}
+    .seat-stats {{ min-width:250px; white-space:normal; line-height:1.45; }}
+    .seat-line {{ display:block; }}
     .positive {{ color:var(--green); }} .negative {{ color:var(--red); }} .muted {{ color:var(--muted); }}
     .empty {{ color:var(--muted); margin:0; }}
     .notice {{ border-left:3px solid var(--gold); background:#182435; color:var(--muted);
@@ -374,11 +411,13 @@ def render_html_dashboard(report: Mapping[str, Any]) -> str:
     <section class="panel"><h2>席順別</h2>{seat_table}</section>
     <section class="panel"><h2>AI性格別</h2>{personality_table}</section>
     <section class="panel wide"><h2>AI性格 × 席</h2>{personality_seat_table}</section>
+    <section class="panel wide"><h2>AI性格相性表</h2>{personality_matchup_table}</section>
     <section class="panel"><h2>初手番だった席</h2>{start_table}</section>
     <section class="panel"><h2>手番位置別</h2>{position_table}</section>
     <section class="panel"><h2>初期配置の6・8接触</h2>{initial_placement_table}</section>
     <section class="panel"><h2>初期pip別</h2>{initial_pip_table}</section>
     <section class="panel wide"><h2>ダイス分布</h2>{dice_table}</section>
+    <section class="panel wide"><h2>盤面公平性</h2>{board_fairness_table}</section>
     <section class="panel wide"><details open><summary>個別試合 {len(displayed_matches)} / {len(matches)}件</summary>{match_limit_note}{match_table}</details></section>
   </div>
   <footer>完全ローカルHTML · 外部通信、JavaScript、トラッキングなし · {_h(report.get('generated_at', ''))}</footer>
@@ -433,6 +472,8 @@ def _extract_batch(source: Any) -> tuple[list[Any], dict[str, Any]]:
             "victory_target",
             "player_count",
             "personality_lineup",
+            "workers_requested",
+            "workers_used",
             "duration_seconds",
         ):
             if key in source and key not in metadata:
@@ -889,6 +930,211 @@ def _personality_seat_statistics(
     return rows
 
 
+def _personality_matchup_statistics(
+    matches: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """Compare every different-personality player pair by final VP.
+
+    Each physical player pair contributes one comparison in each direction.
+    Storing both directions makes the JSON convenient for matrix consumers and
+    also guarantees that A-vs-B wins/margins are the inverse of B-vs-A.
+    """
+
+    observations: dict[tuple[str, str], list[int]] = defaultdict(list)
+    for match in matches:
+        if not _is_valid_completed_match(match):
+            continue
+        players = [
+            player
+            for player in match["players"]
+            if player.get("personality") and player.get("vp") is not None
+        ]
+        for left_index, left in enumerate(players):
+            for right in players[left_index + 1 :]:
+                left_personality = left["personality"]
+                right_personality = right["personality"]
+                if left_personality == right_personality:
+                    continue
+                margin = left["vp"] - right["vp"]
+                observations[(left_personality, right_personality)].append(margin)
+                observations[(right_personality, left_personality)].append(-margin)
+
+    rows = []
+    for (personality_a, personality_b), margins in sorted(observations.items()):
+        wins = sum(margin > 0 for margin in margins)
+        ties = sum(margin == 0 for margin in margins)
+        losses = len(margins) - wins - ties
+        comparison_points = wins + ties * 0.5
+        interval_low, interval_high = _wilson_interval(comparison_points, len(margins))
+        rows.append(
+            {
+                "personality_a": personality_a,
+                "personality_b": personality_b,
+                "comparisons": len(margins),
+                "wins": wins,
+                "ties": ties,
+                "losses": losses,
+                "score_rate": _ratio(comparison_points, len(margins)),
+                "score_rate_ci95": {
+                    "lower": interval_low,
+                    "upper": interval_high,
+                },
+                "average_vp_margin": _mean_or_none(margins),
+            }
+        )
+    return rows
+
+
+def _board_fairness_statistics(
+    matches: Sequence[Mapping[str, Any]],
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Summarise repeated boards without emitting every one-off seed.
+
+    A board identity includes generation mode, seed and player count.  Only
+    completed, integrity-clean matches with a known seed and participant list
+    are eligible.  Single-match groups remain represented by the overview
+    counters, while detailed rows are reserved for boards played at least
+    twice.
+    """
+
+    valid_completed = [match for match in matches if _is_valid_completed_match(match)]
+    grouped: dict[tuple[str, Any, int], list[Mapping[str, Any]]] = defaultdict(list)
+    for match in valid_completed:
+        board_seed = match.get("board_seed")
+        player_count = len(match.get("players", []))
+        if board_seed is None or player_count <= 0:
+            continue
+        grouped[(str(match.get("board_mode", "")), board_seed, player_count)].append(match)
+
+    repeated_groups = {
+        identity: entries for identity, entries in grouped.items() if len(entries) >= 2
+    }
+    single_match_groups = len(grouped) - len(repeated_groups)
+    overview = {
+        "valid_completed_matches": len(valid_completed),
+        "eligible_matches": sum(len(entries) for entries in grouped.values()),
+        "ungrouped_matches": len(valid_completed) - sum(
+            len(entries) for entries in grouped.values()
+        ),
+        "board_groups": len(grouped),
+        "repeated_board_groups": len(repeated_groups),
+        "repeated_board_matches": sum(len(entries) for entries in repeated_groups.values()),
+        "single_match_board_groups": single_match_groups,
+        "single_match_matches": single_match_groups,
+    }
+
+    rows = []
+    ordered_groups = sorted(
+        repeated_groups.items(),
+        key=lambda item: (
+            str(item[0][0]).casefold(),
+            str(item[0][1]),
+            item[0][2],
+        ),
+    )
+    for (board_mode, board_seed, player_count), entries in ordered_groups:
+        seats = sorted(
+            {
+                player["seat"]
+                for match in entries
+                for player in match.get("players", [])
+            }
+        )
+        seat_rows = []
+        rates = []
+        win_counts = []
+        for seat in seats:
+            appearances = sum(
+                any(player["seat"] == seat for player in match.get("players", []))
+                for match in entries
+            )
+            wins = sum(match.get("winner_seat") == seat for match in entries)
+            rate = _ratio(wins, appearances)
+            interval_low, interval_high = _wilson_interval(wins, appearances)
+            seat_rows.append(
+                {
+                    "seat": seat,
+                    "appearances": appearances,
+                    "wins": wins,
+                    "win_rate": rate,
+                    "win_rate_ci95": {
+                        "lower": interval_low,
+                        "upper": interval_high,
+                    },
+                }
+            )
+            if rate is not None:
+                rates.append(rate)
+            win_counts.append(wins)
+
+        turns = [match["turns"] for match in entries if match.get("turns") is not None]
+        rows.append(
+            {
+                "board_mode": board_mode,
+                "board_seed": board_seed,
+                "player_count": player_count,
+                "matches": len(entries),
+                "seat_statistics": seat_rows,
+                "max_seat_win_rate_gap": max(rates) - min(rates) if rates else None,
+                "normalized_winner_entropy": _normalised_entropy(win_counts),
+                "average_turns": _mean_or_none(turns),
+                "small_sample": len(entries) < 20,
+            }
+        )
+
+    overview["small_sample_repeated_board_groups"] = sum(
+        bool(row["small_sample"]) for row in rows
+    )
+    return overview, rows
+
+
+def _is_valid_completed_match(match: Mapping[str, Any]) -> bool:
+    return bool(
+        match.get("completed")
+        and not match.get("validation_errors")
+        and match.get("winner_seat") is not None
+    )
+
+
+def _wilson_interval(successes: float, trials: int) -> tuple[Optional[float], Optional[float]]:
+    """Return a two-sided 95% Wilson score interval.
+
+    ``successes`` may be fractional so matchup ties can contribute 0.5.  The
+    same formula is used for ordinary integer seat wins.
+    """
+
+    if trials <= 0:
+        return None, None
+    z = 1.959963984540054
+    z_squared = z * z
+    proportion = successes / trials
+    denominator = 1 + z_squared / trials
+    centre = (proportion + z_squared / (2 * trials)) / denominator
+    margin = (
+        z
+        * math.sqrt(
+            proportion * (1 - proportion) / trials
+            + z_squared / (4 * trials * trials)
+        )
+        / denominator
+    )
+    return max(0.0, centre - margin), min(1.0, centre + margin)
+
+
+def _normalised_entropy(counts: Sequence[int]) -> Optional[float]:
+    if len(counts) <= 1:
+        return None
+    total = sum(counts)
+    if total <= 0:
+        return None
+    entropy = -sum(
+        (count / total) * math.log(count / total)
+        for count in counts
+        if count > 0
+    )
+    return entropy / math.log(len(counts))
+
+
 def _starting_seat_statistics(matches: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
     seats = sorted(
         {
@@ -1099,6 +1345,154 @@ def _personality_seat_table(rows: Sequence[Mapping[str, Any]]) -> str:
         '<div class="scroll"><table><thead><tr><th>性格</th><th>席</th>'
         '<th>完走/全</th><th>勝</th><th>勝率</th><th>平均VP</th></tr></thead>'
         f"<tbody>{''.join(body)}</tbody></table></div>"
+    )
+
+
+def _personality_matchup_table(
+    rows: Sequence[Mapping[str, Any]],
+    personality_rows: Sequence[Mapping[str, Any]],
+) -> str:
+    personalities = sorted(
+        {
+            str(row["personality"])
+            for row in personality_rows
+            if row.get("personality")
+        }
+        | {
+            str(row[key])
+            for row in rows
+            for key in ("personality_a", "personality_b")
+            if row.get(key)
+        }
+    )
+    if not personalities:
+        return '<p class="empty">AI性格相性データがありません。</p>'
+
+    lookup = {
+        (str(row.get("personality_a")), str(row.get("personality_b"))): row
+        for row in rows
+    }
+    header = "".join(
+        f"<th>{_h(_personality_display_label(personality))}</th>"
+        for personality in personalities
+    )
+    matrix_body = []
+    for personality_a in personalities:
+        cells = []
+        for personality_b in personalities:
+            row = lookup.get((personality_a, personality_b))
+            if personality_a == personality_b or row is None:
+                cells.append('<td class="muted">—</td>')
+            else:
+                cells.append(
+                    f"<td>{_percent(row.get('score_rate'))} "
+                    f"<span class=\"muted\">(n={row.get('comparisons', 0)})</span></td>"
+                )
+        matrix_body.append(
+            f"<tr><th>{_h(_personality_display_label(personality_a))}</th>"
+            f"{''.join(cells)}</tr>"
+        )
+
+    detail_body = []
+    for row in rows:
+        interval = row.get("score_rate_ci95", {})
+        if not isinstance(interval, Mapping):
+            interval = {}
+        detail_body.append(
+            "<tr>"
+            f"<td>{_h(_personality_display_label(row.get('personality_a')))}</td>"
+            f"<td>{_h(_personality_display_label(row.get('personality_b')))}</td>"
+            f"<td>{row.get('comparisons', 0)}</td>"
+            f"<td>{row.get('wins', 0)}-{row.get('ties', 0)}-{row.get('losses', 0)}</td>"
+            f"<td>{_percent(row.get('score_rate'))}</td>"
+            f"<td>{_percent_interval(interval)}</td>"
+            f"<td>{_signed_number(row.get('average_vp_margin'))}</td>"
+            "</tr>"
+        )
+
+    details = (
+        '<details><summary>相性の内訳</summary><div class="scroll"><table>'
+        '<thead><tr><th>性格A</th><th>性格B</th><th>比較</th><th>勝-分-敗</th>'
+        '<th>スコア率</th><th>95% CI</th><th>平均VP差</th></tr></thead>'
+        f"<tbody>{''.join(detail_body)}</tbody></table></div></details>"
+        if detail_body
+        else '<p class="empty">異なる性格同士の比較がありません。</p>'
+    )
+    return (
+        '<div class="scroll"><table><thead><tr><th>A \\ B</th>'
+        f"{header}</tr></thead><tbody>{''.join(matrix_body)}</tbody></table></div>"
+        '<p class="muted">セルはAから見たスコア率（勝=1、分=0.5、敗=0）。'
+        '95% CIは引分けを0.5成功としたWilson score intervalです。</p>'
+        f"{details}"
+    )
+
+
+def _board_fairness_table(overview: Any, rows: Sequence[Mapping[str, Any]]) -> str:
+    if not isinstance(overview, Mapping):
+        overview = {}
+    eligible = overview.get("eligible_matches", 0)
+    if not eligible:
+        return '<p class="empty">盤面seed付きの完走データがありません。</p>'
+
+    overview_text = (
+        '<div class="chips">'
+        f'<span class="chip"><b>集計可能</b> {_h(eligible)}試合</span>'
+        f'<span class="chip"><b>反復盤面</b> {_h(overview.get("repeated_board_groups", 0))}種 / '
+        f'{_h(overview.get("repeated_board_matches", 0))}試合</span>'
+        f'<span class="chip"><b>単発盤面</b> {_h(overview.get("single_match_board_groups", 0))}種</span>'
+        "</div>"
+    )
+    if not rows:
+        return (
+            overview_text
+            + '<p class="empty">同じmode・seed・人数で複数回実行した盤面はまだありません。'
+            '単発seedは大量羅列せず、上の概要だけに集約しています。</p>'
+        )
+
+    displayed_rows = rows[:MAX_HTML_BOARD_ROWS]
+    body = []
+    for row in displayed_rows:
+        seat_fragments = []
+        for seat in row.get("seat_statistics", []):
+            interval = seat.get("win_rate_ci95", {})
+            if not isinstance(interval, Mapping):
+                interval = {}
+            seat_fragments.append(
+                '<span class="seat-line">'
+                f"席{_h(seat.get('seat'))}: {_h(seat.get('wins', 0))}/"
+                f"{_h(seat.get('appearances', 0))} "
+                f"({_h(_percent(seat.get('win_rate')))}, "
+                f"CI {_h(_percent_interval(interval))})</span>"
+            )
+        sample = '<span class="negative">小標本</span>' if row.get("small_sample") else "充足"
+        body.append(
+            "<tr>"
+            f"<td>{_h(row.get('board_mode') or '—')}</td>"
+            f"<td>{_h(row.get('board_seed'))}</td>"
+            f"<td>{row.get('player_count', '—')}</td>"
+            f"<td>{row.get('matches', 0)}</td>"
+            f"<td class=\"seat-stats\">{''.join(seat_fragments) or '—'}</td>"
+            f"<td>{_point_percent(row.get('max_seat_win_rate_gap'))}</td>"
+            f"<td>{_fixed_number(row.get('normalized_winner_entropy'), 3)}</td>"
+            f"<td>{_number(row.get('average_turns'))}</td>"
+            f"<td>{sample}</td>"
+            "</tr>"
+        )
+    limit_note = (
+        f'<p class="notice">反復盤面は先頭{MAX_HTML_BOARD_ROWS:,}種まで表示します。'
+        '全結果はJSONに保存されています。</p>'
+        if len(rows) > MAX_HTML_BOARD_ROWS
+        else ""
+    )
+    return (
+        overview_text
+        + '<p class="muted">席勝率の95% CIはWilson score interval。正規化エントロピーは'
+        '0=勝者席が偏る、1=各席が均等です。20試合未満は小標本とします。</p>'
+        + limit_note
+        + '<div class="scroll"><table><thead><tr><th>mode</th><th>board seed</th>'
+        '<th>人数</th><th>試合</th><th>席別 勝/出場 (勝率, 95% CI)</th>'
+        '<th>最大席差</th><th>正規化entropy</th><th>平均turn</th><th>標本</th>'
+        f"</tr></thead><tbody>{''.join(body)}</tbody></table></div>"
     )
 
 
@@ -1354,14 +1748,24 @@ def _has_small_sample(summary: Mapping[str, Any]) -> bool:
         "initial_placement_statistics",
         "initial_pip_statistics",
     )
-    return any(
+    if any(
         row.get("completed_appearances", 0) < 20
         for group in row_groups
         for row in summary.get(group, [])
+    ):
+        return True
+    if any(
+        row.get("comparisons", 0) < 20
+        for row in summary.get("personality_matchup_statistics", [])
+    ):
+        return True
+    return any(
+        bool(row.get("small_sample"))
+        for row in summary.get("board_fairness_statistics", [])
     )
 
 
-def _ratio(numerator: int, denominator: int) -> Optional[float]:
+def _ratio(numerator: float, denominator: int) -> Optional[float]:
     return None if denominator <= 0 else numerator / denominator
 
 
@@ -1431,6 +1835,24 @@ def _percent(value: Any) -> str:
 
 def _signed_percent(value: Any) -> str:
     return "—" if value is None else f"{float(value) * 100:+.1f}pt"
+
+
+def _point_percent(value: Any) -> str:
+    return "—" if value is None else f"{float(value) * 100:.1f}pt"
+
+
+def _signed_number(value: Any) -> str:
+    if value is None:
+        return "—"
+    return f"{float(value):+.1f}"
+
+
+def _percent_interval(value: Mapping[str, Any]) -> str:
+    return f"{_percent(value.get('lower'))}–{_percent(value.get('upper'))}"
+
+
+def _fixed_number(value: Any, digits: int) -> str:
+    return "—" if value is None else f"{float(value):.{digits}f}"
 
 
 def _bar_width(value: Any, *, scale: float = 1.0) -> float:

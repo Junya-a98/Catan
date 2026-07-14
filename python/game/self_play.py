@@ -12,7 +12,9 @@ game turns; the initial order rolls are excluded.
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import json
+import multiprocessing
 import os
 import random
 import threading
@@ -34,6 +36,8 @@ from game.resources import ResourceType
 DEFAULT_GAME_COUNT = 20
 DEFAULT_MAX_TURNS = 1_000
 DEFAULT_MAX_ACTION_STEPS = 50_000
+AUTO_WORKER_CAP = 8
+MAX_WORKERS = 32
 SUPPORTED_PLAYER_COUNTS = (2, 3, 4)
 SUPPORTED_BOARD_MODES = ("constrained", "fully_random")
 SUPPORTED_AI_PERSONALITIES = AI_PERSONALITY_KEYS
@@ -286,6 +290,39 @@ class MatchResult:
 
 
 @dataclass(frozen=True)
+class _MatchJob:
+    """Fully resolved, picklable input for one worker process."""
+
+    index: int
+    match_seed: int
+    board_seed: int
+    board_mode: str
+    player_count: int
+    victory_target: int
+    max_turns: int
+    max_action_steps: int
+    personalities: tuple[str, ...]
+
+
+class SelfPlayWorkerError(RuntimeError):
+    """A match failure annotated with its stable batch index and seed."""
+
+    def __init__(self, match_index: int, match_seed: int, detail: str):
+        self.match_index = match_index
+        self.match_seed = match_seed
+        self.detail = detail
+        # Keep the constructor arguments intact so multiprocessing can pickle
+        # and reconstruct this exception in the parent process.
+        super().__init__(match_index, match_seed, detail)
+
+    def __str__(self) -> str:
+        return (
+            f"self-play match {self.match_index} (seed={self.match_seed}) failed: "
+            f"{self.detail}"
+        )
+
+
+@dataclass(frozen=True)
 class BatchResult:
     """Aggregate plus individual results for a self-play batch."""
 
@@ -299,6 +336,7 @@ class BatchResult:
     personality_lineup: tuple[str, ...]
     win_counts: dict[int, int]
     average_turns: float
+    worker_count: int = 1
 
     def to_dict(self) -> dict:
         return {
@@ -311,6 +349,7 @@ class BatchResult:
             "personality_lineup": list(self.personality_lineup),
             "win_counts": dict(self.win_counts),
             "average_turns": self.average_turns,
+            "worker_count": self.worker_count,
             "matches": [match.to_dict() for match in self.matches],
         }
 
@@ -665,6 +704,40 @@ def run_match(
             random.setstate(caller_random_state)
 
 
+def _run_match_job(job: _MatchJob) -> MatchResult:
+    """Execute one picklable batch job and retain its diagnostic identity."""
+    try:
+        return run_match(
+            match_seed=job.match_seed,
+            board_seed=job.board_seed,
+            board_mode=job.board_mode,
+            player_count=job.player_count,
+            victory_target=job.victory_target,
+            max_turns=job.max_turns,
+            max_action_steps=job.max_action_steps,
+            personalities=job.personalities,
+        )
+    except KeyboardInterrupt:
+        # Ctrl-C must remain an interrupt rather than becoming a match error.
+        raise
+    except Exception as exc:
+        detail = f"{type(exc).__name__}: {exc}"
+        raise SelfPlayWorkerError(job.index, job.match_seed, detail) from exc
+
+
+def _resolve_worker_count(workers: int, game_count: int) -> int:
+    """Validate a requested worker count and return the effective count."""
+    if isinstance(workers, bool) or not isinstance(workers, int):
+        raise TypeError("workers must be an int")
+    if workers == 0:
+        requested = min(AUTO_WORKER_CAP, os.cpu_count() or 1)
+    elif 1 <= workers <= MAX_WORKERS:
+        requested = workers
+    else:
+        raise ValueError(f"workers must be 0 (auto) or between 1 and {MAX_WORKERS}")
+    return max(1, min(requested, game_count))
+
+
 def run_batch(
     *,
     game_count: int = DEFAULT_GAME_COUNT,
@@ -678,8 +751,15 @@ def run_batch(
     max_action_steps: int = DEFAULT_MAX_ACTION_STEPS,
     personalities: Iterable[str] | None = None,
     progress: Callable[[int, int, MatchResult], None] | None = None,
+    workers: int = 1,
 ) -> BatchResult:
-    """Run a batch, optionally holding ``board_seed`` fixed across matches."""
+    """Run an ordered batch, optionally using isolated worker processes.
+
+    ``workers=0`` chooses a conservative automatic count (at most eight),
+    while ``workers=1`` preserves the original in-process execution path.
+    Seeds, personality rotation, result order, and progress callback order are
+    resolved by the parent and therefore do not depend on scheduling.
+    """
     if match_seeds is None:
         if (
             isinstance(game_count, bool)
@@ -698,8 +778,20 @@ def run_batch(
             raise TypeError("all match_seeds must be ints")
         game_count = len(seeds)
 
+    if board_seed is not None and (
+        isinstance(board_seed, bool) or not isinstance(board_seed, int)
+    ):
+        raise TypeError("board_seed must be an int")
+    board_mode = _validate_options(
+        board_mode=board_mode,
+        player_count=player_count,
+        victory_target=victory_target,
+        max_turns=max_turns,
+        max_action_steps=max_action_steps,
+    )
     personality_lineup = normalise_personalities(personalities, player_count)
-    matches = []
+    worker_count = _resolve_worker_count(workers, game_count)
+    jobs = []
     for match_offset, match_seed in enumerate(seeds):
         # Rotate the exact lineup across seats.  Over a multiple of the player
         # count every personality receives equal exposure to every seat, while
@@ -708,19 +800,44 @@ def run_batch(
         match_personalities = (
             personality_lineup[rotation:] + personality_lineup[:rotation]
         )
-        match = run_match(
-            match_seed=match_seed,
-            board_seed=board_seed,
-            board_mode=board_mode,
-            player_count=player_count,
-            victory_target=victory_target,
-            max_turns=max_turns,
-            max_action_steps=max_action_steps,
-            personalities=match_personalities,
+        jobs.append(
+            _MatchJob(
+                index=match_offset + 1,
+                match_seed=match_seed,
+                board_seed=match_seed if board_seed is None else board_seed,
+                board_mode=board_mode,
+                player_count=player_count,
+                victory_target=victory_target,
+                max_turns=max_turns,
+                max_action_steps=max_action_steps,
+                personalities=match_personalities,
+            )
         )
-        matches.append(match)
-        if progress is not None:
-            progress(match_offset + 1, game_count, match)
+
+    matches = []
+    caller_random_state = random.getstate()
+    try:
+        if worker_count == 1:
+            ordered_results = map(_run_match_job, jobs)
+            for job, match in zip(jobs, ordered_results):
+                matches.append(match)
+                if progress is not None:
+                    progress(job.index, game_count, match)
+        else:
+            spawn_context = multiprocessing.get_context("spawn")
+            with concurrent.futures.ProcessPoolExecutor(
+                max_workers=worker_count,
+                mp_context=spawn_context,
+            ) as executor:
+                # executor.map yields in input order even when later matches
+                # finish first, keeping results and callback delivery stable.
+                ordered_results = executor.map(_run_match_job, jobs, chunksize=1)
+                for job, match in zip(jobs, ordered_results):
+                    matches.append(match)
+                    if progress is not None:
+                        progress(job.index, game_count, match)
+    finally:
+        random.setstate(caller_random_state)
 
     completed = [match for match in matches if match.completed]
     win_counts = {seat: 0 for seat in range(1, player_count + 1)}
@@ -741,6 +858,7 @@ def run_batch(
             if completed
             else 0.0
         ),
+        worker_count=worker_count,
     )
 
 
@@ -768,6 +886,12 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--max-turns", type=int, default=DEFAULT_MAX_TURNS)
     parser.add_argument("--max-actions", type=int, default=DEFAULT_MAX_ACTION_STEPS)
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="並列プロセス数。0で自動（最大8）、1で逐次実行",
+    )
     parser.add_argument("--pretty", action="store_true")
     return parser
 
@@ -786,6 +910,7 @@ def main(argv: list[str] | None = None) -> int:
             max_turns=args.max_turns,
             max_action_steps=args.max_actions,
             personalities=args.personalities,
+            workers=args.workers,
         )
     except (TypeError, ValueError) as exc:
         parser.error(str(exc))

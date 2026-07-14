@@ -102,4 +102,36 @@ PYTHONPATH=python python -m game.self_play_report results.json \
 
 レポートには、完走率、状態整合性、平均・中央値ターン、席順別・AI性格別勝率、性格×席の勝率、平均VP、性格別の平均行動回数と平均建設数、初手番・手番位置別勝率、初期配置のpipと6・8接触、ダイス実測値と期待値の差、個別試合一覧が含まれます。
 
+## AI性格相性
+
+`summary.personality_matchup_statistics` は、完走し、かつ
+`validation_errors` が空の試合だけを使います。同じ試合に出た異なる
+AI性格のplayer pairを最終VPで比較し、勝ちを1、同点を0.5、負けを0とします。
+VPまたは性格が欠けたplayer pairは集計しません。
+
+各行には `comparisons` / `wins` / `ties` / `losses` / `score_rate` /
+`average_vp_margin` と `score_rate_ci95` が入ります。95% CIは、同点を
+0.5成功とした両側Wilson score intervalです。このためA対BとB対Aは、
+勝ち/負けが逆、同点と比較数は同じ、スコア率とCIは0.5を中心に対称、
+平均VP差は符号が逆になります。HTMLの相性行列では同じ性格の対角を `—`
+と表示します。
+
+## 盤面公平性
+
+`summary.board_fairness_statistics` は、整合性が正常に完走した試合を
+`(board_mode, board_seed, player_count)` ごとに分けた結果です。各席の
+勝数・勝率・Wilson 95% CI、最大席勝率差、勝者席の正規化エントロピー、
+平均ターンを含みます。正規化エントロピーは0が一つの席への完全な偏り、
+1が各席均等です。同一盤面が20試合未満なら `small_sample` が
+`true` になります。
+
+異なるseedの1試合だけの盤面をJSONやHTMLに大量羅列しないため、
+詳細行は同一盤面を2回以上実行したグループだけです。単発盤面の種数と
+試合数は `summary.board_fairness_overview` に残るので、省略数は確認
+できます。
+
+並列実行したバッチはmetadataに `workers_requested`（0は自動）と
+`workers_used`（実際のworker数）を保存します。ダッシュボード上部のチップで
+実行条件を確認できます。
+
 自己対戦コアは各試合後に、資源総数、駒総数、街道辺の重複、所有者、勝者VP、ダイス回数を検査します。不整合があった試合は `validation_errors` と `integrity_error` を残し、完走勝率へ混ぜません。

@@ -1,4 +1,6 @@
+import concurrent.futures
 import json
+import multiprocessing
 import random
 
 import pytest
@@ -6,7 +8,11 @@ import pytest
 from game.self_play import (
     ACTION_COUNT_KEYS,
     SUPPORTED_AI_PERSONALITIES,
+    SelfPlayWorkerError,
+    _MatchJob,
     _prepare_game,
+    _resolve_worker_count,
+    _run_match_job,
     _validate_completed_state,
     normalise_personalities,
     parse_personality_lineup,
@@ -233,3 +239,98 @@ def test_headless_player_renaming_keeps_stable_metric_seats_and_names():
         ]
     finally:
         random.setstate(caller_state)
+
+
+def test_parallel_batch_matches_sequential_order_and_preserves_parent_random_state():
+    options = {
+        "match_seeds": (301, 302, 303),
+        "board_mode": "fully_random",
+        "player_count": 4,
+        "victory_target": 10,
+        "max_turns": 1,
+    }
+    sequential = run_batch(**options, workers=1)
+    progress = []
+    random.seed(24680)
+    parent_state = random.getstate()
+
+    parallel = run_batch(
+        **options,
+        workers=2,
+        progress=lambda index, total, match: progress.append(
+            (index, total, match.match_seed)
+        ),
+    )
+
+    assert parallel.matches == sequential.matches
+    assert parallel.win_counts == sequential.win_counts
+    assert parallel.average_turns == sequential.average_turns
+    assert parallel.worker_count == 2
+    assert sequential.worker_count == 1
+    assert progress == [(1, 3, 301), (2, 3, 302), (3, 3, 303)]
+    assert random.getstate() == parent_state
+    assert parallel.to_dict()["worker_count"] == 2
+
+
+def test_worker_count_validation_and_auto_cap(monkeypatch):
+    monkeypatch.setattr("game.self_play.os.cpu_count", lambda: 64)
+
+    assert _resolve_worker_count(0, 100) == 8
+    assert _resolve_worker_count(0, 3) == 3
+    assert _resolve_worker_count(32, 2) == 2
+    assert _resolve_worker_count(1, 20) == 1
+
+    for workers in (-1, 33):
+        with pytest.raises(ValueError):
+            _resolve_worker_count(workers, 2)
+    for workers in (True, 1.5, "2"):
+        with pytest.raises(TypeError):
+            _resolve_worker_count(workers, 2)
+
+
+def test_single_match_does_not_create_a_process_pool(monkeypatch):
+    def fail_if_created(*_args, **_kwargs):
+        raise AssertionError("one effective worker must not create a process pool")
+
+    monkeypatch.setattr(
+        "game.self_play.concurrent.futures.ProcessPoolExecutor",
+        fail_if_created,
+    )
+    result = run_batch(
+        match_seeds=(404,),
+        victory_target=10,
+        max_turns=1,
+        workers=32,
+    )
+
+    assert result.worker_count == 1
+    assert [match.match_seed for match in result.matches] == [404]
+
+
+def test_spawn_worker_wraps_failure_with_match_identity():
+    job = _MatchJob(
+        index=7,
+        match_seed=505,
+        board_seed=606,
+        board_mode="not-a-mode",
+        player_count=2,
+        victory_target=10,
+        max_turns=1,
+        max_action_steps=10,
+        personalities=("standard", "trader"),
+    )
+    context = multiprocessing.get_context("spawn")
+
+    with concurrent.futures.ProcessPoolExecutor(
+        max_workers=1,
+        mp_context=context,
+    ) as executor:
+        future = executor.submit(_run_match_job, job)
+        with pytest.raises(SelfPlayWorkerError) as caught:
+            future.result()
+
+    assert caught.value.match_index == 7
+    assert caught.value.match_seed == 505
+    assert "unsupported board mode" in caught.value.detail
+    assert "match 7" in str(caught.value)
+    assert "seed=505" in str(caught.value)

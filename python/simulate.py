@@ -63,6 +63,17 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--max-turns", type=int, default=DEFAULT_MAX_TURNS)
     parser.add_argument("--max-actions", type=int, default=DEFAULT_MAX_ACTION_STEPS)
+    parser.add_argument(
+        "--workers",
+        type=int,
+        choices=range(0, 33),
+        default=0,
+        metavar="0..32",
+        help=(
+            "並列worker数（0: CPU数に応じて自動、1: 逐次実行、"
+            "2〜32: 指定数で並列、既定: 0）"
+        ),
+    )
     parser.add_argument("--output-dir", type=Path, default=Path("self-play-reports"))
     parser.add_argument("--basename", default="self-play-latest")
     parser.add_argument("--open", action="store_true", help="完了後にHTMLを既定ブラウザで開く")
@@ -74,6 +85,13 @@ def main(argv: list[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
     started = time.perf_counter()
+    requested_workers_label = "自動" if args.workers == 0 else str(args.workers)
+
+    if not args.quiet:
+        print(
+            f"AI自己対戦を開始: {args.games}戦 / workers要求 {requested_workers_label}",
+            file=sys.stderr,
+        )
 
     def show_progress(index, total, match):
         if args.quiet:
@@ -98,6 +116,7 @@ def main(argv: list[str] | None = None) -> int:
             max_action_steps=args.max_actions,
             personalities=args.personalities,
             progress=show_progress,
+            workers=args.workers,
         )
         duration = time.perf_counter() - started
         generated_at = datetime.now(timezone.utc).isoformat()
@@ -111,6 +130,8 @@ def main(argv: list[str] | None = None) -> int:
             "player_count": args.players,
             "personality_lineup": " / ".join(batch.personality_lineup),
             "personality_seat_rotation": True,
+            "workers_requested": args.workers,
+            "workers_used": batch.worker_count,
             "duration_seconds": round(duration, 3),
             "max_turns": args.max_turns,
             "max_action_steps": args.max_actions,
@@ -135,6 +156,11 @@ def main(argv: list[str] | None = None) -> int:
     if not args.quiet:
         print(file=sys.stderr)
     print(render_terminal_summary(report))
+    print(
+        "実行: "
+        f"workers要求={requested_workers_label} / "
+        f"使用={batch.worker_count} / {duration:.3f}秒"
+    )
     print(f"JSON: {paths.json_path.resolve()}")
     print(f"HTML: {paths.html_path.resolve()}")
     if args.open:
