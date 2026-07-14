@@ -883,9 +883,7 @@ class LanLobbyFlow:
     def _apply_room_closed(self, message: Mapping[str, Any]) -> None:
         detail = message.get("message")
         detail = (
-            detail
-            if isinstance(detail, str) and detail
-            else "LAN対戦が終了しました。"
+            detail if isinstance(detail, str) and detail else "LAN対戦が終了しました。"
         )
         self.leave(close_overlay=False)
         self._error = detail
@@ -1102,7 +1100,12 @@ def _validated_room_settings(value: Mapping[str, Any]) -> dict[str, Any]:
     if not isinstance(value, Mapping):
         raise TypeError("room settings provider must return a mapping")
     required = {"player_count", "victory_target", "board_mode", "board_seed"}
-    optional = {"custom_map", "house_rules"}
+    optional = {
+        "ai_player_count",
+        "ai_personality_mode",
+        "custom_map",
+        "house_rules",
+    }
     if not required.issubset(value) or not set(value).issubset(required | optional):
         raise ValueError("部屋設定の項目が不足または過剰です。")
     try:
@@ -1113,7 +1116,14 @@ def _validated_room_settings(value: Mapping[str, Any]) -> dict[str, Any]:
         settings = RoomSettings(**_deep_thaw(value))
     except (LobbyValidationError, TypeError, ValueError) as exc:
         raise ValueError(str(exc)) from exc
-    return settings.to_public_dict()
+    public = settings.to_public_dict()
+    # Keep the original desktop-LAN payload stable when its settings provider
+    # predates browser AI seats.  Providers that opt in still forward both
+    # validated fields to the shared authoritative controller.
+    for key in ("ai_player_count", "ai_personality_mode"):
+        if key not in value:
+            public.pop(key, None)
+    return public
 
 
 def _validated_bound_address(value: Any) -> tuple[str, int]:
@@ -1176,10 +1186,7 @@ def _validate_lobby_snapshot(snapshot: Mapping[str, Any]) -> None:
     if not isinstance(room_code, str) or not _ROOM_CODE_PATTERN.fullmatch(room_code):
         raise ValueError("lobby room code is invalid")
     revision = snapshot["revision"]
-    if (
-        type(revision) is not int
-        or not 0 <= revision <= _MAX_SAFE_JSON_INTEGER
-    ):
+    if type(revision) is not int or not 0 <= revision <= _MAX_SAFE_JSON_INTEGER:
         raise ValueError("lobby revision is invalid")
     if snapshot["phase"] not in ("waiting", "started"):
         raise ValueError("lobby phase is invalid")

@@ -1,11 +1,17 @@
 from http.client import HTTPConnection
 import json
+import socket
 import threading
 
 import pytest
 
 from game.network_protocol import NETWORK_PROTOCOL_VERSION
 from game.web_server import create_web_server
+from game.websocket_transport import (
+    WebSocketOpcode,
+    encode_websocket_frame,
+    read_websocket_frame,
+)
 
 
 @pytest.fixture
@@ -40,6 +46,25 @@ def session_cookie(server):
     assert "HttpOnly" in cookie
     assert "SameSite=Strict" in cookie
     return cookie.split(";", 1)[0]
+
+
+def test_server_service_loop_runs_gateway_maintenance():
+    class Gateway:
+        session_count = 0
+
+        def __init__(self):
+            self.calls = 0
+
+        def maintain(self):
+            self.calls += 1
+
+    gateway = Gateway()
+    server = create_web_server("127.0.0.1", 0, gateway=gateway)
+    try:
+        server.service_actions()
+    finally:
+        server.server_close()
+    assert gateway.calls == 1
 
 
 def test_static_client_and_health_have_strict_security_headers(web_server):
@@ -226,6 +251,111 @@ def test_deleting_session_expires_cookie_and_transport(web_server):
     )
     assert response.status == 401
     assert json.loads(payload)["error"]["code"] == "session_expired"
+
+
+def test_authenticated_websocket_bootstrap_and_gateway_roundtrip(web_server):
+    cookie = session_cookie(web_server)
+    peer = socket.create_connection(("127.0.0.1", web_server.server_port), timeout=3)
+    reader = peer.makefile("rb")
+    try:
+        request_bytes = (
+            "GET /api/socket HTTP/1.1\r\n"
+            f"Host: 127.0.0.1:{web_server.server_port}\r\n"
+            "Connection: Upgrade\r\n"
+            "Upgrade: websocket\r\n"
+            "Sec-WebSocket-Version: 13\r\n"
+            "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+            f"Origin: http://127.0.0.1:{web_server.server_port}\r\n"
+            f"Cookie: {cookie}\r\n\r\n"
+        ).encode("ascii")
+        peer.sendall(request_bytes)
+        response_lines = []
+        while True:
+            line = reader.readline()
+            assert line
+            response_lines.append(line)
+            if line == b"\r\n":
+                break
+        assert response_lines[0].startswith(b"HTTP/1.1 101")
+        assert any(
+            line.lower().startswith(b"sec-websocket-accept:") for line in response_lines
+        )
+
+        bootstrap = read_websocket_frame(reader, require_mask=False)
+        assert json.loads(bootstrap.payload) == {
+            "api_version": 1,
+            "kind": "bootstrap",
+            "events": [],
+        }
+
+        ping = {
+            "type": "ping",
+            "protocol_version": NETWORK_PROTOCOL_VERSION,
+            "nonce": "browser-heartbeat",
+        }
+        peer.sendall(
+            encode_websocket_frame(
+                json.dumps(ping).encode("utf-8"),
+                opcode=WebSocketOpcode.TEXT,
+                masking_key=b"test",
+            )
+        )
+        response = read_websocket_frame(reader, require_mask=False)
+        response_document = json.loads(response.payload)
+        assert response_document["kind"] == "response"
+        events = response_document["events"]
+        assert events == [
+            {
+                "type": "pong",
+                "protocol_version": NETWORK_PROTOCOL_VERSION,
+                "nonce": "browser-heartbeat",
+            }
+        ]
+        peer.sendall(
+            encode_websocket_frame(
+                (1000).to_bytes(2, "big"),
+                opcode=WebSocketOpcode.CLOSE,
+                masking_key=b"done",
+            )
+        )
+        close = read_websocket_frame(reader, require_mask=False)
+        assert close.opcode is WebSocketOpcode.CLOSE
+    finally:
+        reader.close()
+        peer.close()
+
+
+def test_websocket_rejects_cross_origin_before_upgrade(web_server):
+    cookie = session_cookie(web_server)
+    peer = socket.create_connection(("127.0.0.1", web_server.server_port), timeout=3)
+    reader = peer.makefile("rb")
+    try:
+        peer.sendall(
+            (
+                "GET /api/socket HTTP/1.1\r\n"
+                f"Host: 127.0.0.1:{web_server.server_port}\r\n"
+                "Connection: Upgrade\r\n"
+                "Upgrade: websocket\r\n"
+                "Sec-WebSocket-Version: 13\r\n"
+                "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+                "Origin: https://attacker.invalid\r\n"
+                f"Cookie: {cookie}\r\n\r\n"
+            ).encode("ascii")
+        )
+        status = reader.readline()
+        headers = {}
+        while True:
+            line = reader.readline()
+            if line == b"\r\n":
+                break
+            key, value = line.decode("ascii").split(":", 1)
+            headers[key.lower()] = value.strip()
+        body = reader.read(int(headers["content-length"]))
+        assert status.startswith(b"HTTP/1.1 403")
+        assert json.loads(body)["error"]["code"] == "cross_site_request"
+    finally:
+        reader.close()
+        peer.close()
 
 
 def test_non_loopback_bind_is_rejected():

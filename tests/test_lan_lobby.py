@@ -77,6 +77,12 @@ def make_room(*, player_count=3, reservation_seconds=120.0):
         {"board_seed": True},
         {"board_seed": 1 << 53},
         {"board_seed": -(1 << 53)},
+        {"ai_player_count": -1},
+        {"ai_player_count": 4},
+        {"ai_player_count": True},
+        {"ai_personality_mode": "builder"},
+        {"ai_personality_mode": "unknown"},
+        {"ai_personality_mode": None},
     ],
 )
 def test_room_settings_reject_invalid_values(kwargs):
@@ -97,8 +103,80 @@ def test_room_settings_are_json_safe_and_allow_both_modes_and_integer_seeds():
         "victory_target": 5,
         "board_mode": "fully_random",
         "board_seed": -42,
+        "ai_player_count": 0,
+        "ai_personality_mode": "standard",
     }
     assert json.loads(json.dumps(settings.to_public_dict()))["board_seed"] == -42
+
+
+def test_ai_seats_are_public_ready_members_and_only_humans_consume_connections():
+    settings = RoomSettings(
+        player_count=4,
+        victory_target=10,
+        board_mode="constrained",
+        board_seed=73,
+        ai_player_count=2,
+        ai_personality_mode="mixed",
+    )
+    room, _host = LobbyRoom.create(
+        settings,
+        host_name="Host",
+        connection_id="host",
+        code_generator=lambda: "ABC234",
+        token_bytes_generator=DeterministicTokenBytes(),
+    )
+
+    first = room.public_snapshot()
+    assert first["settings"]["ai_player_count"] == 2
+    assert first["settings"]["ai_personality_mode"] == "mixed"
+    assert first["player_members"] == 3
+    assert first["full"] is False
+    assert first["can_start"] is False
+    assert first["members"][1:] == [
+        {
+            "display_name": "CPU1",
+            "role": "player",
+            "seat": 3,
+            "connected": True,
+            "ready": True,
+            "reservation_seconds_remaining": None,
+            "is_ai": True,
+            "ai_personality": "expansion",
+        },
+        {
+            "display_name": "CPU2",
+            "role": "player",
+            "seat": 4,
+            "connected": True,
+            "ready": True,
+            "reservation_seconds_remaining": None,
+            "is_ai": True,
+            "ai_personality": "trader",
+        },
+    ]
+
+    human = room.join_player(display_name="Friend", connection_id="friend")
+    assert human.seat == 2
+    assert room.is_full is True
+    with pytest.raises(LobbyCapacityError):
+        room.join_player(display_name="Too Late", connection_id="late")
+
+    room.set_ready("host")
+    room.set_ready("friend")
+    assert room.can_start is True
+
+
+def test_ai_display_names_are_reserved_from_human_members():
+    settings = RoomSettings(player_count=2, ai_player_count=1)
+
+    with pytest.raises(LobbyValidationError, match="display_name"):
+        LobbyRoom.create(
+            settings,
+            host_name="cpu1",
+            connection_id="host",
+            code_generator=lambda: "ABC234",
+            token_bytes_generator=DeterministicTokenBytes(),
+        )
 
 
 def test_room_settings_canonicalize_custom_map_and_house_rule_documents():

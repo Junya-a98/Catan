@@ -22,6 +22,21 @@ const state = {
   welcome: null,
   lobby: null,
   snapshot: null,
+  liveSnapshot: null,
+  matchResult: null,
+  resultError: null,
+  resultAnnounced: false,
+  replayManifest: null,
+  replayIndex: null,
+  replayPlaying: false,
+  replayTimer: null,
+  replayRequestPending: false,
+  socket: null,
+  socketReady: false,
+  socketConnecting: false,
+  socketRequests: [],
+  socketHeartbeat: null,
+  socketReconnect: null,
   nextSequence: 0,
   commandPending: false,
   pollPending: false,
@@ -40,6 +55,8 @@ const elements = Object.fromEntries(
     "create-form",
     "join-form",
     "random-seed",
+    "ai-player-count",
+    "ai-personality-mode",
     "lobby-room-code",
     "copy-room-code",
     "lobby-status-text",
@@ -55,6 +72,7 @@ const elements = Object.fromEntries(
     "game-instruction",
     "game-leave-button",
     "board-svg",
+    "board-shell",
     "board-layer",
     "board-legend",
     "revision-badge",
@@ -64,6 +82,26 @@ const elements = Object.fromEntries(
     "player-list",
     "latest-event-title",
     "latest-event-detail",
+    "ai-commentary",
+    "ai-commentary-title",
+    "ai-commentary-detail",
+    "result-dashboard",
+    "result-winner",
+    "result-summary",
+    "result-live-button",
+    "result-standings",
+    "result-chart",
+    "result-chart-legend",
+    "replay-position",
+    "replay-slider",
+    "replay-first",
+    "replay-previous",
+    "replay-play",
+    "replay-next",
+    "replay-last",
+    "replay-speed",
+    "replay-frame-label",
+    "result-events",
     "toast",
   ].map((id) => [id, document.getElementById(id)]),
 );
@@ -91,13 +129,15 @@ async function api(path, options = {}) {
 async function startBrowserSession() {
   const document = await api("/api/session", { method: "POST" });
   processEvents(document.events || []);
-  setConnection("online", "ローカルサーバー接続中");
   if (!state.welcome) {
     await reconnectFromStorage();
   }
+  connectWebSocket();
+  setConnection("online", "ローカルサーバー接続中");
 }
 
 async function sendMessage(message) {
+  if (state.socketReady) return sendSocketMessage(message);
   const document = await api("/api/message", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -107,8 +147,108 @@ async function sendMessage(message) {
   return document;
 }
 
+function websocketURL() {
+  const scheme = window.location.protocol === "https:" ? "wss:" : "ws:";
+  return `${scheme}//${window.location.host}/api/socket`;
+}
+
+function connectWebSocket() {
+  if (state.socketReady || state.socketConnecting || !window.WebSocket) return;
+  state.socketConnecting = true;
+  window.clearTimeout(state.socketReconnect);
+  const socket = new WebSocket(websocketURL());
+  state.socket = socket;
+  socket.addEventListener("open", () => {
+    if (state.socket !== socket) return;
+    state.socketConnecting = false;
+    state.socketReady = true;
+    setConnection("online", "WebSocket接続中");
+    window.clearInterval(state.socketHeartbeat);
+    state.socketHeartbeat = window.setInterval(sendSocketHeartbeat, 350);
+  });
+  socket.addEventListener("message", (event) => {
+    let document;
+    try {
+      document = JSON.parse(event.data);
+    } catch (_error) {
+      socket.close(1002, "invalid server message");
+      return;
+    }
+    processEvents(document.events || []);
+    const pending = document.kind === "bootstrap"
+      ? null
+      : state.socketRequests.shift();
+    if (document.error) {
+      const error = new Error(document.error.message || "WebSocket操作に失敗しました。");
+      error.code = document.error.code || "socket_error";
+      if (pending) pending.reject(error);
+      else showToast(error.message, true);
+    } else if (pending) {
+      pending.resolve(document);
+    }
+  });
+  socket.addEventListener("close", () => {
+    if (state.socket !== socket) return;
+    state.socket = null;
+    state.socketReady = false;
+    state.socketConnecting = false;
+    window.clearInterval(state.socketHeartbeat);
+    state.socketHeartbeat = null;
+    for (const pending of state.socketRequests.splice(0)) {
+      pending.reject(new Error("WebSocket接続が切れました。"));
+    }
+    setConnection("connecting", "HTTPで再接続中");
+    state.socketReconnect = window.setTimeout(connectWebSocket, 1600);
+  });
+  socket.addEventListener("error", () => {
+    // The close handler falls back to HTTP polling and retries the upgrade.
+  });
+}
+
+function sendSocketMessage(message) {
+  if (!state.socketReady || !state.socket) {
+    return Promise.reject(new Error("WebSocketは接続されていません。"));
+  }
+  return new Promise((resolve, reject) => {
+    const pending = {
+      timer: null,
+      resolve(value) {
+        window.clearTimeout(pending.timer);
+        resolve(value);
+      },
+      reject(error) {
+        window.clearTimeout(pending.timer);
+        reject(error);
+      },
+    };
+    pending.timer = window.setTimeout(() => {
+      const index = state.socketRequests.indexOf(pending);
+      if (index >= 0) state.socketRequests.splice(index, 1);
+      pending.reject(new Error("WebSocketの応答がないためHTTPへ切り替えます。"));
+      const activeSocket = state.socket;
+      if (activeSocket && activeSocket.readyState < WebSocket.CLOSING) {
+        activeSocket.close(1011, "response timeout");
+      }
+    }, 6000);
+    state.socketRequests.push(pending);
+    try {
+      state.socket.send(JSON.stringify(message));
+    } catch (error) {
+      state.socketRequests.pop();
+      pending.reject(error);
+    }
+  });
+}
+
+function sendSocketHeartbeat() {
+  if (!state.socketReady || state.socketRequests.length > 0) return;
+  sendSocketMessage(
+    wireMessage("ping", { nonce: `web-${Date.now()}` }),
+  ).catch(() => {});
+}
+
 async function pollEvents() {
-  if (state.pollPending) return;
+  if (state.pollPending || state.socketReady) return;
   state.pollPending = true;
   try {
     const document = await api("/api/events");
@@ -131,6 +271,8 @@ async function pollEvents() {
 }
 
 function processEvents(events) {
+  let dirty = false;
+  let focusBoardAfterRender = false;
   for (const event of events) {
     if (!event || typeof event !== "object") continue;
     switch (event.type) {
@@ -148,36 +290,103 @@ function processEvents(events) {
             }),
           );
         }
+        dirty = true;
         break;
       case "lobby_snapshot":
-        state.lobby = event.lobby;
-        syncRoleFromLobby();
-        break;
-      case "state_snapshot":
-        if (!state.snapshot || event.revision >= state.snapshot.revision) {
-          state.snapshot = event;
+        if (
+          !state.lobby
+          || !Number.isInteger(state.lobby.revision)
+          || !Number.isInteger(event.lobby?.revision)
+          || event.lobby.revision >= state.lobby.revision
+        ) {
+          state.lobby = event.lobby;
+          syncRoleFromLobby();
+          dirty = true;
         }
         break;
+      case "state_snapshot":
+        {
+          let changed = false;
+          if (!state.liveSnapshot || event.revision >= state.liveSnapshot.revision) {
+            changed = !state.liveSnapshot || event.revision > state.liveSnapshot.revision;
+            state.liveSnapshot = event;
+          }
+          if (
+            state.replayIndex === null
+            && (!state.snapshot || event.revision >= state.snapshot.revision)
+          ) {
+            changed = changed || !state.snapshot || event.revision > state.snapshot.revision;
+            state.snapshot = event;
+          }
+          dirty = dirty || changed;
+        }
+        break;
+      case "match_result":
+      case "network_match_result":
+        state.matchResult = event.result || null;
+        state.resultError = null;
+        if (event.replay) {
+          const count = Number(event.replay.frame_count) || 0;
+          state.replayManifest = {
+            ...event.replay,
+            frames: Array.from({ length: count }, (_, index) =>
+              state.replayManifest?.frames?.[index] || null,
+            ),
+          };
+        }
+        dirty = true;
+        break;
+      case "network_result_unavailable":
+        state.resultError = event.message || "対局結果を読み込めませんでした。";
+        dirty = true;
+        break;
+      case "replay_manifest":
+        state.replayManifest = event.replay || null;
+        dirty = true;
+        break;
+      case "replay_frame":
+      case "network_replay_frame": {
+        const index = Number.isInteger(event.index) ? event.index : event.controls?.frame_index;
+        if (Number.isInteger(index) && event.snapshot) {
+          state.replayIndex = index;
+          state.snapshot = event.snapshot;
+          const frames = replayFrameEntries();
+          if (frames.length > index) {
+            frames[index] = {
+              revision: event.controls?.revision,
+              elapsed_ms: event.controls?.elapsed_ms,
+              label: event.controls?.label,
+            };
+          }
+          dirty = true;
+          focusBoardAfterRender = true;
+        }
+        break;
+      }
       case "game_command_result":
         state.commandPending = false;
         reconcileSequence(event);
         if (!event.accepted) {
           showToast(event.message || "操作が受理されませんでした。", true);
         }
+        dirty = true;
         break;
       case "request_error":
         state.commandPending = false;
         showToast(event.message || "操作を処理できませんでした。", true);
+        dirty = true;
         break;
       case "room_closed":
         showToast(event.message || "部屋が終了しました。", true);
-        resetRoomState();
+        resetRoomState(false);
+        dirty = true;
         break;
       default:
         break;
     }
   }
-  render();
+  if (dirty) render();
+  if (focusBoardAfterRender) focusGameBoard();
 }
 
 function reconcileSequence(event) {
@@ -224,8 +433,12 @@ function syncRoleFromLobby() {
 }
 
 function setConnection(value, label) {
-  elements["connection-status"].dataset.state = value;
-  elements["connection-label"].textContent = label;
+  if (elements["connection-status"].dataset.state !== value) {
+    elements["connection-status"].dataset.state = value;
+  }
+  if (elements["connection-label"].textContent !== label) {
+    elements["connection-label"].textContent = label;
+  }
 }
 
 function showToast(message, isError = false) {
@@ -239,15 +452,22 @@ function showToast(message, isError = false) {
   }, 3400);
 }
 
-function resetRoomState() {
+function resetRoomState(renderNow = true) {
   state.welcome = null;
   state.lobby = null;
   state.snapshot = null;
+  state.liveSnapshot = null;
+  state.matchResult = null;
+  state.resultError = null;
+  state.resultAnnounced = false;
+  state.replayManifest = null;
+  state.replayIndex = null;
+  stopReplay();
   state.nextSequence = 0;
   state.commandPending = false;
   state.targetOptions.clear();
   sessionStorage.removeItem("catan-reconnect");
-  render();
+  if (renderNow) render();
 }
 
 function render() {
@@ -309,7 +529,9 @@ function renderMembers(lobby) {
       textElement(
         "small",
         member
-          ? `${roleLabel(member.role)} · ${member.connected ? "接続中" : "再接続待ち"}`
+          ? member.is_ai
+            ? `${aiPersonalityLabel(member.ai_personality)}AI · サーバー管理`
+            : `${roleLabel(member.role)} · ${member.connected ? "接続中" : "再接続待ち"}`
           : "参加者を待っています",
       ),
     );
@@ -317,7 +539,7 @@ function renderMembers(lobby) {
     row.append(
       textElement(
         "span",
-        member?.ready ? "READY" : member ? "WAIT" : "OPEN",
+        member?.is_ai ? "AI READY" : member?.ready ? "READY" : member ? "WAIT" : "OPEN",
         `ready-state${member?.ready ? " ready" : ""}`,
       ),
     );
@@ -344,6 +566,7 @@ function renderLobbySettings(settings) {
   list.replaceChildren();
   const rows = [
     ["プレイヤー", `${settings.player_count}人`],
+    ["AI", settings.ai_player_count ? `${settings.ai_player_count}人 · ${aiPersonalityLabel(settings.ai_personality_mode)}` : "なし"],
     ["勝利条件", `${settings.victory_target} VP`],
     ["盤面", boardModeLabel(settings.board_mode)],
     ["Seed", String(settings.board_seed)],
@@ -381,6 +604,24 @@ function renderGame() {
   const latest = gameState.history?.latest_event || {};
   elements["latest-event-title"].textContent = latest.title || "進行中";
   elements["latest-event-detail"].textContent = latest.detail || "次の操作を待っています。";
+  renderAICommentary(gameState.ai?.status);
+  const finished = state.liveSnapshot?.state?.phase?.name === "finished";
+  elements["result-dashboard"].hidden = !finished;
+  if (finished) {
+    renderMatchResult();
+    if (!state.resultAnnounced) {
+      state.resultAnnounced = true;
+      window.requestAnimationFrame(() => focusAndScroll(elements["result-dashboard"], "start"));
+    }
+  }
+}
+
+function renderAICommentary(status) {
+  const visible = Boolean(status?.player_name && status?.title);
+  elements["ai-commentary"].hidden = !visible;
+  if (!visible) return;
+  elements["ai-commentary-title"].textContent = `${status.player_name}（${aiPersonalityLabel(status.personality)}）: ${status.title}`;
+  elements["ai-commentary-detail"].textContent = status.detail || "次の一手を評価しています。";
 }
 
 function renderActions(options) {
@@ -613,13 +854,27 @@ function renderPlayers(gameState, activeSeat, ownSeat) {
     color.style.background = playerColor(gameState.players, index);
     const main = document.createElement("div");
     main.className = "player-main";
+    const identity = player.is_ai
+      ? `${player.marker || ""} ${player.name}・${aiPersonalityLabel(player.ai_personality)}AI`
+      : `${player.marker || ""} ${player.name}`;
     main.append(
-      textElement("strong", `${player.marker || ""} ${player.name}`.trim()),
+      textElement("strong", identity.trim()),
       textElement(
         "small",
         `${index === ownSeat ? "あなた · " : ""}手札${player.resource_total ?? resourceTotal(player.resources)}枚 · 発展${player.development_card_total ?? 0}枚`,
       ),
     );
+    const gains = gameState.history?.public_gain_history?.[player.name];
+    const latestGain = Array.isArray(gains) ? gains[gains.length - 1] : null;
+    if (latestGain?.text) {
+      main.append(
+        textElement(
+          "small",
+          `直近公開: ${latestGain.text}${latestGain.source ? `（${latestGain.source}）` : ""}`,
+          "public-gain",
+        ),
+      );
+    }
     card.append(color, main, textElement("span", `VP ${publicPoints[index]}`, "player-vp"));
     if (player.resources && typeof player.resources === "object") {
       const strip = document.createElement("div");
@@ -633,7 +888,265 @@ function renderPlayers(gameState, activeSeat, ownSeat) {
   });
 }
 
+function renderMatchResult() {
+  const result = state.matchResult;
+  if (!result) {
+    elements["result-winner"].textContent = state.resultError ? "対局終了" : "対局結果を集計中";
+    elements["result-summary"].textContent = state.resultError
+      || "権威サーバーから最終集計を受け取っています。";
+    elements["result-standings"].replaceChildren();
+    elements["result-events"].replaceChildren();
+    return;
+  }
+  const winner = result.winner?.name;
+  elements["result-winner"].textContent = winner ? `${winner} の勝利` : "対局終了";
+  const replayNotice = state.replayManifest?.truncated
+    ? ` · 長期戦のためrev.${state.replayManifest.first_revision}以降を保存`
+    : "";
+  elements["result-summary"].textContent = `${result.victory_target || "—"} VP戦 · ${boardModeLabel(result.board?.mode)} · seed ${result.board?.seed ?? "—"}${replayNotice}`;
+  renderResultStandings(result.standings || []);
+  renderResultChart(result.vp_progression || [], result.standings || []);
+  renderResultEvents(result.important_events || []);
+  syncReplayControls();
+}
+
+function renderResultStandings(standings) {
+  const container = elements["result-standings"];
+  container.replaceChildren();
+  for (const row of standings) {
+    const item = document.createElement("article");
+    item.className = `result-standing${row.winner ? " winner" : ""}`;
+    const color = document.createElement("span");
+    color.className = "legend-dot";
+    color.style.background = arrayColor(row.color);
+    const builds = row.builds || {};
+    const trades = row.trades || {};
+    const details = [
+      `建設 道${builds.roads ?? row.roads ?? 0}・開${builds.settlements ?? row.settlements ?? 0}・都${builds.cities ?? row.cities ?? 0}`,
+      `交易 国内${trades.domestic ?? 0}・銀行${trades.bank ?? 0}`,
+      `運指数 ${formatLuck(row.luck_index)}`,
+    ].join(" / ");
+    const copy = document.createElement("div");
+    copy.className = "result-player-copy";
+    copy.append(
+      textElement("strong", `${row.name}${row.is_ai ? `（${aiPersonalityLabel(row.personality)}AI）` : ""}`),
+      textElement("small", details),
+    );
+    item.append(
+      textElement("span", `#${row.rank || "—"}`, "result-rank"),
+      color,
+      copy,
+      textElement("span", `${row.victory_points ?? 0} VP`, "result-score"),
+    );
+    container.append(item);
+  }
+}
+
+function renderResultChart(timeline, standings) {
+  const chart = elements["result-chart"];
+  const legend = elements["result-chart-legend"];
+  chart.replaceChildren();
+  legend.replaceChildren();
+  chart.setAttribute("viewBox", "0 0 520 230");
+  const chartTitle = svg("title");
+  chartTitle.textContent = "プレイヤー別の勝利点推移";
+  const chartDescription = svg("desc");
+  chartDescription.textContent = standings.length
+    ? `最終得点: ${standings.map((row) => `${row.name} ${row.victory_points ?? 0}点`).join("、")}`
+    : "勝利点推移データはありません。";
+  chart.append(chartTitle, chartDescription);
+  if (!timeline.length || !standings.length) {
+    chart.append(svgText(260, 115, "勝利点の推移データがありません", "chart-axis-label"));
+    return;
+  }
+  const maximum = Math.max(
+    1,
+    Number(state.matchResult?.victory_target) || 10,
+    ...timeline.flatMap((entry) => (entry.scores || []).map((score) => Number(score.victory_points) || 0)),
+  );
+  const left = 32;
+  const top = 12;
+  const width = 472;
+  const height = 188;
+  for (let value = 0; value <= maximum; value += Math.max(1, Math.ceil(maximum / 5))) {
+    const y = top + height - (value / maximum) * height;
+    chart.append(svg("line", { x1: left, y1: y, x2: left + width, y2: y, class: "chart-grid-line" }));
+    chart.append(svgText(left - 8, y + 3, String(value), "chart-axis-label"));
+  }
+  standings.forEach((player, playerIndex) => {
+    const points = timeline.map((entry, index) => {
+      const score = (entry.scores || []).find((candidate) => candidate.seat === player.seat);
+      return {
+        x: left + (index / Math.max(1, timeline.length - 1)) * width,
+        y: top + height - ((Number(score?.victory_points) || 0) / maximum) * height,
+      };
+    });
+    const color = arrayColor(player.color, playerIndex);
+    chart.append(svg("polyline", {
+      points: points.map((point) => `${point.x},${point.y}`).join(" "),
+      stroke: color,
+      class: "chart-player-line",
+    }));
+    for (const point of points) {
+      chart.append(svg("circle", { cx: point.x, cy: point.y, r: 4, fill: color, class: "chart-player-point" }));
+    }
+    const item = document.createElement("span");
+    item.className = "legend-item";
+    const dot = document.createElement("span");
+    dot.className = "legend-dot";
+    dot.style.background = color;
+    item.append(dot, document.createTextNode(player.name));
+    legend.append(item);
+  });
+}
+
+function renderResultEvents(events) {
+  const container = elements["result-events"];
+  container.replaceChildren();
+  if (!events.length) {
+    container.append(textElement("p", "重要イベントは記録されませんでした。", "context-hint"));
+    return;
+  }
+  for (const event of events) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "result-event-button";
+    button.disabled = !Number.isInteger(event.replay_frame_index);
+    if (event.replay_frame_index === state.replayIndex) {
+      button.setAttribute("aria-current", "true");
+    }
+    button.append(
+      textElement("strong", event.title || "イベント"),
+      textElement("small", event.detail || "この時点の盤面を表示します。"),
+    );
+    if (Number.isInteger(event.replay_frame_index)) {
+      button.addEventListener("click", () => requestReplayFrame(event.replay_frame_index));
+    }
+    container.append(button);
+  }
+}
+
+function replayFrameEntries() {
+  return Array.isArray(state.replayManifest?.frames) ? state.replayManifest.frames : [];
+}
+
+function replayFrameCount() {
+  return Number.isInteger(state.replayManifest?.frame_count)
+    ? state.replayManifest.frame_count
+    : replayFrameEntries().length;
+}
+
+function syncReplayControls() {
+  const count = replayFrameCount();
+  const available = count > 0;
+  const index = state.replayIndex === null ? Math.max(0, count - 1) : state.replayIndex;
+  elements["replay-slider"].max = String(Math.max(0, count - 1));
+  elements["replay-slider"].value = String(index);
+  elements["replay-slider"].setAttribute(
+    "aria-valuetext",
+    available ? `${index + 1} / ${count}` : "リプレイなし",
+  );
+  elements["replay-slider"].disabled = !available;
+  const atStart = index <= 0;
+  const atEnd = state.replayIndex === null || index >= count - 1;
+  elements["replay-first"].disabled = !available || atStart;
+  elements["replay-previous"].disabled = !available || atStart;
+  elements["replay-play"].disabled = count < 2;
+  elements["replay-next"].disabled = !available || atEnd;
+  elements["replay-last"].disabled = !available || atEnd;
+  elements["result-live-button"].disabled = state.replayIndex === null;
+  elements["replay-position"].textContent = state.replayIndex === null
+    ? "LIVE"
+    : `${index + 1} / ${count}`;
+  const metadata = replayFrameEntries()[index];
+  elements["replay-frame-label"].textContent = metadata
+    ? `${metadata.label || "盤面更新"} · rev. ${metadata.revision ?? metadata.sequence ?? index}`
+    : available
+      ? "リプレイ位置を選択できます。"
+      : "対局終了後に操作できます。";
+  elements["replay-play"].textContent = state.replayPlaying ? "一時停止" : "再生";
+  elements["replay-play"].setAttribute("aria-pressed", String(state.replayPlaying));
+}
+
+async function requestReplayFrame(index) {
+  const count = replayFrameCount();
+  if (state.replayRequestPending || !Number.isInteger(index) || index < 0 || index >= count) return;
+  state.replayRequestPending = true;
+  try {
+    await sendMessage(wireMessage("replay_frame_request", { index }));
+  } catch (error) {
+    stopReplay();
+    showToast(error.message, true);
+  } finally {
+    state.replayRequestPending = false;
+    syncReplayControls();
+  }
+}
+
+function stopReplay() {
+  state.replayPlaying = false;
+  window.clearTimeout(state.replayTimer);
+  state.replayTimer = null;
+  if (elements["replay-play"]) elements["replay-play"].textContent = "再生";
+}
+
+function scheduleReplay() {
+  window.clearTimeout(state.replayTimer);
+  if (!state.replayPlaying) return;
+  const delay = Number(elements["replay-speed"].value) || 800;
+  state.replayTimer = window.setTimeout(async () => {
+    const count = replayFrameCount();
+    const current = state.replayIndex === null ? -1 : state.replayIndex;
+    if (current >= count - 1) {
+      stopReplay();
+      syncReplayControls();
+      return;
+    }
+    await requestReplayFrame(current + 1);
+    scheduleReplay();
+  }, delay);
+}
+
+function showLiveSnapshot() {
+  stopReplay();
+  state.replayIndex = null;
+  if (state.liveSnapshot) state.snapshot = state.liveSnapshot;
+  render();
+  focusGameBoard();
+}
+
+function focusGameBoard() {
+  window.requestAnimationFrame(() => focusAndScroll(elements["board-shell"], "center"));
+}
+
+function focusAndScroll(element, block) {
+  if (!element) return;
+  element.focus({ preventScroll: true });
+  element.scrollIntoView({
+    behavior: window.matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth",
+    block,
+  });
+}
+
+function arrayColor(color, fallbackIndex = 0) {
+  if (Array.isArray(color) && color.length >= 3) {
+    return `rgb(${color[0]}, ${color[1]}, ${color[2]})`;
+  }
+  return ["#ff6565", "#6478ff", "#efb444", "#63d7df"][fallbackIndex % 4];
+}
+
+function formatLuck(value) {
+  const number = Number(value);
+  return Number.isFinite(number) ? `${number.toFixed(0)}` : "—";
+}
+
 function calculatePublicPoints(gameState) {
+  if (gameState.phase?.name === "finished" && state.matchResult?.standings) {
+    return gameState.players.map((_player, index) => {
+      const standing = state.matchResult.standings.find((row) => row.seat === index + 1);
+      return Number(standing?.victory_points) || 0;
+    });
+  }
   const points = gameState.players.map(() => 0);
   const manifest = state.snapshot?.board_manifest;
   for (const node of manifest?.nodes || []) {
@@ -756,7 +1269,17 @@ function houseRulesLabel(rules) {
 }
 
 function roleLabel(role) {
-  return { host: "ホスト", player: "プレイヤー", spectator: "観戦" }[role] || role || "未参加";
+  return { host: "ホスト", player: "プレイヤー", ai: "AI", spectator: "観戦" }[role] || role || "未参加";
+}
+
+function aiPersonalityLabel(mode) {
+  return {
+    standard: "標準",
+    mixed: "混合",
+    expansion: "拡大重視",
+    trader: "交渉重視",
+    disruptor: "妨害重視",
+  }[mode] || mode || "標準";
 }
 
 function playerColor(players, index) {
@@ -801,6 +1324,8 @@ elements["create-form"].addEventListener("submit", async (event) => {
         display_name: String(form.get("display_name") || "").trim(),
         settings: {
           player_count: Number(form.get("player_count")),
+          ai_player_count: Number(form.get("ai_player_count")),
+          ai_personality_mode: String(form.get("ai_personality_mode")),
           victory_target: Number(form.get("victory_target")),
           board_mode: String(form.get("board_mode")),
           board_seed: Number(form.get("board_seed")),
@@ -831,6 +1356,26 @@ elements["join-form"].addEventListener("submit", async (event) => {
 elements["random-seed"].addEventListener("click", () => {
   const input = elements["create-form"].elements.board_seed;
   input.value = String(Math.floor(10000 + Math.random() * 99989999));
+});
+
+function syncAIOptions() {
+  const total = Number(elements["create-form"].elements.player_count.value);
+  const select = elements["ai-player-count"];
+  const previous = Math.min(Number(select.value) || 0, Math.max(0, total - 1));
+  select.replaceChildren();
+  for (let count = 0; count < total; count += 1) {
+    const option = document.createElement("option");
+    option.value = String(count);
+    option.textContent = count === 0 ? "なし" : `${count}人`;
+    option.selected = count === previous;
+    select.append(option);
+  }
+  elements["ai-personality-mode"].disabled = previous === 0;
+}
+
+elements["create-form"].elements.player_count.addEventListener("change", syncAIOptions);
+elements["ai-player-count"].addEventListener("change", () => {
+  elements["ai-personality-mode"].disabled = Number(elements["ai-player-count"].value) === 0;
 });
 
 elements["ready-button"].addEventListener("click", async () => {
@@ -876,6 +1421,33 @@ elements["copy-room-code"].addEventListener("click", async () => {
   }
 });
 
+elements["result-live-button"].addEventListener("click", showLiveSnapshot);
+elements["replay-first"].addEventListener("click", () => requestReplayFrame(0));
+elements["replay-previous"].addEventListener("click", () => {
+  const index = state.replayIndex === null ? replayFrameCount() - 1 : state.replayIndex;
+  requestReplayFrame(Math.max(0, index - 1));
+});
+elements["replay-next"].addEventListener("click", () => {
+  const index = state.replayIndex === null ? replayFrameCount() - 1 : state.replayIndex;
+  requestReplayFrame(Math.min(replayFrameCount() - 1, index + 1));
+});
+elements["replay-last"].addEventListener("click", () => requestReplayFrame(replayFrameCount() - 1));
+elements["replay-play"].addEventListener("click", () => {
+  state.replayPlaying = !state.replayPlaying;
+  if (state.replayPlaying && (state.replayIndex === null || state.replayIndex >= replayFrameCount() - 1)) {
+    state.replayIndex = null;
+  }
+  syncReplayControls();
+  scheduleReplay();
+});
+elements["replay-slider"].addEventListener("change", (event) => {
+  stopReplay();
+  requestReplayFrame(Number(event.currentTarget.value));
+});
+elements["replay-speed"].addEventListener("change", () => {
+  if (state.replayPlaying) scheduleReplay();
+});
+
 window.addEventListener("beforeunload", () => {
   // The HttpOnly browser session survives a refresh.  Explicit disconnect is
   // handled by the UI because keepalive requests during unload are unreliable.
@@ -883,6 +1455,7 @@ window.addEventListener("beforeunload", () => {
 
 async function initialise() {
   setConnection("connecting", "接続準備中");
+  syncAIOptions();
   try {
     await startBrowserSession();
     render();

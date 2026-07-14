@@ -37,7 +37,9 @@ class LanServerRuntime:
         controller: LanServerController | None = None,
         transport: LanServerTransport | None = None,
     ) -> None:
-        if transport is not None and (host != DEFAULT_LAN_HOST or port != DEFAULT_LAN_PORT):
+        if transport is not None and (
+            host != DEFAULT_LAN_HOST or port != DEFAULT_LAN_PORT
+        ):
             raise ValueError("host/port cannot be combined with a transport")
         self.controller = controller or LanServerController()
         self.transport = transport or LanServerTransport(host, port)
@@ -164,17 +166,29 @@ class LanClientSession:
         victory_target: int = 10,
         board_mode: str = "constrained",
         board_seed: int = 0,
+        ai_player_count: int | None = None,
+        ai_personality_mode: str | None = None,
         custom_map: CustomMapSpec | Mapping[str, Any] | None = None,
         house_rules: HouseRules | Mapping[str, Any] | None = None,
     ) -> None:
+        include_ai_settings = (
+            ai_player_count is not None or ai_personality_mode is not None
+        )
         settings = RoomSettings(
             player_count=player_count,
             victory_target=victory_target,
             board_mode=board_mode,
             board_seed=board_seed,
+            ai_player_count=0 if ai_player_count is None else ai_player_count,
+            ai_personality_mode=(
+                "standard" if ai_personality_mode is None else ai_personality_mode
+            ),
             custom_map=custom_map,
             house_rules=house_rules,
         ).to_public_dict()
+        if not include_ai_settings:
+            settings.pop("ai_player_count", None)
+            settings.pop("ai_personality_mode", None)
         self._begin_session_sync()
         self._send(
             "create_room",
@@ -330,7 +344,10 @@ class LanClientSession:
                         if isinstance(self.game_snapshot, dict)
                         else None
                     )
-                    if type(snapshot_revision) is not int or snapshot_revision < revision:
+                    if (
+                        type(snapshot_revision) is not int
+                        or snapshot_revision < revision
+                    ):
                         required = self._required_snapshot_revision
                         self._required_snapshot_revision = max(
                             revision,

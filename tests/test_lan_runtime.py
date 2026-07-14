@@ -50,9 +50,11 @@ def test_runtime_create_join_start_command_and_reconnect_round_trip():
         _wait(
             runtime,
             [host, guest],
-            lambda: guest.seat_index == 1
-            and host.lobby is not None
-            and host.lobby["player_members"] == 2,
+            lambda: (
+                guest.seat_index == 1
+                and host.lobby is not None
+                and host.lobby["player_members"] == 2
+            ),
         )
         guest_token = guest.reconnect_token
         room_code = host.room_code
@@ -75,8 +77,10 @@ def test_runtime_create_join_start_command_and_reconnect_round_trip():
         _wait(
             runtime,
             [host, guest],
-            lambda: sequence in host.command_results
-            and host.game_revision == guest.game_revision == 1,
+            lambda: (
+                sequence in host.command_results
+                and host.game_revision == guest.game_revision == 1
+            ),
         )
         assert host.command_results[sequence]["accepted"] is True
         assert host.game_snapshot["viewer_player_index"] == 0
@@ -122,9 +126,9 @@ def test_runtime_explicit_leave_releases_seat_and_promotes_remaining_player():
         _wait(
             runtime,
             [host, guest, replacement],
-            lambda: host.is_connected
-            and guest.is_connected
-            and replacement.is_connected,
+            lambda: (
+                host.is_connected and guest.is_connected and replacement.is_connected
+            ),
         )
         host.create_room("Host", player_count=2, victory_target=5)
         _wait(runtime, [host, guest], lambda: host.room_code is not None)
@@ -133,32 +137,37 @@ def test_runtime_explicit_leave_releases_seat_and_promotes_remaining_player():
         _wait(
             runtime,
             [host, guest],
-            lambda: guest.seat_index == 1
-            and host.lobby is not None
-            and host.lobby["player_members"] == 2,
+            lambda: (
+                guest.seat_index == 1
+                and host.lobby is not None
+                and host.lobby["player_members"] == 2
+            ),
         )
 
         host.leave_room()
         _wait(
             runtime,
             [host, guest],
-            lambda: guest.lobby is not None
-            and guest.lobby["player_members"] == 1
-            and guest.lobby["members"][0]["role"] == "host",
+            lambda: (
+                guest.lobby is not None
+                and guest.lobby["player_members"] == 1
+                and guest.lobby["members"][0]["role"] == "host"
+            ),
         )
         assert guest.role == "host"
         replacement.join_room(room_code, "Replacement")
         _wait(
             runtime,
             [guest, replacement],
-            lambda: replacement.seat_index == 0
-            and guest.lobby is not None
-            and guest.lobby["player_members"] == 2,
+            lambda: (
+                replacement.seat_index == 0
+                and guest.lobby is not None
+                and guest.lobby["player_members"] == 2
+            ),
         )
 
         seats = {
-            member["display_name"]: member["seat"]
-            for member in guest.lobby["members"]
+            member["display_name"]: member["seat"] for member in guest.lobby["members"]
         }
         assert seats == {"Replacement": 1, "Guest": 2}
     finally:
@@ -214,9 +223,7 @@ def test_surrogate_ping_does_not_stop_runtime():
                         return received
             raise AssertionError(f"timed out waiting for {message_type}")
 
-        send_raw(
-            b'{"type":"ping","protocol_version":1,"nonce":"\\ud800"}'
-        )
+        send_raw(b'{"type":"ping","protocol_version":1,"nonce":"\\ud800"}')
         rejected = wait_for("request_error")
         assert rejected["code"] == "invalid_request"
         assert runtime.transport.is_running
@@ -446,3 +453,28 @@ def test_client_create_room_canonicalizes_optional_custom_settings():
             },
         }
     ]
+
+
+def test_client_create_room_forwards_opt_in_ai_settings():
+    class StubTransport:
+        is_connected = True
+
+        def __init__(self):
+            self.sent = []
+
+        def send(self, message):
+            self.sent.append(message)
+
+    transport = StubTransport()
+    session = LanClientSession(transport=transport)
+
+    session.create_room(
+        "Host",
+        player_count=3,
+        ai_player_count=2,
+        ai_personality_mode="mixed",
+    )
+
+    settings = transport.sent[0]["settings"]
+    assert settings["ai_player_count"] == 2
+    assert settings["ai_personality_mode"] == "mixed"

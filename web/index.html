@@ -17,7 +17,7 @@
           <small>権威サーバーで遊ぶローカル版</small>
         </span>
       </a>
-      <div class="connection" id="connection-status" data-state="connecting">
+      <div class="connection" id="connection-status" data-state="connecting" role="status" aria-live="polite">
         <span class="connection-dot" aria-hidden="true"></span>
         <span id="connection-label">接続準備中</span>
       </div>
@@ -65,6 +65,27 @@
                 <input name="victory_target" type="number" min="5" max="15" value="10" required>
               </label>
             </div>
+            <div class="field-row">
+              <label>
+                AI人数
+                <select name="ai_player_count" id="ai-player-count">
+                  <option value="0">なし</option>
+                  <option value="1" selected>1人</option>
+                  <option value="2">2人</option>
+                </select>
+              </label>
+              <label>
+                AI性格
+                <select name="ai_personality_mode" id="ai-personality-mode">
+                  <option value="mixed" selected>混合</option>
+                  <option value="standard">標準</option>
+                  <option value="expansion">拡大重視</option>
+                  <option value="trader">交渉重視</option>
+                  <option value="disruptor">妨害重視</option>
+                </select>
+              </label>
+            </div>
+            <p class="field-note">AI席は最初から準備済みです。人間は残りの席へ参加できます。</p>
             <label>
               盤面
               <select name="board_mode">
@@ -163,7 +184,7 @@
         </div>
 
         <div class="game-grid">
-          <section class="board-shell" aria-label="カタン盤面">
+          <section class="board-shell" id="board-shell" aria-label="カタン盤面" tabindex="-1">
             <svg id="board-svg" role="img" aria-labelledby="board-title">
               <title id="board-title">ゲーム盤面</title>
               <g id="board-layer"></g>
@@ -192,13 +213,90 @@
               <div class="web-player-list" id="player-list"></div>
             </section>
 
-            <section class="panel event-panel">
+            <section class="panel event-panel" aria-live="polite">
               <p class="eyebrow">LATEST EVENT</p>
               <h2 id="latest-event-title">対局準備</h2>
               <p id="latest-event-detail">イベントを待っています。</p>
+              <div class="ai-commentary" id="ai-commentary" hidden>
+                <span>AI COMMENT</span>
+                <strong id="ai-commentary-title">判断中</strong>
+                <p id="ai-commentary-detail"></p>
+              </div>
             </section>
           </aside>
         </div>
+
+        <section class="result-dashboard" id="result-dashboard" aria-labelledby="result-winner" aria-live="polite" tabindex="-1" hidden>
+          <div class="result-hero panel">
+            <div>
+              <p class="eyebrow">MATCH RESULT</p>
+              <h2 id="result-winner">対局結果</h2>
+              <p id="result-summary">最終結果を集計しています。</p>
+            </div>
+            <button class="secondary-button" id="result-live-button" type="button">最終盤面へ戻る</button>
+          </div>
+
+          <div class="result-grid">
+            <section class="panel result-standings-panel">
+              <div class="section-heading compact">
+                <div>
+                  <p class="eyebrow">STANDINGS</p>
+                  <h2>最終順位</h2>
+                </div>
+              </div>
+              <div class="result-standings" id="result-standings"></div>
+            </section>
+
+            <section class="panel result-chart-panel">
+              <div class="section-heading compact">
+                <div>
+                  <p class="eyebrow">VICTORY POINTS</p>
+                  <h2>勝敗推移</h2>
+                </div>
+              </div>
+              <svg id="result-chart" role="img" aria-label="プレイヤー別の勝利点推移"></svg>
+              <div class="result-chart-legend" id="result-chart-legend"></div>
+            </section>
+
+            <section class="panel replay-panel">
+              <div class="section-heading compact">
+                <div>
+                  <p class="eyebrow">REPLAY</p>
+                  <h2>盤面を見返す</h2>
+                </div>
+                <span class="phase-badge" id="replay-position">LIVE</span>
+              </div>
+              <input id="replay-slider" class="replay-slider" type="range" min="0" max="0" value="0" aria-label="リプレイ位置">
+              <div class="replay-controls">
+                <button class="ghost-button" id="replay-first" type="button" aria-label="最初へ">|◀</button>
+                <button class="ghost-button" id="replay-previous" type="button" aria-label="前へ">◀</button>
+                <button class="primary-button" id="replay-play" type="button">再生</button>
+                <button class="ghost-button" id="replay-next" type="button" aria-label="次へ">▶</button>
+                <button class="ghost-button" id="replay-last" type="button" aria-label="最後へ">▶|</button>
+              </div>
+              <label class="replay-speed-label">
+                再生速度
+                <select id="replay-speed">
+                  <option value="1400">0.5×</option>
+                  <option value="800" selected>1×</option>
+                  <option value="400">2×</option>
+                  <option value="200">4×</option>
+                </select>
+              </label>
+              <p class="context-hint" id="replay-frame-label">対局終了後に操作できます。</p>
+            </section>
+
+            <section class="panel result-events-panel">
+              <div class="section-heading compact">
+                <div>
+                  <p class="eyebrow">KEY MOMENTS</p>
+                  <h2>重要イベント</h2>
+                </div>
+              </div>
+              <div class="result-events" id="result-events"></div>
+            </section>
+          </div>
+        </section>
       </section>
     </main>
 

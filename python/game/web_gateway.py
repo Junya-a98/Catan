@@ -17,7 +17,12 @@ import threading
 import time
 from typing import Any, Callable, Mapping
 
-from game.lan_controller import LanServerController, OutboundMessage
+from game.lan_controller import (
+    LanControllerError,
+    LanServerController,
+    OutboundMessage,
+)
+from game.network_replay import NetworkReplayError
 
 
 WEB_API_VERSION = 1
@@ -25,11 +30,20 @@ MAX_WEB_SESSIONS = 64
 MAX_PENDING_WEB_EVENTS = 48
 DEFAULT_WEB_SESSION_IDLE_SECONDS = 6 * 60 * 60
 
-_COALESCED_EVENT_TYPES = frozenset({"lobby_snapshot", "state_snapshot"})
+_COALESCED_EVENT_TYPES = frozenset(
+    {
+        "lobby_snapshot",
+        "state_snapshot",
+        "network_match_result",
+        "network_result_unavailable",
+    }
+)
 _BOOTSTRAP_EVENT_TYPES = (
     "session_welcome",
     "lobby_snapshot",
     "state_snapshot",
+    "network_match_result",
+    "network_result_unavailable",
     "room_closed",
 )
 
@@ -160,6 +174,23 @@ class WebGateway:
             self._maintain(now)
             session = self._require_session(token)
             session.last_seen_at = now
+            if message.get("type") == "replay_frame_request":
+                self._validate_replay_frame_request(message)
+                try:
+                    frame = self.controller.replay_frame_for_connection(
+                        session.connection_id,
+                        message["index"],
+                    )
+                except (LanControllerError, NetworkReplayError) as exc:
+                    code = exc.code
+                    raise WebGatewayError(code, str(exc)) from exc
+                except Exception as exc:
+                    raise WebGatewayError(
+                        "replay_unavailable",
+                        "リプレイを読み込めませんでした。",
+                    ) from exc
+                pending = self._drain(session)
+                return (*pending, deepcopy(frame))
             outbound = self.controller.handle(
                 session.connection_id,
                 deepcopy(dict(message)),
@@ -186,6 +217,12 @@ class WebGateway:
             session = self._require_session(token)
             session.last_seen_at = now
             return self._drain(session)
+
+    def maintain(self) -> None:
+        """Advance expiry and AI work from the server loop, without a client poll."""
+
+        with self._lock:
+            self._maintain(float(self._clock()))
 
     def close_session(self, token: str) -> bool:
         """Disconnect a browser while preserving the controller reservation."""
@@ -219,25 +256,83 @@ class WebGateway:
             if session is None:
                 continue
             message = deepcopy(item.message)
-            message_type = message.get("type")
-            if isinstance(message_type, str):
-                if message_type == "session_welcome":
-                    # Joining a room starts a new durable browser view.  This
-                    # also removes a room_closed event from an earlier match.
-                    session.latest.clear()
-                if message_type in _BOOTSTRAP_EVENT_TYPES:
-                    session.latest[message_type] = deepcopy(message)
-                if message_type == "room_closed":
-                    session.latest.pop("lobby_snapshot", None)
-                    session.latest.pop("state_snapshot", None)
-            if message_type in _COALESCED_EVENT_TYPES:
+            self._enqueue(session, message)
+            if (
+                message.get("type") == "state_snapshot"
+                and message.get("state", {}).get("phase", {}).get("name") == "finished"
+            ):
+                try:
+                    result = self.controller.match_result_for_connection(
+                        item.connection_id
+                    )
+                except Exception:
+                    # Result/replay is a read-only enhancement.  A capture
+                    # failure must never interrupt authoritative live state.
+                    self._enqueue(
+                        session,
+                        {
+                            "type": "network_result_unavailable",
+                            "protocol_version": WEB_API_VERSION,
+                            "message": "対局結果とリプレイを読み込めませんでした。",
+                        },
+                    )
+                    continue
+                self._enqueue(session, deepcopy(result))
+
+    def _enqueue(self, session: _BrowserSession, message: dict[str, Any]) -> None:
+        """Store one already-routed event with coalescing and bootstrap state."""
+
+        message_type = message.get("type")
+        if isinstance(message_type, str):
+            if message_type == "session_welcome":
+                # Joining a room starts a new durable browser view.  This
+                # also removes a room_closed event from an earlier match.
+                session.latest.clear()
+            if message_type == "network_match_result":
+                session.latest.pop("network_result_unavailable", None)
                 session.pending = deque(
                     event
                     for event in session.pending
-                    if event.get("type") != message_type
+                    if event.get("type") != "network_result_unavailable"
                 )
-            session.pending.append(message)
-            self._bound_pending(session)
+            elif message_type == "network_result_unavailable":
+                session.latest.pop("network_match_result", None)
+            if message_type in _BOOTSTRAP_EVENT_TYPES:
+                session.latest[message_type] = deepcopy(message)
+            if message_type == "room_closed":
+                session.latest.pop("lobby_snapshot", None)
+                session.latest.pop("state_snapshot", None)
+                session.latest.pop("network_match_result", None)
+                session.latest.pop("network_result_unavailable", None)
+        if message_type in _COALESCED_EVENT_TYPES:
+            session.pending = deque(
+                event for event in session.pending if event.get("type") != message_type
+            )
+        session.pending.append(message)
+        self._bound_pending(session)
+
+    @staticmethod
+    def _validate_replay_frame_request(message: Mapping[str, Any]) -> None:
+        if type(message) is not dict or set(message) != {
+            "type",
+            "protocol_version",
+            "index",
+        }:
+            raise WebGatewayError(
+                "invalid_request",
+                "replay_frame_requestが不正です。",
+            )
+        if message.get("protocol_version") != WEB_API_VERSION:
+            raise WebGatewayError(
+                "version_mismatch",
+                "通信versionが一致しません。",
+            )
+        index = message.get("index")
+        if isinstance(index, bool) or not isinstance(index, int) or index < 0:
+            raise WebGatewayError(
+                "invalid_frame",
+                "リプレイのフレーム番号が不正です。",
+            )
 
     @staticmethod
     def _bound_pending(session: _BrowserSession) -> None:

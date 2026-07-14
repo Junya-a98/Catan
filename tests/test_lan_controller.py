@@ -25,21 +25,36 @@ def message(message_type, **payload):
     }
 
 
-def create_room(controller, connection="host", *, players=2):
+def create_room(
+    controller,
+    connection="host",
+    *,
+    players=2,
+    ai_players=0,
+    ai_personality_mode="standard",
+):
+    settings = {
+        "player_count": players,
+        "victory_target": 5,
+        "board_mode": "constrained",
+        "board_seed": 4242,
+    }
+    if ai_players or ai_personality_mode != "standard":
+        settings.update(
+            ai_player_count=ai_players,
+            ai_personality_mode=ai_personality_mode,
+        )
     outbound = controller.handle(
         connection,
         message(
             "create_room",
             display_name="Host",
-            settings={
-                "player_count": players,
-                "victory_target": 5,
-                "board_mode": "constrained",
-                "board_seed": 4242,
-            },
+            settings=settings,
         ),
     )
-    welcome = next(item.message for item in outbound if item.message["type"] == "session_welcome")
+    welcome = next(
+        item.message for item in outbound if item.message["type"] == "session_welcome"
+    )
     return welcome["room_code"], welcome["reconnect_token"], outbound
 
 
@@ -53,7 +68,9 @@ def join_player(controller, room_code, connection="guest", name="Guest"):
             role="player",
         ),
     )
-    return next(item.message for item in outbound if item.message["type"] == "session_welcome"), outbound
+    return next(
+        item.message for item in outbound if item.message["type"] == "session_welcome"
+    ), outbound
 
 
 def ready_and_start(controller, room_code):
@@ -80,9 +97,20 @@ def test_create_join_ready_start_and_viewer_specific_snapshots():
 
     assert host_token
     assert guest_welcome["seat_index"] == 1
-    assert all(host_token not in json.dumps(item.message) for item in created if item.message["type"] == "lobby_snapshot")
+    assert all(
+        host_token not in json.dumps(item.message)
+        for item in created
+        if item.message["type"] == "lobby_snapshot"
+    )
     assert any(item.message["type"] == "lobby_snapshot" for item in joined)
-    assert next(item.message for item in spectator if item.message["type"] == "session_welcome")["seat_index"] is None
+    assert (
+        next(
+            item.message
+            for item in spectator
+            if item.message["type"] == "session_welcome"
+        )["seat_index"]
+        is None
+    )
 
     ready_and_start(controller, room_code)
     host = controller.snapshot_for_connection("host")
@@ -100,13 +128,195 @@ def test_create_join_ready_start_and_viewer_specific_snapshots():
     assert viewer["command_options"] == []
 
 
+def test_authenticated_replay_frames_track_revisions_without_private_leaks():
+    controller = LanServerController()
+    room_code, _host_token, _created = create_room(controller)
+    join_player(controller, room_code)
+    controller.handle(
+        "viewer",
+        message(
+            "join_room",
+            room_code=room_code,
+            display_name="Viewer",
+            role="spectator",
+        ),
+    )
+    ready_and_start(controller, room_code)
+
+    initial_host = controller.replay_frame_for_connection("host", 0)
+    initial_viewer = controller.replay_frame_for_connection("viewer", 0)
+    assert initial_host["read_only"] is True
+    assert initial_host["controls"]["revision"] == 0
+    assert initial_host["snapshot"]["command_options"] == []
+    assert initial_host["snapshot"]["state"]["players"][0]["resources"] is not None
+    assert initial_host["snapshot"]["state"]["players"][1]["resources"] is None
+    assert all(
+        player["resources"] is None
+        for player in initial_viewer["snapshot"]["state"]["players"]
+    )
+
+    controller.handle(
+        "host",
+        build_game_command(
+            sequence=0,
+            expected_revision=0,
+            command="roll_dice",
+        ),
+    )
+    latest = controller.replay_frame_for_connection("host", 1)
+    assert latest["controls"]["frame_count"] == 2
+    assert latest["controls"]["revision"] == 1
+    with pytest.raises(LanControllerError):
+        controller.replay_frame_for_connection("not-joined", 0)
+
+
+def test_ai_only_opponents_fill_lobby_and_advance_as_authoritative_seats():
+    controller = LanServerController()
+    room_code, _host_token, created = create_room(
+        controller,
+        players=3,
+        ai_players=2,
+        ai_personality_mode="mixed",
+    )
+    lobby = next(
+        item.message["lobby"]
+        for item in created
+        if item.message["type"] == "lobby_snapshot"
+    )
+
+    assert lobby["full"] is True
+    assert lobby["can_start"] is False
+    assert lobby["settings"]["ai_player_count"] == 2
+    assert [member["display_name"] for member in lobby["members"]] == [
+        "Host",
+        "CPU1",
+        "CPU2",
+    ]
+    assert [member.get("ai_personality") for member in lobby["members"]] == [
+        None,
+        "expansion",
+        "trader",
+    ]
+    full = controller.handle(
+        "late",
+        message(
+            "join_room",
+            room_code=room_code,
+            display_name="Late",
+            role="player",
+        ),
+    )[0].message
+    assert full["type"] == "request_error"
+    assert full["code"] == "room_full"
+
+    controller.handle("host", message("set_ready", ready=True))
+    started = controller.handle("host", message("start_game"))
+    assert any(item.message["type"] == "state_snapshot" for item in started)
+    game = controller._rooms[room_code].game
+    assert [player.is_ai for player in game.players] == [False, True, True]
+    assert [player.name for player in game.players] == ["Host", "CPU1", "CPU2"]
+    assert [player.ai_personality for player in game.players] == [
+        "standard",
+        "expansion",
+        "trader",
+    ]
+
+    host_roll = controller.handle(
+        "host",
+        build_game_command(
+            sequence=0,
+            expected_revision=0,
+            command="roll_dice",
+        ),
+    )
+    assert host_roll[0].message["accepted"] is True
+    before_tick_rng = random.getstate()
+
+    advanced = controller.tick()
+
+    ai_snapshot = next(
+        item.message
+        for item in advanced
+        if item.connection_id == "host" and item.message["type"] == "state_snapshot"
+    )
+    assert ai_snapshot["revision"] == 2
+    assert ai_snapshot["state"]["ai"]["status"]["player_name"] == "CPU1"
+    assert ai_snapshot["state"]["ai"]["status"]["title"] == "初期ダイス"
+    assert ai_snapshot["state"]["players"][1]["resources"] is None
+    assert ai_snapshot["command_options"] == []
+    assert random.getstate() == before_tick_rng
+    replay = controller.replay_frame_for_connection("host", 2)
+    assert replay["controls"]["frame_count"] == 3
+    assert replay["controls"]["revision"] == 2
+
+
+def test_ai_tick_step_limit_is_bounded_and_each_decision_has_a_revision():
+    controller = LanServerController(ai_steps_per_tick=2)
+    room_code, _host_token, _created = create_room(
+        controller,
+        players=3,
+        ai_players=2,
+    )
+    controller.handle("host", message("set_ready", ready=True))
+    controller.handle("host", message("start_game"))
+    controller.handle(
+        "host",
+        build_game_command(
+            sequence=0,
+            expected_revision=0,
+            command="roll_dice",
+        ),
+    )
+
+    outbound = controller.tick()
+    revisions = [
+        item.message["revision"]
+        for item in outbound
+        if item.connection_id == "host" and item.message["type"] == "state_snapshot"
+    ]
+
+    assert revisions == [2, 3]
+    assert controller.snapshot_for_connection("host")["revision"] == 3
+
+
+def test_failed_ai_step_rolls_back_game_room_rng_and_global_rng():
+    def failing_ai_step(game):
+        game.bank.resources[ResourceType.WOOD] -= 1
+        game.players[1].resources[ResourceType.WOOD] += 1
+        random.random()
+        raise RuntimeError("private AI failure")
+
+    controller = LanServerController(ai_stepper=failing_ai_step)
+    room_code, _host_token, _created = create_room(
+        controller,
+        players=2,
+        ai_players=1,
+    )
+    controller.handle("host", message("set_ready", ready=True))
+    controller.handle("host", message("start_game"))
+    controller.handle(
+        "host",
+        build_game_command(
+            sequence=0,
+            expected_revision=0,
+            command="roll_dice",
+        ),
+    )
+    snapshot_before = controller.snapshot_for_connection("host")
+    room_rng_before = controller._rooms[room_code].random_state
+    caller_rng_before = random.getstate()
+
+    assert controller.tick() == ()
+    assert controller.snapshot_for_connection("host") == snapshot_before
+    assert controller._rooms[room_code].random_state == room_rng_before
+    assert random.getstate() == caller_rng_before
+
+
 def test_custom_room_settings_reach_authority_and_public_board_identity():
     custom_map = CustomMapSpec.from_board(GameBoard(seed=8765))
     house_rules = HouseRules(
         skip_discard_on_seven=True,
-        disabled_development_cards=frozenset(
-            {DevelopmentCardType.YEAR_OF_PLENTY}
-        ),
+        disabled_development_cards=frozenset({DevelopmentCardType.YEAR_OF_PLENTY}),
     )
     controller = LanServerController()
     created = controller.handle(
@@ -125,9 +335,7 @@ def test_custom_room_settings_reach_authority_and_public_board_identity():
         ),
     )
     welcome = next(
-        item.message
-        for item in created
-        if item.message["type"] == "session_welcome"
+        item.message for item in created if item.message["type"] == "session_welcome"
     )
     lobby = next(
         item.message["lobby"]
@@ -142,18 +350,14 @@ def test_custom_room_settings_reach_authority_and_public_board_identity():
     snapshot = next(
         item.message
         for item in started
-        if item.connection_id == "host"
-        and item.message["type"] == "state_snapshot"
+        if item.connection_id == "host" and item.message["type"] == "state_snapshot"
     )
 
     assert snapshot["state"]["board"]["mode"] == "custom"
     assert (
-        snapshot["board_manifest"]["custom_map_fingerprint"]
-        == custom_map.fingerprint
+        snapshot["board_manifest"]["custom_map_fingerprint"] == custom_map.fingerprint
     )
-    assert snapshot["state"]["rules"]["house_rules"] == (
-        house_rules.to_document()
-    )
+    assert snapshot["state"]["rules"]["house_rules"] == (house_rules.to_document())
 
 
 @pytest.mark.parametrize(
@@ -211,9 +415,7 @@ def test_command_options_follow_authoritative_actor_after_each_revision():
 
     assert host_snapshot["revision"] == 1
     assert host_snapshot["command_options"] == []
-    assert guest_snapshot["command_options"] == [
-        {"command": "roll_dice", "args": {}}
-    ]
+    assert guest_snapshot["command_options"] == [{"command": "roll_dice", "args": {}}]
 
 
 def test_only_host_can_start_and_all_seats_must_be_ready():
@@ -246,7 +448,11 @@ def test_disconnect_and_reconnect_preserve_seat_and_command_identity():
             reconnect_token=token,
         ),
     )
-    new_welcome = next(item.message for item in reconnected if item.message["type"] == "session_welcome")
+    new_welcome = next(
+        item.message
+        for item in reconnected
+        if item.message["type"] == "session_welcome"
+    )
     assert new_welcome["seat_index"] == 1
     assert new_welcome["reconnect_token"] is None
 
@@ -258,7 +464,9 @@ def test_disconnect_and_reconnect_preserve_seat_and_command_identity():
             reconnect_token=token,
         ),
     )[0].message
-    assert hijack["code"] == "authentication_failed" or hijack["code"] == "invalid_state"
+    assert (
+        hijack["code"] == "authentication_failed" or hijack["code"] == "invalid_state"
+    )
 
 
 def test_reconnect_restores_consumed_command_sequence_and_duplicate_result():
@@ -449,8 +657,7 @@ def test_match_rng_uses_private_entropy_instead_of_public_board_seed(monkeypatch
         started_messages.append(ready_and_start(controller, room_code))
 
     contexts = [
-        controller._rooms[controller.room_codes[0]]
-        for controller in controllers
+        controller._rooms[controller.room_codes[0]] for controller in controllers
     ]
     assert contexts[0].match_seed != contexts[1].match_seed
     assert contexts[0].random_state != contexts[1].random_state
@@ -459,11 +666,7 @@ def test_match_rng_uses_private_entropy_instead_of_public_board_seed(monkeypatch
         == controllers[1].snapshot_for_connection("host")["board_manifest"]
     )
     encoded_messages = json.dumps(
-        [
-            item.message
-            for outbound in started_messages
-            for item in outbound
-        ]
+        [item.message for outbound in started_messages for item in outbound]
     )
     assert all(str(context.match_seed) not in encoded_messages for context in contexts)
     assert random.getstate() == caller_rng_before
@@ -569,15 +772,12 @@ def test_failed_reconnect_snapshot_restores_reservation_and_sequence():
         ),
     )
     welcome = next(
-        item.message
-        for item in retried
-        if item.message["type"] == "session_welcome"
+        item.message for item in retried if item.message["type"] == "session_welcome"
     )
     assert welcome["seat_index"] == 0
     assert welcome["next_sequence"] == 1
     assert any(
-        item.message["type"] == "state_snapshot"
-        and item.message["revision"] == 1
+        item.message["type"] == "state_snapshot" and item.message["revision"] == 1
         for item in retried
     )
 
@@ -687,7 +887,10 @@ def test_start_failure_does_not_commit_lobby_phase_and_can_be_retried():
 @pytest.mark.parametrize(
     ("raised", "expected_code"),
     (
-        (NetworkActionError("forced_rejection", "意図的な拒否です。"), "forced_rejection"),
+        (
+            NetworkActionError("forced_rejection", "意図的な拒否です。"),
+            "forced_rejection",
+        ),
         (RuntimeError("private command failure"), "internal_error"),
     ),
 )

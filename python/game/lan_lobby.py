@@ -25,6 +25,14 @@ from collections.abc import Mapping
 from typing import Any, Callable, Optional
 import unicodedata
 
+from game.ai_personality import (
+    AI_PERSONALITY_MODES,
+    DISRUPTOR,
+    EXPANSION,
+    MIXED,
+    STANDARD,
+    TRADER,
+)
 from game.custom_map import CustomMapError, CustomMapSpec
 from game.house_rules import HouseRules
 
@@ -99,6 +107,8 @@ class RoomSettings:
     victory_target: int = 10
     board_mode: str = "constrained"
     board_seed: int = 0
+    ai_player_count: int = 0
+    ai_personality_mode: str = STANDARD
     custom_map: CustomMapSpec | Mapping[str, Any] | None = None
     house_rules: HouseRules | Mapping[str, Any] | None = None
 
@@ -113,6 +123,19 @@ class RoomSettings:
             raise LobbyValidationError("board_seed must be an integer")
         if abs(self.board_seed) > MAX_SAFE_BOARD_SEED:
             raise LobbyValidationError("board_seed must be a JSON-safe integer")
+        _bounded_int(
+            self.ai_player_count,
+            "ai_player_count",
+            minimum=0,
+            maximum=self.player_count - 1,
+        )
+        if (
+            not isinstance(self.ai_personality_mode, str)
+            or self.ai_personality_mode not in AI_PERSONALITY_MODES
+        ):
+            raise LobbyValidationError(
+                "ai_personality_mode must be standard, mixed, expansion, trader, or disruptor"
+            )
 
         custom_map = self.custom_map
         if isinstance(custom_map, Mapping):
@@ -121,9 +144,7 @@ class RoomSettings:
             except CustomMapError as exc:
                 raise LobbyValidationError("custom_map is invalid") from exc
         elif custom_map is not None and not isinstance(custom_map, CustomMapSpec):
-            raise LobbyValidationError(
-                "custom_map must be a validated map document"
-            )
+            raise LobbyValidationError("custom_map must be a validated map document")
         if self.board_mode == "custom":
             if custom_map is None:
                 raise LobbyValidationError("custom board mode requires custom_map")
@@ -155,6 +176,8 @@ class RoomSettings:
             "victory_target": self.victory_target,
             "board_mode": self.board_mode,
             "board_seed": self.board_seed,
+            "ai_player_count": self.ai_player_count,
+            "ai_personality_mode": self.ai_personality_mode,
         }
         if self.custom_map is not None:
             public["custom_map"] = self.custom_map.to_document()
@@ -288,7 +311,19 @@ class LobbyRoom:
     def is_full(self) -> bool:
         """Whether every player seat is occupied, including reservations."""
 
-        return len(self._seated_members()) >= self.settings.player_count
+        return len(self._seated_members()) >= self.human_player_count
+
+    @property
+    def human_player_count(self) -> int:
+        """Number of transport-backed seats after reserving the AI lineup."""
+
+        return self.settings.player_count - self.settings.ai_player_count
+
+    @property
+    def has_members(self) -> bool:
+        """Whether the room still has a real player or spectator membership."""
+
+        return bool(self._members)
 
     @property
     def can_start(self) -> bool:
@@ -297,7 +332,7 @@ class LobbyRoom:
         seated = self._seated_members()
         return bool(
             self.phase is RoomPhase.WAITING
-            and len(seated) == self.settings.player_count
+            and len(seated) == self.human_player_count
             and all(member.connected and member.ready for member in seated)
             and self._host_member_id in self._members
         )
@@ -313,7 +348,7 @@ class LobbyRoom:
         occupied = {member.seat for member in self._seated_members()}
         seat = next(
             seat
-            for seat in range(1, self.settings.player_count + 1)
+            for seat in range(1, self.human_player_count + 1)
             if seat not in occupied
         )
         return self._add_member(
@@ -414,10 +449,7 @@ class LobbyRoom:
             raise LobbyAuthenticationError("invalid or expired reconnect token")
         if member.connected:
             raise LobbyStateError("the member is already connected")
-        if (
-            member.reserved_until is not None
-            and member.reserved_until <= self._now()
-        ):
+        if member.reserved_until is not None and member.reserved_until <= self._now():
             raise LobbyAuthenticationError("invalid or expired reconnect token")
         member.connection_id = connection_id
         member.connected = True
@@ -476,9 +508,7 @@ class LobbyRoom:
             if not member.connected
             and member.reserved_until is not None
             and member.reserved_until <= now
-            and not (
-                self.phase is RoomPhase.STARTED and member.seat is not None
-            )
+            and not (self.phase is RoomPhase.STARTED and member.seat is not None)
         ]
         if not expired:
             return ()
@@ -509,14 +539,14 @@ class LobbyRoom:
 
         now = self._now()
         members = []
-        ordered = sorted(
+        ordered_members = sorted(
             self._members.values(),
             key=lambda member: (
                 member.seat is None,
                 member.seat if member.seat is not None else member.joined_order,
             ),
         )
-        for member in ordered:
+        for member in ordered_members:
             reservation_remaining = None
             if not member.connected and member.reserved_until is not None:
                 reservation_remaining = max(0.0, member.reserved_until - now)
@@ -530,6 +560,16 @@ class LobbyRoom:
                     "reservation_seconds_remaining": reservation_remaining,
                 }
             )
+        spectators = [member for member in members if member["seat"] is None]
+        human_players = [member for member in members if member["seat"] is not None]
+        ai_members = self._public_ai_members()
+        members = (
+            sorted(
+                [*human_players, *ai_members],
+                key=lambda member: member["seat"],
+            )
+            + spectators
+        )
         return {
             "room_code": self.room_code,
             "revision": self.revision,
@@ -538,11 +578,40 @@ class LobbyRoom:
             "full": self.is_full,
             "can_start": self.can_start,
             "members": members,
-            "player_members": sum(member.seat is not None for member in ordered),
+            "player_members": len(human_players) + len(ai_members),
             "spectators": sum(
-                member.role is MemberRole.SPECTATOR for member in ordered
+                member.role is MemberRole.SPECTATOR for member in ordered_members
             ),
         }
+
+    def _public_ai_members(self) -> list[dict[str, Any]]:
+        personalities = self._ai_personality_lineup()
+        return [
+            {
+                "display_name": f"CPU{cpu_index}",
+                "role": MemberRole.PLAYER.value,
+                "seat": seat,
+                "connected": True,
+                "ready": True,
+                "reservation_seconds_remaining": None,
+                "is_ai": True,
+                "ai_personality": personality,
+            }
+            for cpu_index, (seat, personality) in enumerate(
+                zip(
+                    range(self.human_player_count + 1, self.settings.player_count + 1),
+                    personalities,
+                ),
+                start=1,
+            )
+        ]
+
+    def _ai_personality_lineup(self) -> tuple[str, ...]:
+        count = self.settings.ai_player_count
+        if self.settings.ai_personality_mode == MIXED:
+            mixed = (EXPANSION, TRADER, DISRUPTOR)
+            return tuple(mixed[index % len(mixed)] for index in range(count))
+        return (self.settings.ai_personality_mode,) * count
 
     def _add_member(
         self,
@@ -559,7 +628,9 @@ class LobbyRoom:
         if any(
             member.display_name.casefold() == display_name.casefold()
             for member in self._members.values()
-        ):
+        ) or display_name.casefold() in {
+            member["display_name"].casefold() for member in self._public_ai_members()
+        }:
             raise LobbyValidationError("display_name is already in use")
 
         token, token_hash = self._new_reconnect_token()

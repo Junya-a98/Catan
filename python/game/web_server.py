@@ -12,6 +12,13 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from game.web_gateway import WEB_API_VERSION, WebGateway, WebGatewayError
+from game.websocket_transport import (
+    WebSocketConnection,
+    WebSocketEOF,
+    WebSocketHandshakeError,
+    WebSocketProtocolError,
+    validate_websocket_handshake,
+)
 
 
 DEFAULT_WEB_HOST = "127.0.0.1"
@@ -70,6 +77,16 @@ class CatanWebServer(ThreadingHTTPServer):
         self.allowed_hosts = frozenset({"127.0.0.1", "localhost", "::1", host})
         super().__init__((host, port), CatanWebRequestHandler)
 
+    def service_actions(self) -> None:
+        """Keep authoritative AI moving even when browser timers are throttled."""
+
+        try:
+            self.gateway.maintain()
+        except Exception:
+            # Maintenance is best-effort; request handlers remain available
+            # and will retry it under the same serialized gateway lock.
+            return
+
 
 class CatanWebRequestHandler(BaseHTTPRequestHandler):
     """Strict same-origin routes for the local browser MVP."""
@@ -124,6 +141,9 @@ class CatanWebRequestHandler(BaseHTTPRequestHandler):
                     },
                 )
                 return
+            if path == "/api/socket" and method == "GET":
+                self._handle_websocket()
+                return
             if path == "/api/session" and method == "POST":
                 self._start_session()
                 return
@@ -170,6 +190,83 @@ class CatanWebRequestHandler(BaseHTTPRequestHandler):
             },
             extra_headers=(("Set-Cookie", cookie),),
         )
+
+    def _handle_websocket(self) -> None:
+        """Upgrade one authenticated browser session to bounded JSON frames."""
+
+        if not self._valid_request_origin():
+            self._json_error(
+                HTTPStatus.FORBIDDEN,
+                "cross_site_request",
+                "同一originから接続してください。",
+            )
+            return
+        token = self._required_session_token()
+        try:
+            handshake = validate_websocket_handshake(
+                self.headers,
+                method=self.command,
+            )
+        except WebSocketHandshakeError as exc:
+            self._json_response(
+                exc.status,
+                {
+                    "api_version": WEB_API_VERSION,
+                    "error": {"code": exc.code, "message": str(exc)},
+                },
+                extra_headers=exc.response_headers,
+            )
+            return
+
+        self.send_response(HTTPStatus.SWITCHING_PROTOCOLS)
+        self._security_headers()
+        for key, value in handshake.response_headers:
+            self.send_header(key, value)
+        self.end_headers()
+        self.close_connection = True
+
+        socket_connection = WebSocketConnection(self.rfile, self.wfile)
+        socket_connection.send_json(
+            {
+                "api_version": WEB_API_VERSION,
+                "kind": "bootstrap",
+                "events": list(self.catan_server.gateway.bootstrap(token)),
+            }
+        )
+        while True:
+            try:
+                event = socket_connection.receive()
+                if event.kind != "message":
+                    if socket_connection.handle_control(event):
+                        return
+                    continue
+                events = self.catan_server.gateway.handle(token, event.message or {})
+                socket_connection.send_json(
+                    {
+                        "api_version": WEB_API_VERSION,
+                        "kind": "response",
+                        "events": list(events),
+                    }
+                )
+            except WebSocketProtocolError as exc:
+                socket_connection.send_protocol_error(exc)
+                return
+            except WebGatewayError as exc:
+                try:
+                    socket_connection.send_json(
+                        {
+                            "api_version": WEB_API_VERSION,
+                            "kind": "response",
+                            "error": {"code": exc.code, "message": str(exc)},
+                        }
+                    )
+                except (WebSocketEOF, OSError):
+                    return
+                if exc.status == HTTPStatus.UNAUTHORIZED:
+                    return
+                continue
+            except (WebSocketEOF, BrokenPipeError, ConnectionResetError, OSError):
+                return
 
     def _end_session(self) -> None:
         token = self._session_token()

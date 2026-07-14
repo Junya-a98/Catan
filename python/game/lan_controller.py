@@ -40,6 +40,7 @@ from game.network_actions import (
     apply_game_command,
     build_game_command_options,
 )
+from game.network_replay import NetworkReplayStore
 from game.network_protocol import (
     NETWORK_PROTOCOL_VERSION,
     NetworkProtocolError,
@@ -52,6 +53,8 @@ from game.persistence import restore_game, serialize_game
 MAX_ROOMS = 32
 MAX_COMMAND_RECORDS = 128
 MAX_CONNECTION_ID_LENGTH = 128
+MAX_AI_STEPS_PER_TICK = 8
+DEFAULT_AI_STEPS_PER_TICK = 1
 _RANDOM_LOCK = threading.RLock()
 
 
@@ -114,7 +117,8 @@ def _default_game_factory(
         board_seed=settings.board_seed,
         custom_map=settings.custom_map,
         house_rules=settings.house_rules,
-        ai_player_count=0,
+        ai_player_count=settings.ai_player_count,
+        ai_personality_mode=settings.ai_personality_mode,
         headless=True,
     )
     game.player_palette = [
@@ -124,14 +128,15 @@ def _default_game_factory(
             game.player_palette,
         )
     ]
+    # The constructor initially configures two seats and therefore clamps the
+    # requested count.  Restore the room setting before rebuilding all seats.
+    game.ai_player_count = settings.ai_player_count
     game.configure_players(
         settings.player_count,
         reset_logs=False,
         schedule_ai=False,
         reset_replay=False,
     )
-    for player in game.players:
-        player.is_ai = False
     game.victory_point_target = settings.victory_target
     game.network_mode = True
     game.reset_match_metrics()
@@ -140,24 +145,62 @@ def _default_game_factory(
     return game
 
 
+def _default_ai_stepper(game: Any) -> bool:
+    ai = getattr(game, "ai", None)
+    step = getattr(ai, "step", None)
+    return bool(callable(step) and step(game))
+
+
 class LanServerController:
     """Authoritative multi-room state machine for a trusted LAN server."""
 
     def __init__(
         self,
         *,
-        game_factory: Callable[[RoomSettings, tuple[str, ...]], Any] = _default_game_factory,
-        command_applier: Callable[[Any, int | None, str, dict[str, Any] | None], bool] = apply_game_command,
+        game_factory: Callable[
+            [RoomSettings, tuple[str, ...]], Any
+        ] = _default_game_factory,
+        command_applier: Callable[
+            [Any, int | None, str, dict[str, Any] | None], bool
+        ] = apply_game_command,
         snapshot_builder: Callable[..., dict[str, Any]] = build_state_snapshot,
+        ai_stepper: Callable[[Any], bool] = _default_ai_stepper,
+        ai_steps_per_tick: int = DEFAULT_AI_STEPS_PER_TICK,
+        replay_store: NetworkReplayStore | None = None,
         room_limit: int = MAX_ROOMS,
     ) -> None:
-        if not callable(game_factory) or not callable(command_applier) or not callable(snapshot_builder):
+        if (
+            not callable(game_factory)
+            or not callable(command_applier)
+            or not callable(snapshot_builder)
+            or not callable(ai_stepper)
+        ):
             raise ValueError("controller dependencies must be callable")
+        if replay_store is not None and not all(
+            callable(getattr(replay_store, method, None))
+            for method in (
+                "capture_game",
+                "frame_payload",
+                "result_payload",
+                "discard_room",
+            )
+        ):
+            raise ValueError("replay_store does not implement the replay contract")
+        if (
+            type(ai_steps_per_tick) is not int
+            or not 1 <= ai_steps_per_tick <= MAX_AI_STEPS_PER_TICK
+        ):
+            raise ValueError(f"ai_steps_per_tick must be 1..{MAX_AI_STEPS_PER_TICK}")
         if type(room_limit) is not int or not 1 <= room_limit <= 256:
             raise ValueError("room_limit must be 1..256")
         self._game_factory = game_factory
         self._command_applier = command_applier
         self._snapshot_builder = snapshot_builder
+        self._ai_stepper = ai_stepper
+        self._ai_steps_per_tick = ai_steps_per_tick
+        self._replay_store = (
+            NetworkReplayStore() if replay_store is None else replay_store
+        )
         self._room_limit = room_limit
         self._rooms: dict[str, _RoomContext] = {}
         self._sessions: dict[str, _Session] = {}
@@ -198,7 +241,9 @@ class LanServerController:
                         self._wire("pong", nonce=self._safe_nonce(message["nonce"])),
                     ),
                 )
-            raise LanControllerError("unsupported_message", "未対応のLANメッセージです。")
+            raise LanControllerError(
+                "unsupported_message", "未対応のLANメッセージです。"
+            )
         except (LanControllerError, LobbyError, NetworkProtocolError) as exc:
             code, detail = self._public_error(exc)
             return (
@@ -242,7 +287,7 @@ class LanServerController:
         return self._broadcast_lobby(context)
 
     def tick(self) -> tuple[OutboundMessage, ...]:
-        """Prune expired reservations and broadcast rooms that changed."""
+        """Maintain rooms and advance authoritative AI by bounded steps."""
 
         outbound = []
         for room_code, context in tuple(self._rooms.items()):
@@ -262,15 +307,18 @@ class LanServerController:
                 for session in sessions:
                     self._sessions.pop(session.connection_id, None)
                 self._rooms.pop(room_code, None)
+                self._discard_replay(room_code)
                 continue
-            if not context.lobby.prune_expired():
-                continue
-            if not context.lobby.public_snapshot()["members"]:
-                self._rooms.pop(room_code, None)
-                for session in self._room_sessions(room_code):
-                    self._sessions.pop(session.connection_id, None)
-                continue
-            outbound.extend(self._broadcast_lobby(context))
+            pruned = context.lobby.prune_expired()
+            if pruned:
+                if not context.lobby.has_members:
+                    self._rooms.pop(room_code, None)
+                    for session in self._room_sessions(room_code):
+                        self._sessions.pop(session.connection_id, None)
+                    self._discard_replay(room_code)
+                    continue
+                outbound.extend(self._broadcast_lobby(context))
+            outbound.extend(self._advance_ai(context))
         return tuple(outbound)
 
     def snapshot_for_connection(self, connection_id: str | int) -> dict[str, Any]:
@@ -279,8 +327,36 @@ class LanServerController:
         session = self._require_session(self._connection_key(connection_id))
         context = self._rooms[session.room_code]
         if context.game is None:
-            raise LanControllerError("game_not_started", "対局はまだ開始されていません。")
+            raise LanControllerError(
+                "game_not_started", "対局はまだ開始されていません。"
+            )
         return self._snapshot_for(context, session)
+
+    def replay_frame_for_connection(
+        self,
+        connection_id: str | int,
+        frame_index: int,
+    ) -> dict[str, Any]:
+        """Return one read-only replay frame for the authenticated viewer."""
+
+        session = self._require_session(self._connection_key(connection_id))
+        return self._replay_store.frame_payload(
+            session.room_code,
+            viewer_player_index=session.seat_index,
+            frame_index=frame_index,
+        )
+
+    def match_result_for_connection(
+        self,
+        connection_id: str | int,
+    ) -> dict[str, Any]:
+        """Return the public result and replay manifest for one room member."""
+
+        session = self._require_session(self._connection_key(connection_id))
+        return self._replay_store.result_payload(
+            session.room_code,
+            viewer_player_index=session.seat_index,
+        )
 
     def _create_room(
         self,
@@ -296,7 +372,9 @@ class LanServerController:
         )
         self._require_unattached(connection_id)
         if len(self._rooms) >= self._room_limit:
-            raise LanControllerError("server_full", "このLANサーバーは部屋数の上限です。")
+            raise LanControllerError(
+                "server_full", "このLANサーバーは部屋数の上限です。"
+            )
         raw_settings = message["settings"]
         if type(raw_settings) is not dict:
             raise LanControllerError("invalid_request", "settingsが不正です。")
@@ -306,7 +384,12 @@ class LanServerController:
             "board_mode",
             "board_seed",
         }
-        optional_settings = {"custom_map", "house_rules"}
+        optional_settings = {
+            "ai_player_count",
+            "ai_personality_mode",
+            "custom_map",
+            "house_rules",
+        }
         if not required_settings.issubset(raw_settings) or not set(
             raw_settings
         ).issubset(required_settings | optional_settings):
@@ -417,10 +500,7 @@ class LanServerController:
         self._expect_fields(message, "type", "protocol_version")
         session = self._require_session(connection_id)
         context = self._rooms[session.room_code]
-        if (
-            context.lobby.phase is RoomPhase.STARTED
-            and session.seat_index is not None
-        ):
+        if context.lobby.phase is RoomPhase.STARTED and session.seat_index is not None:
             closed = self._wire(
                 "room_closed",
                 code="player_left",
@@ -430,14 +510,16 @@ class LanServerController:
             for room_session in sessions:
                 self._sessions.pop(room_session.connection_id, None)
             self._rooms.pop(session.room_code, None)
+            self._discard_replay(session.room_code)
             return tuple(
                 OutboundMessage(room_session.connection_id, closed)
                 for room_session in sessions
             )
         context.lobby.leave(connection_id)
         self._sessions.pop(connection_id, None)
-        if not context.lobby.public_snapshot()["members"]:
+        if not context.lobby.has_members:
             self._rooms.pop(session.room_code, None)
+            self._discard_replay(session.room_code)
             return ()
         return self._broadcast_lobby(context)
 
@@ -478,6 +560,7 @@ class LanServerController:
         context.game = game
         context.random_state = match_random_state
         context.game_revision = 0
+        self._capture_replay(context)
         outbound = list(self._broadcast_lobby(context))
         outbound.extend(game_snapshots)
         return tuple(outbound)
@@ -507,7 +590,9 @@ class LanServerController:
         session = self._require_session(connection_id)
         context = self._rooms[session.room_code]
         if context.game is None:
-            raise LanControllerError("game_not_started", "対局はまだ開始されていません。")
+            raise LanControllerError(
+                "game_not_started", "対局はまだ開始されていません。"
+            )
         seat = context.lobby.require_player_seat(connection_id) - 1
         command_state = context.command_states.setdefault(
             session.member_id,
@@ -656,6 +741,7 @@ class LanServerController:
 
         context.random_state = applied_random_state
         context.game_revision = next_revision
+        self._capture_replay(context)
         response = self._command_result(
             sequence,
             accepted=True,
@@ -683,9 +769,7 @@ class LanServerController:
                 reconnect_token=grant.reconnect_token,
                 lobby_revision=context.lobby.revision,
                 next_sequence=(
-                    command_state.next_sequence
-                    if command_state is not None
-                    else 0
+                    command_state.next_sequence if command_state is not None else 0
                 ),
             ),
         )
@@ -710,6 +794,102 @@ class LanServerController:
             context.game,
             revision=context.game_revision,
         )
+
+    def _advance_ai(self, context: _RoomContext) -> tuple[OutboundMessage, ...]:
+        """Apply a small, observable AI slice without exposing process RNG.
+
+        The default is one decision per server tick so LAN and browser clients
+        can display the AI's latest status/event instead of jumping over an
+        entire turn.  The configurable upper bound exists for headless tests
+        and future accelerated spectator modes.
+        """
+
+        outbound: list[OutboundMessage] = []
+        for _step_index in range(self._ai_steps_per_tick):
+            game = context.game
+            if game is None or not self._is_ai_action_pending(game):
+                break
+            random_state_before = context.random_state
+            try:
+                game_state_before = serialize_game(game)
+            except Exception:
+                break
+
+            changed = False
+            applied_random_state = random_state_before
+            with _RANDOM_LOCK:
+                caller_state = random.getstate()
+                try:
+                    if random_state_before is not None:
+                        random.setstate(random_state_before)
+                    try:
+                        changed = self._ai_stepper(game) is True
+                    except Exception:
+                        changed = False
+                    else:
+                        if changed:
+                            applied_random_state = random.getstate()
+                finally:
+                    random.setstate(caller_state)
+
+            if not changed:
+                self._rollback_game(
+                    context,
+                    game_state_before,
+                    random_state_before,
+                )
+                break
+
+            next_revision = context.game_revision + 1
+            try:
+                snapshots = self._snapshot_messages_for_game(
+                    context,
+                    game,
+                    revision=next_revision,
+                )
+            except Exception:
+                self._rollback_game(
+                    context,
+                    game_state_before,
+                    random_state_before,
+                )
+                break
+            context.random_state = applied_random_state
+            context.game_revision = next_revision
+            self._capture_replay(context)
+            outbound.extend(snapshots)
+        return tuple(outbound)
+
+    def _capture_replay(self, context: _RoomContext) -> bool:
+        """Best-effort archive capture that can never roll back live play."""
+
+        if context.game is None:
+            return False
+        try:
+            self._replay_store.capture_game(
+                context.lobby.room_code,
+                context.game,
+                revision=context.game_revision,
+            )
+        except Exception:
+            return False
+        return True
+
+    def _discard_replay(self, room_code: str) -> None:
+        try:
+            self._replay_store.discard_room(room_code)
+        except Exception:
+            pass
+
+    @staticmethod
+    def _is_ai_action_pending(game: Any) -> bool:
+        is_locked = getattr(game, "is_ai_input_locked", None)
+        if not callable(is_locked):
+            return False
+        try:
+            return is_locked() is True
+        except Exception:
+            return False
 
     def _snapshot_messages_for_game(
         self,
@@ -833,8 +1013,7 @@ class LanServerController:
     def _new_room_code(self) -> str:
         for _ in range(32):
             code = "".join(
-                secrets.choice(ROOM_CODE_ALPHABET)
-                for _ in range(ROOM_CODE_LENGTH)
+                secrets.choice(ROOM_CODE_ALPHABET) for _ in range(ROOM_CODE_LENGTH)
             )
             if code not in self._rooms:
                 return code
@@ -856,7 +1035,9 @@ class LanServerController:
 
     def _require_unattached(self, connection_id: str) -> None:
         if connection_id in self._sessions:
-            raise LanControllerError("already_joined", "この接続は既に部屋へ参加しています。")
+            raise LanControllerError(
+                "already_joined", "この接続は既に部屋へ参加しています。"
+            )
 
     @staticmethod
     def _player_names(lobby: LobbyRoom) -> tuple[str, ...]:
@@ -921,7 +1102,9 @@ class LanServerController:
     @staticmethod
     def _validate_envelope(message: Mapping[str, Any]) -> str:
         if type(message) is not dict:
-            raise LanControllerError("invalid_request", "LANメッセージはobjectで指定してください。")
+            raise LanControllerError(
+                "invalid_request", "LANメッセージはobjectで指定してください。"
+            )
         protocol_version = message.get("protocol_version")
         if (
             type(protocol_version) is not int
