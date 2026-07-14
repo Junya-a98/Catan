@@ -1,7 +1,7 @@
 PYTHON ?= .venv/bin/python
 PYTEST_ENV = PYTHONPATH=python SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy PYGAME_HIDE_SUPPORT_PROMPT=1
 
-.PHONY: venv install-dev run simulate test
+.PHONY: venv install-dev run web simulate test
 
 venv:
 	python3 -m venv .venv
@@ -12,6 +12,9 @@ install-dev:
 
 run:
 	PYTHONPATH=python PYGAME_HIDE_SUPPORT_PROMPT=1 $(PYTHON) python/main.py
+
+web:
+	PYTHONPATH=python PYGAME_HIDE_SUPPORT_PROMPT=1 $(PYTHON) python/web_main.py
 
 simulate:
 	PYTHONPATH=python PYGAME_HIDE_SUPPORT_PROMPT=1 $(PYTHON) python/simulate.py
