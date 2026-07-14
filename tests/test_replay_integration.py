@@ -10,6 +10,7 @@ import pytest
 
 from game.game import CatanGame
 from game.persistence import serialize_game
+from game.replay import ReplayRecorder
 from game.resources import ResourceType
 
 
@@ -130,16 +131,85 @@ def test_victory_auto_saves_replay_and_finished_screen_can_open_it(game, tmp_pat
     assert game.latest_replay_path.exists()
     assert game.replay_archive is not None
     assert game.replay_archive.frames[-1].label == f"{player.name}の勝利"
+    assert game.match_result["winner"]["name"] == player.name
+    victory_event_index = next(
+        index
+        for index, item in enumerate(game.match_result["important_events"])
+        if "勝利" in item["title"]
+    )
+    victory_frame = game.match_result["important_events"][victory_event_index][
+        "replay_frame_index"
+    ]
     replay_button = next(
         button for button in game.build_buttons() if button.action == "replay_open"
     )
     assert replay_button.enabled is True
 
-    assert game.start_replay() is True
+    game.result_selected_event_index = victory_event_index
+    game.render()
+    assert game.result_display_layout is not None
+    assert game.handle_match_result_action("replay_selected_event") is True
     assert game.replay_mode is True
+    assert game.replay_index == victory_frame
     game.render()
     assert game.exit_replay() is True
     assert game.phase == "finished"
+
+
+def test_quick_load_unlinks_events_from_the_previous_replay_epoch(game, tmp_path):
+    game.quick_save_path = tmp_path / "match.json"
+    for index in range(3):
+        game.record_event(f"OLD盗賊{index}", "旧リプレイ")
+        assert game.flush_replay_capture() is True
+    assert game.quick_save() is True
+
+    assert game.quick_load() is True
+
+    old_events = [
+        event
+        for event in game.match_metrics.important_events
+        if event.title.startswith("OLD盗賊")
+    ]
+    assert len(old_events) == 3
+    assert all(event.replay_frame_index is None for event in old_events)
+    assert len(game.replay_recorder.frames) == 1
+
+    game.record_event("NEW盗賊", "新リプレイ")
+    assert game.flush_replay_capture() is True
+    assert game.match_metrics.important_events[-1].replay_frame_index == 1
+
+
+def test_replacing_the_last_replay_frame_unlinks_the_displaced_event(
+    game,
+    tmp_path,
+):
+    game.replay_dir = tmp_path / "replays"
+    game.reset_match_metrics()
+    game.replay_recorder = ReplayRecorder(max_frames=2)
+    first = game.replay_recorder.capture(game, label="対局準備", elapsed_ms=0)
+    game.record_match_progress(first.label, first.sequence)
+    game.record_event("旧盗賊イベント", "置換前")
+    assert game.flush_replay_capture() is True
+    assert game.match_metrics.important_events[-1].replay_frame_index == 1
+
+    game.phase = "main"
+    player = game.get_current_player()
+    player.victory_point_cards = game.victory_point_target
+    game.check_for_winner(player)
+
+    old_event = next(
+        event
+        for event in game.match_metrics.important_events
+        if event.title == "旧盗賊イベント"
+    )
+    victory_event = game.match_metrics.important_events[-1]
+    assert old_event.replay_frame_index is None
+    assert "勝利" in victory_event.title
+    assert victory_event.replay_frame_index == 1
+    assert [frame.label for frame in game.replay_archive.frames] == [
+        "対局準備",
+        f"{player.name}の勝利",
+    ]
 
 
 def test_autoplay_stops_safely_on_a_semantically_broken_frame(game):

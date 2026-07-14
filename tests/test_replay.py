@@ -95,6 +95,30 @@ def test_replay_is_versioned_compact_atomic_and_latest_is_discoverable(
     assert find_latest_replay(replay_dir) == second_path
 
 
+def test_replay_frames_keep_fixed_size_metrics_without_cumulative_histories(game):
+    recorder = ReplayRecorder(max_frames=120)
+    for index in range(120):
+        game.match_metrics.record_important_event(f"イベント{index}", "確認")
+        game.match_metrics.record_point_checkpoint(
+            f"得点{index}",
+            {"seat-1": index % 10, "seat-2": 2},
+        )
+        recorder.capture(game, label=f"frame-{index}", elapsed_ms=index)
+
+    document = recorder.archive().to_document()
+    encoded = json.dumps(document, ensure_ascii=False).encode("utf-8")
+
+    assert len(encoded) < 2 * 1024 * 1024
+    for frame in document["frames"]:
+        metrics = frame["snapshot"]["match_metrics"]
+        assert metrics["point_checkpoints"] == []
+        assert metrics["important_events"] == []
+        assert [player["player_id"] for player in metrics["players"]] == [
+            "seat-1",
+            "seat-2",
+        ]
+
+
 def test_load_validates_frames_without_changing_current_game_and_can_restore(
     game,
     tmp_path,

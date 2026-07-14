@@ -52,6 +52,8 @@ from game.game_board import GameBoard
 from game.guidance import GuidanceState, build_action_mode_guidance, build_help_panel_content, build_side_panel_guidance
 from game.hex_tile import get_token_pip_count
 from game.log_display import draw_log, draw_resource_counts
+from game.match_metrics import MatchMetrics
+from game.match_result import build_match_result
 from game.persistence import (
     DEFAULT_SAVE_PATH,
     SaveGameError,
@@ -70,6 +72,16 @@ from game.replay import (
     find_latest_replay,
     load_replay,
     restore_replay_frame,
+)
+from game.result_display import (
+    NEW_BOARD_ACTION,
+    REPLAY_SELECTED_ACTION,
+    RESTART_SAME_BOARD_ACTION,
+    build_result_display_layout,
+    draw_result_display,
+    hit_test_result_display,
+    normalise_match_result,
+    selected_replay_frame,
 )
 from game.ui import (
     RESOURCE_LABELS,
@@ -174,6 +186,10 @@ class CatanGame:
         }
         self.last_resource_distribution = {}
         self.public_gain_history = {}
+        self.match_metrics = MatchMetrics()
+        self.match_result = None
+        self.result_display_layout = None
+        self.result_selected_event_index = 0
         if not self.headless:
             self.audio.start_bgm()
 
@@ -299,6 +315,104 @@ class CatanGame:
             # The actual snapshot is deferred until the action method returns.
             # Several flows set their special phase immediately after logging.
             self.replay_pending_capture = title
+        elif capture_replay and not self.replay_mode:
+            self.record_match_progress(title, None)
+
+    def reset_match_metrics(self):
+        """Start a clean, transport-safe statistics record for this match."""
+
+        self.match_metrics = MatchMetrics()
+        for index, player in enumerate(self.players, start=1):
+            self.match_metrics.register_player(f"seat-{index}", player.name)
+        self.match_result = None
+        self.result_display_layout = None
+        self.result_selected_event_index = 0
+
+    def get_match_metric_player_id(self, player):
+        """Return a stable seat identity that survives display-name changes."""
+
+        try:
+            return f"seat-{self.players.index(player) + 1}"
+        except ValueError:
+            return str(getattr(player, "name", player))
+
+    def unlink_match_replay_frames(self):
+        """Keep cumulative metrics while detaching links from an old recorder."""
+
+        document = self.match_metrics.to_dict()
+        display_names = {
+            f"seat-{index}": player.name
+            for index, player in enumerate(self.players, start=1)
+        }
+        for player_data in document.get("players", []):
+            player_id = player_data.get("player_id")
+            if player_id in display_names:
+                player_data["display_name"] = display_names[player_id]
+        for checkpoint in document.get("point_checkpoints", []):
+            checkpoint["replay_frame_index"] = None
+        for event in document.get("important_events", []):
+            event["replay_frame_index"] = None
+        self.match_metrics = MatchMetrics.from_dict(document)
+        self.match_result = None
+        self.result_display_layout = None
+
+    def unlink_match_replay_frame(self, frame_index):
+        """Detach metrics that pointed at a replay frame being replaced."""
+
+        document = self.match_metrics.to_dict()
+        changed = False
+        for section in ("point_checkpoints", "important_events"):
+            for item in document.get(section, []):
+                if item.get("replay_frame_index") == frame_index:
+                    item["replay_frame_index"] = None
+                    changed = True
+        if changed:
+            self.match_metrics = MatchMetrics.from_dict(document)
+
+    def record_match_progress(self, label, replay_frame_index):
+        """Attach score changes and highlights to a stable replay frame."""
+
+        if self.replay_mode or not self.players:
+            return
+        points = {
+            self.get_match_metric_player_id(player): self.get_player_victory_points(player)
+            for player in self.players
+        }
+        checkpoints = self.match_metrics.point_checkpoints
+        points_changed = not checkpoints or checkpoints[-1].points != points
+        detail = str(self.latest_event.get("detail", ""))
+        if points_changed:
+            self.match_metrics.record_point_checkpoint(
+                str(label) or "得点更新",
+                points,
+                detail=detail,
+                replay_frame_index=replay_frame_index,
+            )
+
+        important_terms = (
+            "勝利",
+            "開拓地",
+            "都市",
+            "交易成立",
+            "騎士",
+            "略奪",
+            "盗賊",
+        )
+        is_important = points_changed or any(term in str(label) for term in important_terms)
+        if not is_important or str(label) == "対局準備":
+            return
+        events = self.match_metrics.important_events
+        if (
+            events
+            and events[-1].replay_frame_index == replay_frame_index
+            and events[-1].title == str(label)
+        ):
+            return
+        self.match_metrics.record_important_event(
+            str(label) or "重要イベント",
+            detail,
+            replay_frame_index=replay_frame_index,
+        )
 
     def refresh_latest_replay_path(self):
         if self.headless:
@@ -323,10 +437,11 @@ class CatanGame:
         self.replay_pending_capture = None
         self.replay_archive = None
         try:
-            self.replay_recorder.capture(self, label="対局準備", elapsed_ms=0)
+            frame = self.replay_recorder.capture(self, label="対局準備", elapsed_ms=0)
         except ReplayError:
             self.replay_recorder = None
             return False
+        self.record_match_progress(frame.label, frame.sequence)
         return True
 
     def flush_replay_capture(self, *, force_latest=False):
@@ -342,8 +457,12 @@ class CatanGame:
             return False
         label = self.replay_pending_capture
         self.replay_pending_capture = None
+        replacing_last = bool(
+            force_latest
+            and len(self.replay_recorder.frames) >= self.replay_recorder.max_frames
+        )
         try:
-            self.replay_recorder.capture(
+            frame = self.replay_recorder.capture(
                 self,
                 label=label,
                 replace_last_if_full=force_latest,
@@ -351,6 +470,9 @@ class CatanGame:
         except ReplayError as exc:
             self.add_log(f"リプレイ記録を継続できません: {exc}")
             return False
+        if replacing_last:
+            self.unlink_match_replay_frame(frame.sequence)
+        self.record_match_progress(frame.label, frame.sequence)
         return True
 
     def save_completed_replay(self):
@@ -366,6 +488,100 @@ class CatanGame:
         self.latest_replay_path = path
         self.add_log(f"リプレイを保存しました: {path.name}")
         return path
+
+    def refresh_match_result(self):
+        """Rebuild the public result payload used by desktop and future clients."""
+
+        if self.phase != "finished":
+            self.match_result = None
+            self.result_display_layout = None
+            return None
+        self.match_result = build_match_result(self, replay=self.replay_archive)
+        replay_frame_count = (
+            len(self.replay_archive.frames)
+            if self.replay_archive is not None
+            else 0
+        )
+        self.match_result["replay"] = {
+            "available": replay_frame_count > 0,
+            "frame_count": replay_frame_count,
+        }
+        result = normalise_match_result(self.match_result)
+        if result.important_events:
+            self.result_selected_event_index = max(
+                0,
+                min(
+                    self.result_selected_event_index,
+                    len(result.important_events) - 1,
+                ),
+            )
+        else:
+            self.result_selected_event_index = 0
+        self.result_display_layout = self.build_match_result_layout()
+        return self.match_result
+
+    def build_match_result_layout(self):
+        if self.match_result is None or self.screen is None:
+            return None
+        result = normalise_match_result(self.match_result)
+        replay_frame = selected_replay_frame(
+            self.match_result,
+            self.result_selected_event_index,
+        )
+        return build_result_display_layout(
+            self.screen.get_size(),
+            len(result.players),
+            len(result.important_events),
+            self.result_selected_event_index,
+            replay_enabled=replay_frame is not None,
+        )
+
+    def move_result_selection(self, delta):
+        if self.match_result is None:
+            self.refresh_match_result()
+        if self.match_result is None:
+            return False
+        events = normalise_match_result(self.match_result).important_events
+        if not events:
+            return False
+        self.result_selected_event_index = max(
+            0,
+            min(
+                self.result_selected_event_index + int(delta),
+                len(events) - 1,
+            ),
+        )
+        self.result_display_layout = self.build_match_result_layout()
+        return True
+
+    def handle_match_result_action(self, action):
+        if action == REPLAY_SELECTED_ACTION:
+            if self.match_result is None:
+                self.refresh_match_result()
+            frame_index = selected_replay_frame(
+                self.match_result,
+                self.result_selected_event_index,
+            )
+            if frame_index is None:
+                self.notify_invalid("このイベントには対応するリプレイ位置がありません。")
+                return False
+            archive = self.replay_archive
+            if (
+                archive is None
+                or not 0 <= frame_index < len(archive.frames)
+            ):
+                self.notify_invalid("この対局のリプレイ位置を確認できません。")
+                return False
+            if not self.start_replay(archive):
+                return False
+            return self.show_replay_frame(frame_index)
+        if action == RESTART_SAME_BOARD_ACTION:
+            self.restart_game(randomize_seed=False)
+            return True
+        if action == NEW_BOARD_ACTION:
+            self.restart_game(randomize_seed=True)
+            return True
+        return False
 
     def get_current_replay_frame(self):
         if self.replay_archive is None or not self.replay_archive.frames:
@@ -743,6 +959,7 @@ class CatanGame:
             self.notify_invalid(str(exc))
             return False
         self.log_scroll_offset = 0
+        self.unlink_match_replay_frames()
         self.reset_replay_recording()
         self.record_event(
             "クイックロード完了",
@@ -1092,6 +1309,7 @@ class CatanGame:
             if is_ai:
                 cpu_index += 1
         self.assign_ai_personalities()
+        self.reset_match_metrics()
         self.public_gain_history = {player.name: [] for player in self.players}
         self.last_resource_distribution = {}
         self.ai_status = {
@@ -2851,6 +3069,10 @@ class CatanGame:
             level="success",
             actor=active_player,
         )
+        self.match_metrics.record_domestic_trade(
+            self.get_match_metric_player_id(active_player),
+            self.get_match_metric_player_id(partner),
+        )
         self.finish_domestic_trade(previous_viewer=previous_viewer)
         return True
 
@@ -2962,6 +3184,9 @@ class CatanGame:
                 f"{RESOURCE_LABELS[give_resource]} -{required} / {RESOURCE_LABELS[resource_type]} +1",
                 level="success",
                 actor=player,
+            )
+            self.match_metrics.record_bank_trade(
+                self.get_match_metric_player_id(player)
             )
             self.special_phase = None
             self.bank_trade_give_resource = None
@@ -3591,6 +3816,9 @@ class CatanGame:
 
         current_player.roads_remaining -= 1
         self.board.roads.append(Road(current_player, node1, node2))
+        self.match_metrics.record_build(
+            self.get_match_metric_player_id(current_player), "road"
+        )
         self.free_roads_remaining -= 1
         self.play_sound("road")
         self.add_log(
@@ -3735,6 +3963,7 @@ class CatanGame:
         current_player = self.get_current_player()
         player_name = current_player.name if current_player is not None else "プレイヤー"
         self.add_log(f"{player_name} のダイスの目: {dice_roll}")
+        self.record_dice_luck(dice_roll)
         if dice_roll == 7:
             self.record_event(
                 f"{current_player.name}のダイス: 7",
@@ -3766,6 +3995,33 @@ class CatanGame:
         self.dice_rolled = True
         if current_player is not None and current_player.is_ai:
             self.schedule_ai_action(1.6)
+
+    def record_dice_luck(self, dice_roll):
+        """Compare this roll's production with each player's statistical mean.
+
+        Bank shortages are deliberately excluded: the index measures dice luck,
+        not whether the shared bank happened to run out of a resource.
+        """
+
+        for player in self.players:
+            expected_units = 0.0
+            actual_units = 0
+            for node in self.board.nodes:
+                building = node.building
+                if building is None or building.owner is not player:
+                    continue
+                multiplier = building.resource_multiplier
+                for tile in node.tiles:
+                    if tile is self.board.robber_tile:
+                        continue
+                    expected_units += get_token_pip_count(tile.number) * multiplier / 36.0
+                    if tile.number == dice_roll:
+                        actual_units += multiplier
+            self.match_metrics.record_production(
+                self.get_match_metric_player_id(player),
+                actual_units=actual_units,
+                expected_units=expected_units,
+            )
 
     def advance_initial_phase(self, current_player):
         self.add_log(f"{current_player.name} の初期配置が完了しました。")
@@ -3844,6 +4100,9 @@ class CatanGame:
 
             current_player.settlements_remaining -= 1
             closest_node.building = Building(current_player)
+            self.match_metrics.record_build(
+                self.get_match_metric_player_id(current_player), "settlement"
+            )
             self.play_sound("build")
             self.add_log(
                 f"{current_player.name} が ({closest_node.x:.1f}, {closest_node.y:.1f}) に"
@@ -3879,6 +4138,9 @@ class CatanGame:
         current_player.roads_remaining -= 1
         new_road = Road(current_player, self.last_settlement_node, candidate_node)
         self.board.roads.append(new_road)
+        self.match_metrics.record_build(
+            self.get_match_metric_player_id(current_player), "road"
+        )
         self.play_sound("road")
         self.add_log(
             f"{current_player.name} が ({self.last_settlement_node.x:.1f}, {self.last_settlement_node.y:.1f}) から"
@@ -4005,6 +4267,9 @@ class CatanGame:
         self.pay_resource_cost(current_player, BUILD_COSTS["settlement"])
         current_player.settlements_remaining -= 1
         closest_node.building = Building(current_player)
+        self.match_metrics.record_build(
+            self.get_match_metric_player_id(current_player), "settlement"
+        )
         self.action_mode = None
         self.feedback.clear()
         self.play_sound("build")
@@ -4042,6 +4307,9 @@ class CatanGame:
         current_player.cities_remaining -= 1
         current_player.settlements_remaining += 1
         closest_node.building.upgrade_to_city()
+        self.match_metrics.record_build(
+            self.get_match_metric_player_id(current_player), "city"
+        )
         self.action_mode = None
         self.feedback.clear()
         self.play_sound("build")
@@ -4078,6 +4346,9 @@ class CatanGame:
         self.pay_resource_cost(current_player, BUILD_COSTS["road"])
         current_player.roads_remaining -= 1
         self.board.roads.append(Road(current_player, node1, node2))
+        self.match_metrics.record_build(
+            self.get_match_metric_player_id(current_player), "road"
+        )
         self.action_mode = None
         self.feedback.clear()
         self.play_sound("road")
@@ -4177,6 +4448,11 @@ class CatanGame:
     def check_for_winner(self, player):
         if self.phase != "main":
             return
+        if self.replay_recorder is None and not self.replay_mode:
+            self.record_match_progress(
+                self.latest_event.get("title", "得点更新"),
+                None,
+            )
         points = self.get_player_victory_points(player)
         if points >= self.victory_point_target:
             self.winner = player
@@ -4195,6 +4471,7 @@ class CatanGame:
             )
             self.flush_replay_capture(force_latest=True)
             self.save_completed_replay()
+            self.refresh_match_result()
 
     def is_ai_input_locked(self):
         if self.special_phase == "player_handoff":
@@ -4241,14 +4518,44 @@ class CatanGame:
                 continue
 
             if self.phase == "finished":
-                if event.type == pygame.KEYDOWN and event.key == pygame.K_r:
-                    self.restart_game(randomize_seed=False)
+                if self.show_log_panel or self.show_help_panel:
+                    continue
+                if event.type == pygame.MOUSEWHEEL:
+                    self.move_result_selection(-event.y)
+                elif event.type == pygame.KEYDOWN and event.key in (
+                    pygame.K_UP,
+                    pygame.K_LEFT,
+                ):
+                    self.move_result_selection(-1)
+                elif event.type == pygame.KEYDOWN and event.key in (
+                    pygame.K_DOWN,
+                    pygame.K_RIGHT,
+                ):
+                    self.move_result_selection(1)
+                elif event.type == pygame.KEYDOWN and event.key in (
+                    pygame.K_RETURN,
+                    pygame.K_SPACE,
+                ):
+                    self.handle_match_result_action(REPLAY_SELECTED_ACTION)
+                elif event.type == pygame.KEYDOWN and event.key == pygame.K_r:
+                    self.handle_match_result_action(RESTART_SAME_BOARD_ACTION)
                 elif event.type == pygame.KEYDOWN and event.key == pygame.K_n:
-                    self.restart_game(randomize_seed=True)
+                    self.handle_match_result_action(NEW_BOARD_ACTION)
                 elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
-                    clicked_button = self.find_clicked_button(event.pos)
-                    if clicked_button is not None:
-                        self.handle_button_action(clicked_button.action)
+                    if self.match_result is None:
+                        self.refresh_match_result()
+                    if self.result_display_layout is None:
+                        self.result_display_layout = self.build_match_result_layout()
+                    if self.result_display_layout is not None:
+                        target = hit_test_result_display(
+                            self.result_display_layout,
+                            event.pos,
+                        )
+                        if target is not None and target.kind == "event":
+                            self.result_selected_event_index = target.event_index
+                            self.result_display_layout = self.build_match_result_layout()
+                        elif target is not None and target.kind == "action":
+                            self.handle_match_result_action(target.action)
                 continue
 
             if self.has_active_dice_animation():
@@ -4441,6 +4748,39 @@ class CatanGame:
         if self.headless:
             raise RuntimeError("ヘッドレスゲームは描画できません。")
         self.buttons = self.build_buttons()
+        if self.phase == "finished" and not self.replay_mode:
+            if self.match_result is None:
+                self.refresh_match_result()
+            self.result_display_layout = draw_result_display(
+                self.screen,
+                self.match_result,
+                self.result_selected_event_index,
+            )
+            if self.show_help_panel:
+                draw_help_panel(
+                    self.screen,
+                    "リザルト操作",
+                    [
+                        "↑ / ↓ またはホイール: 重要イベントを選択",
+                        "Enter / Space: 選択イベントからリプレイ",
+                        "R: 同じ盤面で再戦 / N: 新しい盤面",
+                        "L: 対局ログを表示 / H: このヘルプを閉じる",
+                    ],
+                    "運指数は100が盤面確率どおりです。",
+                    collapsed=False,
+                )
+            if self.show_log_panel:
+                draw_log(
+                    self.screen,
+                    self.log_messages,
+                    panel_height=SCREEN_HEIGHT - 24,
+                    latest_event=self.latest_event,
+                    expanded=True,
+                    scroll_offset=self.log_scroll_offset,
+                )
+            draw_transient_message(self.screen, self.get_active_feedback())
+            pygame.display.flip()
+            return
         self.screen.fill(COLORS["BACKGROUND"])
         draw_ocean_background(self.screen)
         self.board.draw(self.screen)

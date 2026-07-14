@@ -18,6 +18,12 @@ from game.constants import (
 )
 from game.development_cards import DevelopmentCardType
 from game.game_board import GameBoard
+from game.match_metrics import (
+    MatchMetrics,
+    MatchMetricsError,
+    restore_match_metrics,
+    serialize_match_metrics,
+)
 from game.resources import ResourceType
 from game.road import Road
 
@@ -121,6 +127,29 @@ def _restore_refs(indices, objects, *, label):
     ]
 
 
+def _serialize_match_metrics(game):
+    """Return a valid metrics document, including for legacy test doubles."""
+
+    metrics = getattr(game, "match_metrics", None)
+    if metrics is None:
+        metrics = MatchMetrics()
+    try:
+        return serialize_match_metrics(metrics)
+    except (MatchMetricsError, TypeError, ValueError) as exc:
+        raise SaveGameError("対局メトリクスを保存できません。") from exc
+
+
+def _restore_match_metrics(data):
+    """Restore optional v1 metrics while keeping old saves compatible."""
+
+    if "match_metrics" not in data:
+        return MatchMetrics()
+    try:
+        return restore_match_metrics(data["match_metrics"])
+    except (MatchMetricsError, TypeError, ValueError) as exc:
+        raise SaveGameError("対局メトリクスが不正です。") from exc
+
+
 def serialize_game(game):
     players = list(game.players)
     nodes = list(game.board.nodes)
@@ -160,6 +189,7 @@ def serialize_game(game):
         "rules": {
             "victory_point_target": int(game.victory_point_target),
         },
+        "match_metrics": _serialize_match_metrics(game),
         "board": {
             "mode": game.board_mode,
             "seed": game.board_seed,
@@ -323,6 +353,7 @@ def _validate_save_header(data):
 
 def restore_game(game, data, *, runtime_side_effects=True):
     _validate_save_header(data)
+    restored_match_metrics = _restore_match_metrics(data)
     board_data = data["board"]
     player_data = data["players"]
     rules_data = data.get("rules", {})
@@ -631,6 +662,10 @@ def restore_game(game, data, *, runtime_side_effects=True):
         str(name): _resource_map_from_json(bundle, label="直前資源配布")
         for name, bundle in history_data.get("last_resource_distribution", {}).items()
     }
+    game.match_metrics = restored_match_metrics
+    game.match_result = None
+    game.result_display_layout = None
+    game.result_selected_event_index = 0
 
     game.ai_action_delay_ms = int(ai_data.get("action_delay_ms", game.ai_action_delay_ms))
     if game.ai_action_delay_ms < 0:

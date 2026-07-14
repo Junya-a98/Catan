@@ -206,3 +206,30 @@ def test_self_play_integrity_check_detects_piece_count_corruption():
         assert "CPU1: road pieces" in _validate_completed_state(game)
     finally:
         random.setstate(caller_state)
+
+
+def test_headless_player_renaming_keeps_stable_metric_seats_and_names():
+    caller_state = random.getstate()
+    try:
+        game = _prepare_game(
+            match_seed=11,
+            board_seed=22,
+            board_mode="constrained",
+            player_count=4,
+            victory_target=5,
+        )
+
+        assert [row.player_id for row in game.match_metrics.players] == [
+            "seat-1",
+            "seat-2",
+            "seat-3",
+            "seat-4",
+        ]
+        assert [row.display_name for row in game.match_metrics.players] == [
+            "CPU1",
+            "CPU2",
+            "CPU3",
+            "CPU4",
+        ]
+    finally:
+        random.setstate(caller_state)

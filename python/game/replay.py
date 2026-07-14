@@ -224,6 +224,19 @@ def compact_game_snapshot(game: Any) -> Dict[str, Any]:
     """
 
     snapshot = serialize_game(game)
+    match_metrics = snapshot.get("match_metrics")
+    if isinstance(match_metrics, dict):
+        # Cumulative timelines/events in every frame make a replay grow
+        # quadratically.  Per-player counters (including production luck) are
+        # fixed-size; score changes and highlights can be reconstructed from
+        # the semantic replay frames themselves.
+        snapshot["match_metrics"] = {
+            "format": match_metrics.get("format", "catan-match-metrics"),
+            "version": match_metrics.get("version", 1),
+            "players": copy.deepcopy(match_metrics.get("players", [])),
+            "point_checkpoints": [],
+            "important_events": [],
+        }
     development_deck = snapshot.get("development_deck")
     if isinstance(development_deck, list):
         snapshot["development_deck"] = sorted(development_deck)

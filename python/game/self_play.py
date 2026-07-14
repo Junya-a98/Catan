@@ -423,6 +423,7 @@ def _prepare_game(
         player.name = f"CPU{seat}"
         player.is_ai = True
         player.ai_personality = personality
+    game.reset_match_metrics()
     game.ai_player_count = player_count
     game.public_gain_history = {player.name: [] for player in game.players}
     game.last_resource_distribution = {}
