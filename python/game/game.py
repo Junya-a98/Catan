@@ -1,3 +1,5 @@
+from collections.abc import Mapping
+from dataclasses import asdict
 import random
 
 import pygame
@@ -52,6 +54,21 @@ from game.game_board import GameBoard
 from game.guidance import GuidanceState, build_action_mode_guidance, build_help_panel_content, build_side_panel_guidance
 from game.hex_tile import get_token_pip_count
 from game.log_display import draw_log, draw_resource_counts
+from game.lan_lobby_display import (
+    ACTION_BACK,
+    ACTION_CLOSE,
+    ACTION_LEAVE_ROOM,
+    ACTION_START_MATCH,
+    LanLobbyDisplayState,
+    draw_lan_lobby_display,
+    hit_test_lan_lobby_display,
+)
+from game.lan_lobby_flow import LanLobbyFlow
+from game.lan_match_display import (
+    LanMatchDisplayState,
+    draw_lan_match_display,
+    hit_test_lan_match_display,
+)
 from game.match_metrics import MatchMetrics
 from game.match_result import build_match_result
 from game.persistence import (
@@ -190,6 +207,12 @@ class CatanGame:
         self.match_result = None
         self.result_display_layout = None
         self.result_selected_event_index = 0
+        self.lan_lobby_flow = None
+        self.lan_lobby_layout = None
+        self.lan_match_layout = None
+        self.lan_selected_build_piece = None
+        self.lan_match_visible = False
+        self.lan_match_seen = False
         if not self.headless:
             self.audio.start_bgm()
 
@@ -1098,6 +1121,176 @@ class CatanGame:
             and self.pending_dice_roll is None
             and not self.has_active_dice_animation()
         )
+
+    def get_lan_room_settings(self):
+        """Return the current pre-game settings accepted by the LAN host."""
+
+        return {
+            "player_count": len(self.players),
+            "victory_target": self.victory_point_target,
+            "board_mode": self.board_mode,
+            "board_seed": self.board_seed,
+        }
+
+    @staticmethod
+    def copy_lan_room_code(text):
+        """Copy an ASCII room code through Pygame's platform clipboard."""
+
+        if not isinstance(text, str) or not text:
+            raise ValueError("コピーする参加コードがありません。")
+        pygame.scrap.init()
+        pygame.scrap.put(pygame.SCRAP_TEXT, text.encode("utf-8") + b"\0")
+
+    def open_lan_lobby(self):
+        if self.headless:
+            self.notify_invalid("ヘッドレス実行ではLANロビーを開けません。")
+            return False
+        if not self.can_edit_pre_game_settings():
+            self.notify_invalid("LAN対戦は初期ダイスを振る前に開始してください。")
+            return False
+        if self.lan_lobby_flow is None:
+            default_name = self.players[0].name if self.players else "Player"
+            self.lan_lobby_flow = LanLobbyFlow(
+                room_settings_provider=self.get_lan_room_settings,
+                clipboard_callback=self.copy_lan_room_code,
+                default_name=default_name,
+                default_address="0.0.0.0:47624",
+            )
+        self.lan_lobby_flow.open()
+        self.seed_input_active = False
+        self.lan_lobby_layout = None
+        self.lan_match_layout = None
+        self.lan_selected_build_piece = None
+        self.lan_match_visible = False
+        self.lan_match_seen = False
+        self.buttons = []
+        return True
+
+    def close_lan_lobby(self, *, permanent=False):
+        flow = self.lan_lobby_flow
+        if flow is None:
+            return False
+        if permanent:
+            flow.close()
+            self.lan_lobby_flow = None
+        else:
+            flow.leave_room(close_overlay=True)
+        self.lan_lobby_layout = None
+        self.lan_match_layout = None
+        self.lan_selected_build_piece = None
+        self.lan_match_visible = False
+        self.lan_match_seen = False
+        return True
+
+    def is_lan_overlay_open(self):
+        return bool(self.lan_lobby_flow and self.lan_lobby_flow.is_open)
+
+    def get_lan_lobby_display_state(self):
+        if self.lan_lobby_flow is None:
+            raise RuntimeError("LANロビーが初期化されていません。")
+        return LanLobbyDisplayState(**asdict(self.lan_lobby_flow.display_state))
+
+    def sync_lan_build_selection(self):
+        flow = self.lan_lobby_flow
+        if flow is None:
+            self.lan_selected_build_piece = None
+            return
+        available = {
+            option.get("args", {}).get("piece")
+            for option in flow.latest_command_options
+            if option.get("command") == "build"
+            and isinstance(option.get("args"), Mapping)
+        }
+        if self.lan_selected_build_piece not in available:
+            self.lan_selected_build_piece = None
+
+    def get_lan_match_display_state(self):
+        flow = self.lan_lobby_flow
+        if flow is None or flow.latest_game_view is None:
+            return None
+        self.sync_lan_build_selection()
+        flow_state = flow.display_state
+        return LanMatchDisplayState(
+            view=flow.latest_game_view,
+            command_options=(
+                () if flow.command_pending else flow.latest_command_options
+            ),
+            selected_build_piece=self.lan_selected_build_piece,
+            room_code=flow_state.room_code,
+            connected=flow.is_connected,
+            error=flow_state.error,
+        )
+
+    def handle_lan_event(self, event):
+        """Consume one Pygame event while the LAN overlay owns the screen."""
+
+        flow = self.lan_lobby_flow
+        if flow is None or not flow.is_open:
+            return False
+
+        showing_match = bool(
+            flow.match_active
+            and flow.mode == "connected"
+            and self.lan_match_visible
+        )
+        if showing_match:
+            if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
+                self.lan_match_visible = False
+                self.lan_match_layout = None
+                return True
+            if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                if flow.command_pending or self.lan_match_layout is None:
+                    return True
+                target = hit_test_lan_match_display(
+                    self.lan_match_layout,
+                    event.pos,
+                )
+                if target is None:
+                    return True
+                if target.kind == "select_build_piece":
+                    self.lan_selected_build_piece = target.build_piece
+                    return True
+                if target.kind == "command" and target.command is not None:
+                    flow.send_game_command(target.command, dict(target.args))
+                return True
+            return True
+
+        if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+            if self.lan_lobby_layout is None:
+                return True
+            target = hit_test_lan_lobby_display(self.lan_lobby_layout, event.pos)
+            if target is None:
+                return True
+            if target.action == ACTION_START_MATCH and flow.match_active:
+                self.lan_match_visible = True
+                return True
+            flow.handle_action(target.action)
+            return True
+
+        if event.type == pygame.TEXTINPUT:
+            flow.append_text(event.text)
+            return True
+
+        if event.type != pygame.KEYDOWN:
+            return True
+        if event.key == pygame.K_ESCAPE:
+            if flow.mode == "home":
+                flow.handle_action(ACTION_CLOSE)
+            elif flow.mode == "connected":
+                flow.handle_action(ACTION_LEAVE_ROOM)
+            else:
+                flow.handle_action(ACTION_BACK)
+            return True
+        if event.key == pygame.K_BACKSPACE:
+            flow.backspace()
+            return True
+        if event.key in (pygame.K_RETURN, pygame.K_KP_ENTER):
+            if flow.match_active and flow.mode == "connected":
+                self.lan_match_visible = True
+            else:
+                flow.submit()
+            return True
+        return True
 
     def rebuild_pre_game_board(self, *, announcement=None):
         if not self.can_edit_pre_game_settings():
@@ -2209,13 +2402,19 @@ class CatanGame:
                 and self.victory_point_target < MAX_VICTORY_POINT_TARGET,
             )
             replay_path = self.latest_replay_path
-            add_custom(
+            add(
+                "lan_lobby_open",
+                "LAN対戦",
+                7,
+                0,
+                enabled=settings_unlocked,
+                highlighted=True,
+            )
+            add(
                 "replay_open",
-                "直前の対局をリプレイ" if replay_path is not None else "保存済みリプレイなし",
-                base_x,
-                base_y + 7 * (button_height + gap_y),
-                available_width,
-                button_height,
+                "直前をリプレイ" if replay_path is not None else "リプレイなし",
+                7,
+                1,
                 enabled=replay_path is not None,
             )
             return buttons
@@ -3204,6 +3403,9 @@ class CatanGame:
         self.add_log("行動選択をキャンセルしました。")
 
     def handle_button_action(self, action):
+        if action == "lan_lobby_open":
+            self.open_lan_lobby()
+            return
         if action == "replay_open":
             self.start_replay()
             return
@@ -4504,10 +4706,14 @@ class CatanGame:
             self.ai_next_action_at = now + self.ai_action_delay_ms
 
     def handle_events(self):
-        self.buttons = self.build_buttons()
+        self.buttons = [] if self.is_lan_overlay_open() else self.build_buttons()
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 self.running = False
+                break
+
+            if self.is_lan_overlay_open():
+                self.handle_lan_event(event)
                 continue
 
             if self.replay_mode:
@@ -4735,6 +4941,14 @@ class CatanGame:
         return gain_summaries
 
     def update(self):
+        if self.is_lan_overlay_open():
+            self.lan_lobby_flow.update()
+            if self.lan_lobby_flow.match_active and not self.lan_match_seen:
+                self.lan_match_seen = True
+                self.lan_match_visible = True
+            self.sync_lan_build_selection()
+            self.buttons = []
+            return
         if self.replay_mode:
             self.update_replay()
             self.buttons = [] if self.headless else self.build_buttons()
@@ -4747,6 +4961,31 @@ class CatanGame:
     def render(self):
         if self.headless:
             raise RuntimeError("ヘッドレスゲームは描画できません。")
+        if self.is_lan_overlay_open():
+            flow = self.lan_lobby_flow
+            self.buttons = []
+            if (
+                flow.match_active
+                and flow.mode == "connected"
+                and self.lan_match_visible
+            ):
+                state = self.get_lan_match_display_state()
+                if state is not None:
+                    self.lan_match_layout = draw_lan_match_display(
+                        self.screen,
+                        state,
+                    )
+                    self.lan_lobby_layout = None
+                else:
+                    self.lan_match_layout = None
+            else:
+                self.lan_lobby_layout = draw_lan_lobby_display(
+                    self.screen,
+                    self.get_lan_lobby_display_state(),
+                )
+                self.lan_match_layout = None
+            pygame.display.flip()
+            return
         self.buttons = self.build_buttons()
         if self.phase == "finished" and not self.replay_mode:
             if self.match_result is None:
@@ -5023,13 +5262,19 @@ class CatanGame:
     def run(self):
         if self.headless:
             raise RuntimeError("ヘッドレスゲームは対話ループを開始できません。")
-        while self.running:
-            self.handle_events()
-            self.update()
-            self.render()
-            self.clock.tick(60)
-        self.audio.stop()
-        pygame.quit()
+        try:
+            while self.running:
+                self.handle_events()
+                if not self.running:
+                    break
+                self.update()
+                self.render()
+                self.clock.tick(60)
+        finally:
+            if self.lan_lobby_flow is not None:
+                self.close_lan_lobby(permanent=True)
+            self.audio.stop()
+            pygame.quit()
 
 
 if __name__ == "__main__":
