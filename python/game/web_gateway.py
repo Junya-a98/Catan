@@ -299,6 +299,8 @@ class WebGateway:
                 session.latest.pop("network_match_result", None)
             if message_type in _BOOTSTRAP_EVENT_TYPES:
                 session.latest[message_type] = deepcopy(message)
+            if message_type == "game_command_result":
+                self._advance_bootstrap_sequence(session, message)
             if message_type == "room_closed":
                 session.latest.pop("lobby_snapshot", None)
                 session.latest.pop("state_snapshot", None)
@@ -310,6 +312,31 @@ class WebGateway:
             )
         session.pending.append(message)
         self._bound_pending(session)
+
+    @staticmethod
+    def _advance_bootstrap_sequence(
+        session: _BrowserSession,
+        message: Mapping[str, Any],
+    ) -> None:
+        """Keep reload bootstrap aligned with the controller command cursor."""
+
+        welcome = session.latest.get("session_welcome")
+        sequence = message.get("sequence")
+        if not isinstance(welcome, dict) or isinstance(sequence, bool) or not isinstance(
+            sequence, int
+        ):
+            return
+        does_not_consume = {
+            "sequence_conflict",
+            "sequence_expired",
+            "sequence_gap",
+        }
+        if not message.get("accepted") and message.get("code") in does_not_consume:
+            return
+        current = welcome.get("next_sequence", 0)
+        if isinstance(current, bool) or not isinstance(current, int) or current < 0:
+            current = 0
+        welcome["next_sequence"] = max(current, sequence + 1)
 
     @staticmethod
     def _validate_replay_frame_request(message: Mapping[str, Any]) -> None:

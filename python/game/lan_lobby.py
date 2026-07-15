@@ -35,6 +35,7 @@ from game.ai_personality import (
 )
 from game.custom_map import CustomMapError, CustomMapSpec
 from game.house_rules import HouseRules
+from game.variant import VariantConfig
 
 
 __all__ = (
@@ -111,6 +112,7 @@ class RoomSettings:
     ai_personality_mode: str = STANDARD
     custom_map: CustomMapSpec | Mapping[str, Any] | None = None
     house_rules: HouseRules | Mapping[str, Any] | None = None
+    variant: VariantConfig | Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
         _bounded_int(self.player_count, "player_count", minimum=2, maximum=4)
@@ -162,11 +164,23 @@ class RoomSettings:
                 "house_rules must be a validated house-rule document"
             )
 
+        variant = self.variant
+        if isinstance(variant, Mapping) or variant is None:
+            try:
+                variant = VariantConfig.from_document(variant)
+            except ValueError as exc:
+                raise LobbyValidationError("variant is invalid") from exc
+        elif not isinstance(variant, VariantConfig):
+            raise LobbyValidationError(
+                "variant must be a validated variant document"
+            )
+
         # Never retain caller-owned mutable documents inside a room.  LAN
         # snapshots and the authority factory now share immutable domain
         # values validated at the trust boundary.
         object.__setattr__(self, "custom_map", custom_map)
         object.__setattr__(self, "house_rules", house_rules)
+        object.__setattr__(self, "variant", variant)
 
     def to_public_dict(self) -> dict[str, Any]:
         """Return the JSON-safe settings shared with every lobby viewer."""
@@ -178,6 +192,7 @@ class RoomSettings:
             "board_seed": self.board_seed,
             "ai_player_count": self.ai_player_count,
             "ai_personality_mode": self.ai_personality_mode,
+            "variant": self.variant.to_document(),
         }
         if self.custom_map is not None:
             public["custom_map"] = self.custom_map.to_document()

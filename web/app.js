@@ -59,6 +59,9 @@ const state = {
   pollPending: false,
   reconnecting: false,
   targetOptions: new Map(),
+  pendingBuildAnimations: new Set(),
+  pendingDiceAnimation: null,
+  pendingAnimationRevision: null,
   currentView: null,
 };
 
@@ -145,7 +148,7 @@ async function api(path, options = {}) {
 
 async function startBrowserSession() {
   const document = await api("/api/session", { method: "POST" });
-  processEvents(document.events || []);
+  processEvents(document.events || [], { animateLive: false });
   if (!state.welcome) {
     await reconnectFromStorage();
   }
@@ -160,7 +163,9 @@ async function sendMessage(message) {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(message),
   });
-  processEvents(document.events || []);
+  processEvents(document.events || [], {
+    animateLive: message.type !== "reconnect_room",
+  });
   return document;
 }
 
@@ -191,7 +196,9 @@ function connectWebSocket() {
       socket.close(1002, "invalid server message");
       return;
     }
-    processEvents(document.events || []);
+    processEvents(document.events || [], {
+      animateLive: document.kind !== "bootstrap",
+    });
     const pending = document.kind === "bootstrap"
       ? null
       : state.socketRequests.shift();
@@ -287,7 +294,7 @@ async function pollEvents() {
   }
 }
 
-function processEvents(events) {
+function processEvents(events, { animateLive = true } = {}) {
   let dirty = false;
   let focusBoardAfterRender = false;
   for (const event of events) {
@@ -325,7 +332,16 @@ function processEvents(events) {
         {
           let changed = false;
           if (!state.liveSnapshot || event.revision >= state.liveSnapshot.revision) {
-            changed = !state.liveSnapshot || event.revision > state.liveSnapshot.revision;
+            const previousLive = state.liveSnapshot;
+            changed = !previousLive || event.revision > previousLive.revision;
+            if (
+              animateLive
+              && state.replayIndex === null
+              && previousLive
+              && event.revision > previousLive.revision
+            ) {
+              queueLiveBoardAnimations(previousLive, event);
+            }
             state.liveSnapshot = event;
           }
           if (
@@ -418,6 +434,198 @@ function reconcileSequence(event) {
   }
 }
 
+function queueLiveBoardAnimations(previousSnapshot, nextSnapshot) {
+  const builds = detectNewBoardPieces(
+    previousSnapshot?.board_manifest,
+    nextSnapshot?.board_manifest,
+  );
+  for (const build of builds) {
+    state.pendingBuildAnimations.add(`${build.kind}:${build.targetId}`);
+  }
+  const dice = detectNewDiceRoll(previousSnapshot, nextSnapshot);
+  if (dice) state.pendingDiceAnimation = dice;
+  state.pendingAnimationRevision = nextSnapshot.revision;
+  playLiveSnapshotAudio(previousSnapshot, nextSnapshot, builds, dice);
+}
+
+function playLiveSnapshotAudio(previousSnapshot, nextSnapshot, builds, dice) {
+  const audio = window.CatanAudio;
+  if (!audio) return;
+  if (dice) audio.playDice(dice.values);
+
+  const finishedNow = previousSnapshot?.state?.phase?.name !== "finished"
+    && nextSnapshot?.state?.phase?.name === "finished";
+  if (finishedNow) {
+    audio.playVictory();
+    return;
+  }
+
+  if (builds.length) {
+    audio.playBuild(builds[builds.length - 1].kind);
+  }
+  if (tradeActivityTotal(nextSnapshot) > tradeActivityTotal(previousSnapshot)) {
+    audio.playTrade();
+  }
+}
+
+function tradeActivityTotal(snapshot) {
+  const players = snapshot?.state?.match_metrics?.players;
+  if (!Array.isArray(players)) return 0;
+  return players.reduce((total, player) => {
+    const domestic = Number(player?.domestic_trades);
+    const bank = Number(player?.bank_trades);
+    return total
+      + (Number.isFinite(domestic) && domestic >= 0 ? domestic : 0)
+      + (Number.isFinite(bank) && bank >= 0 ? bank : 0);
+  }, 0);
+}
+
+function takePendingBoardAnimations(snapshot) {
+  const isCurrentLive = state.replayIndex === null
+    && state.liveSnapshot
+    && snapshot?.revision === state.liveSnapshot.revision
+    && snapshot?.revision === state.pendingAnimationRevision;
+  if (!isCurrentLive) {
+    if (state.pendingAnimationRevision !== null) clearPendingBoardAnimations();
+    return { buildKeys: new Set(), dice: null };
+  }
+  const plan = {
+    buildKeys: new Set(state.pendingBuildAnimations),
+    dice: state.pendingDiceAnimation,
+  };
+  clearPendingBoardAnimations();
+  return plan;
+}
+
+function clearPendingBoardAnimations() {
+  state.pendingBuildAnimations.clear();
+  state.pendingDiceAnimation = null;
+  state.pendingAnimationRevision = null;
+}
+
+function detectNewBoardPieces(previousManifest, nextManifest) {
+  if (!previousManifest || !nextManifest) return [];
+  if (
+    previousManifest.mode !== nextManifest.mode
+    || previousManifest.seed !== nextManifest.seed
+    || previousManifest.custom_map_fingerprint !== nextManifest.custom_map_fingerprint
+  ) {
+    return [];
+  }
+  const previousRoads = new Set(
+    (previousManifest.edges || [])
+      .filter((edge) => edge.road)
+      .map((edge) => edge.id),
+  );
+  const previousBuildings = new Map(
+    (previousManifest.nodes || []).map((node) => [node.id, node.building?.type || null]),
+  );
+  const builds = [];
+  for (const edge of nextManifest.edges || []) {
+    if (edge.road && !previousRoads.has(edge.id)) {
+      builds.push({ kind: "road", targetId: edge.id });
+    }
+  }
+  for (const node of nextManifest.nodes || []) {
+    const buildingType = node.building?.type || null;
+    const previousType = previousBuildings.get(node.id) || null;
+    if (buildingType === "settlement" && previousType === null) {
+      builds.push({ kind: "settlement", targetId: node.id });
+    } else if (buildingType === "city" && previousType !== "city") {
+      builds.push({ kind: "city", targetId: node.id });
+    }
+  }
+  return builds;
+}
+
+function detectNewDiceRoll(previousSnapshot, nextSnapshot) {
+  if (!previousSnapshot || !nextSnapshot) return null;
+  if (!Number.isInteger(nextSnapshot.revision) || nextSnapshot.revision <= previousSnapshot.revision) {
+    return null;
+  }
+  const initialTotal = newestInitialDiceTotal(previousSnapshot, nextSnapshot);
+  const previousPair = publishedDicePair(previousSnapshot);
+  const nextPair = publishedDicePair(nextSnapshot);
+  const previousPhase = previousSnapshot.state?.phase || {};
+  const nextPhase = nextSnapshot.state?.phase || {};
+  const rolledNow = !previousPhase.dice_rolled && Boolean(nextPhase.dice_rolled);
+  const pairChanged = nextPair !== null && !sameDicePair(previousPair, nextPair);
+  const actorAdvanced = Boolean(nextPhase.dice_rolled)
+    && activeSnapshotPlayer(previousSnapshot) !== activeSnapshotPlayer(nextSnapshot);
+  if (initialTotal === null && !rolledNow && !pairChanged && !actorAdvanced) return null;
+
+  const publishedTotal = nextPair ? nextPair[0] + nextPair[1] : null;
+  const total = initialTotal ?? publishedTotal ?? latestDiceTotal(nextSnapshot);
+  if (!Number.isInteger(total) || total < 2 || total > 12) return null;
+  const values = nextPair && publishedTotal === total
+    ? nextPair
+    : deterministicDicePair(total, nextSnapshot.revision);
+  return { values, total, revision: nextSnapshot.revision };
+}
+
+function publishedDicePair(snapshot) {
+  const candidate = snapshot?.state?.phase?.last_dice_pair;
+  if (!Array.isArray(candidate) || candidate.length !== 2) return null;
+  const values = candidate.map(Number);
+  return values.every((value) => Number.isInteger(value) && value >= 1 && value <= 6)
+    ? values
+    : null;
+}
+
+function sameDicePair(first, second) {
+  if (first === null || second === null) return first === second;
+  return first[0] === second[0] && first[1] === second[1];
+}
+
+function newestInitialDiceTotal(previousSnapshot, nextSnapshot) {
+  const previous = previousSnapshot.state?.initial?.dice_histories;
+  const next = nextSnapshot.state?.initial?.dice_histories;
+  if (!previous || !next || typeof previous !== "object" || typeof next !== "object") {
+    return null;
+  }
+  for (const [playerName, values] of Object.entries(next)) {
+    if (!Array.isArray(values)) continue;
+    const priorValues = Array.isArray(previous[playerName]) ? previous[playerName] : [];
+    if (values.length > priorValues.length) {
+      const total = Number(values[values.length - 1]);
+      if (Number.isInteger(total) && total >= 2 && total <= 12) return total;
+    }
+  }
+  return null;
+}
+
+function activeSnapshotPlayer(snapshot) {
+  const phase = snapshot?.state?.phase || {};
+  const order = Array.isArray(phase.turn_order) ? phase.turn_order : [];
+  return order[phase.current_player_index] ?? phase.current_player_index ?? null;
+}
+
+function latestDiceTotal(snapshot) {
+  const history = snapshot?.state?.history || {};
+  const candidates = [
+    history.latest_event?.title,
+    history.latest_event?.detail,
+    ...(Array.isArray(history.log_messages) ? [...history.log_messages].reverse() : []),
+  ];
+  for (const candidate of candidates) {
+    if (typeof candidate !== "string") continue;
+    const match = candidate.match(/(?:ダイス(?:の目)?|出目)\s*[:：]?\s*(1[0-2]|[2-9])(?:\D|$)/);
+    if (match) return Number(match[1]);
+  }
+  return null;
+}
+
+function deterministicDicePair(total, revision = 0) {
+  const pairs = [];
+  for (let first = 1; first <= 6; first += 1) {
+    const second = total - first;
+    if (second >= 1 && second <= 6) pairs.push([first, second]);
+  }
+  if (!pairs.length) return [1, 1];
+  const index = Math.abs(Number(revision) || 0) % pairs.length;
+  return pairs[index];
+}
+
 async function reconnectFromStorage() {
   const raw = sessionStorage.getItem("catan-reconnect");
   if (!raw) return;
@@ -483,6 +691,7 @@ function resetRoomState(renderNow = true) {
   state.nextSequence = 0;
   state.commandPending = false;
   state.targetOptions.clear();
+  clearPendingBoardAnimations();
   sessionStorage.removeItem("catan-reconnect");
   if (renderNow) render();
 }
@@ -615,7 +824,8 @@ function renderGame() {
       .filter((option) => typeof option?.args?.target === "string")
       .map((option) => [option.args.target, option]),
   );
-  renderBoard(snapshot.board_manifest, gameState.players || []);
+  const animationPlan = takePendingBoardAnimations(snapshot);
+  renderBoard(snapshot.board_manifest, gameState.players || [], animationPlan);
   renderActions(options);
   renderPlayers(gameState, activeSeat, ownSeat);
   const latest = gameState.history?.latest_event || {};
@@ -693,7 +903,7 @@ async function sendGameCommand(option) {
   }
 }
 
-function renderBoard(manifest, players) {
+function renderBoard(manifest, players, animationPlan = { buildKeys: new Set(), dice: null }) {
   if (!manifest) return;
   const layer = elements["board-layer"];
   layer.replaceChildren();
@@ -718,6 +928,7 @@ function renderBoard(manifest, players) {
   const roadLayer = svg("g");
   const buildingLayer = svg("g");
   const robberLayer = svg("g");
+  const diceLayer = svg("g");
   layer.append(
     definitions,
     tileLayer,
@@ -727,6 +938,7 @@ function renderBoard(manifest, players) {
     roadLayer,
     buildingLayer,
     robberLayer,
+    diceLayer,
   );
 
   manifest.tiles.forEach((tile, index) => {
@@ -754,6 +966,8 @@ function renderBoard(manifest, players) {
         nodes[1],
         players,
         edge.road.owner_player_index,
+        edge.id,
+        animationPlan,
       );
     }
     if (state.targetOptions.has(edge.id)) {
@@ -772,8 +986,13 @@ function renderBoard(manifest, players) {
         players,
         node.building.owner_player_index,
         node.building.type,
+        node.id,
+        animationPlan,
       );
     }
+  }
+  if (animationPlan.dice) {
+    drawDiceRollEffect(diceLayer, animationPlan.dice, boardCenter);
   }
   renderLegend(players);
 }
@@ -1297,7 +1516,15 @@ function drawBoardHarbor(layer, layout) {
   layer.append(group);
 }
 
-function drawRoadPiece(layer, nodeStart, nodeEnd, players, ownerIndex) {
+function drawRoadPiece(
+  layer,
+  nodeStart,
+  nodeEnd,
+  players,
+  ownerIndex,
+  targetId,
+  animationPlan,
+) {
   const dx = nodeEnd.x - nodeStart.x;
   const dy = nodeEnd.y - nodeStart.y;
   const fullLength = Math.hypot(dx, dy);
@@ -1314,7 +1541,12 @@ function drawRoadPiece(layer, nodeStart, nodeEnd, players, ownerIndex) {
   const light = mixBoardColor(base, [255, 255, 246], 0.52);
   const shade = mixBoardColor(base, [24, 20, 17], 0.38);
   const grain = mixBoardColor(base, [44, 30, 21], 0.28);
-  const group = svg("g", { "pointer-events": "none" });
+  const animated = animationPlan.buildKeys.has(`road:${targetId}`);
+  const group = svg("g", {
+    class: animated ? "board-piece build-enter build-enter-road" : "board-piece",
+    "data-piece-id": targetId,
+    "pointer-events": "none",
+  });
   appendSvgTitle(group, `${players?.[ownerIndex]?.name || `Player ${ownerIndex + 1}`}の街道`);
 
   const localPoint = (along, across, offset = { x: 0, y: 0 }) => ({
@@ -1335,6 +1567,20 @@ function drawRoadPiece(layer, nodeStart, nodeEnd, players, ownerIndex) {
       localPoint(-capExtension, half * 0.48, offset),
     ];
   };
+  if (animated) {
+    const haloStart = localPoint(-1, 0);
+    const haloEnd = localPoint(length + 1, 0);
+    group.append(svg("line", {
+      x1: haloStart.x,
+      y1: haloStart.y,
+      x2: haloEnd.x,
+      y2: haloEnd.y,
+      class: "build-enter-halo build-enter-halo-road",
+      stroke: "#ffe9a8",
+      "stroke-width": 24,
+      "stroke-linecap": "round",
+    }));
+  }
   group.append(
     svg("polygon", { points: boardPointList(plank(17, 2.2, { x: 2.5, y: 3.5 })), fill: "#181a1c", "stroke-linejoin": "round" }),
     svg("polygon", { points: boardPointList(plank(16, 2)), fill: "#191c20", "stroke-linejoin": "round" }),
@@ -1378,13 +1624,26 @@ function drawRoadPiece(layer, nodeStart, nodeEnd, players, ownerIndex) {
   layer.append(group);
 }
 
-function drawBuildingPiece(layer, center, players, ownerIndex, buildingType) {
+function drawBuildingPiece(
+  layer,
+  center,
+  players,
+  ownerIndex,
+  buildingType,
+  targetId,
+  animationPlan,
+) {
   const base = boardPlayerRgb(players, ownerIndex);
   const light = mixBoardColor(base, [255, 255, 244], 0.50);
   const roof = mixBoardColor(base, [48, 31, 22], 0.26);
   const shade = mixBoardColor(base, [22, 19, 18], 0.43);
   const detail = mixBoardColor(base, [23, 24, 27], 0.58);
-  const group = svg("g", { "pointer-events": "none" });
+  const animated = animationPlan.buildKeys.has(`${buildingType}:${targetId}`);
+  const group = svg("g", {
+    class: animated ? `board-piece build-enter build-enter-${buildingType}` : "board-piece",
+    "data-piece-id": targetId,
+    "pointer-events": "none",
+  });
   appendSvgTitle(
     group,
     `${players?.[ownerIndex]?.name || `Player ${ownerIndex + 1}`}の${buildingType === "city" ? "都市" : "開拓地"}`,
@@ -1395,6 +1654,17 @@ function drawBuildingPiece(layer, center, players, ownerIndex, buildingType) {
   }));
   let silhouette;
   let markCenter;
+  if (animated) {
+    group.append(svg("circle", {
+      cx: center.x,
+      cy: center.y,
+      r: buildingType === "city" ? 29 : 24,
+      class: "build-enter-halo",
+      fill: "none",
+      stroke: "#ffe9a8",
+      "stroke-width": 5,
+    }));
+  }
   if (buildingType === "city") {
     silhouette = [[-16, 12], [-16, -1], [-8, -10], [0, -3], [0, -13], [13, -13], [13, 12]];
     group.append(
@@ -1471,6 +1741,116 @@ function drawOwnerPattern(layer, center, patternValue, color, radius) {
       fill: color,
     }));
   }
+}
+
+function drawDiceRollEffect(layer, dice, boardCenter) {
+  const values = Array.isArray(dice.values) ? dice.values.map(Number) : [];
+  if (
+    values.length !== 2
+    || values.some((value) => !Number.isInteger(value) || value < 1 || value > 6)
+    || values[0] + values[1] !== dice.total
+  ) {
+    return;
+  }
+  const overlay = svg("g", {
+    class: "board-dice-roll-overlay",
+    "aria-hidden": "true",
+    "data-dice-total": dice.total,
+    "pointer-events": "none",
+  });
+  overlay.append(
+    svg("ellipse", {
+      cx: boardCenter.x,
+      cy: boardCenter.y + 8,
+      rx: 70,
+      ry: 46,
+      class: "board-dice-stage",
+    }),
+  );
+  drawDieFace(overlay, { x: boardCenter.x - 28, y: boardCenter.y - 5 }, values[0], "first");
+  drawDieFace(overlay, { x: boardCenter.x + 28, y: boardCenter.y - 5 }, values[1], "second");
+
+  const totalGroup = svg("g", { class: "board-dice-total" });
+  totalGroup.append(
+    svg("rect", {
+      x: boardCenter.x - 36,
+      y: boardCenter.y + 32,
+      width: 72,
+      height: 27,
+      rx: 13.5,
+      class: "board-dice-total-badge",
+    }),
+  );
+  const totalLabel = svg("text", {
+    x: boardCenter.x,
+    y: boardCenter.y + 46,
+    class: "board-dice-total-label",
+    "text-anchor": "middle",
+    "dominant-baseline": "middle",
+  });
+  totalLabel.textContent = `合計 ${dice.total}`;
+  totalGroup.append(totalLabel);
+  overlay.append(totalGroup);
+  layer.append(overlay);
+
+  const reducedMotion = window.matchMedia?.("(prefers-reduced-motion: reduce)")?.matches;
+  window.setTimeout(() => {
+    if (overlay.isConnected) overlay.remove();
+  }, reducedMotion ? 1250 : 1900);
+}
+
+function drawDieFace(layer, center, value, position) {
+  const size = 44;
+  const half = size / 2;
+  const group = svg("g", {
+    class: `board-die board-die-${position}`,
+    "data-die-value": value,
+  });
+  group.append(
+    svg("rect", {
+      x: center.x - half + 3,
+      y: center.y - half + 4,
+      width: size,
+      height: size,
+      rx: 10,
+      class: "board-die-shadow",
+    }),
+    svg("rect", {
+      x: center.x - half,
+      y: center.y - half,
+      width: size,
+      height: size,
+      rx: 10,
+      class: "board-die-face",
+    }),
+    svg("path", {
+      d: `M ${center.x - 13} ${center.y - 17} H ${center.x + 10}`,
+      class: "board-die-highlight",
+    }),
+  );
+  for (const [column, row] of dicePipPositions(value)) {
+    group.append(
+      svg("circle", {
+        cx: center.x + column * 12,
+        cy: center.y + row * 12,
+        r: 3.8,
+        class: "board-die-pip",
+      }),
+    );
+  }
+  layer.append(group);
+}
+
+function dicePipPositions(value) {
+  const patterns = {
+    1: [[0, 0]],
+    2: [[-1, -1], [1, 1]],
+    3: [[-1, -1], [0, 0], [1, 1]],
+    4: [[-1, -1], [1, -1], [-1, 1], [1, 1]],
+    5: [[-1, -1], [1, -1], [0, 0], [-1, 1], [1, 1]],
+    6: [[-1, -1], [1, -1], [-1, 0], [1, 0], [-1, 1], [1, 1]],
+  };
+  return patterns[value] || [];
 }
 
 function drawTileTarget(layer, tile, points) {
@@ -1968,6 +2348,7 @@ function calculatePublicPoints(gameState) {
 
 function activePlayerIndex(gameState) {
   const phase = gameState.phase || {};
+  const initial = gameState.initial || {};
   const special = gameState.special || {};
   const trade = gameState.domestic_trade || {};
   if (phase.special_phase === "discard" && Number.isInteger(special.discard_player)) {
@@ -1982,6 +2363,15 @@ function activePlayerIndex(gameState) {
   ) {
     if (Number.isInteger(trade.broadcast_viewer)) return trade.broadcast_viewer;
     if (Number.isInteger(trade.editor)) return trade.editor;
+  }
+  if (phase.name === "initial") {
+    const initialOrder = initial.dice_phase
+      ? initial.dice_contenders
+      : initial.placement_order;
+    if (Array.isArray(initialOrder)) {
+      const initialActor = initialOrder[initial.player_index];
+      if (Number.isInteger(initialActor)) return initialActor;
+    }
   }
   const order = Array.isArray(phase.turn_order) ? phase.turn_order : [];
   return order[phase.current_player_index] ?? phase.current_player_index ?? null;

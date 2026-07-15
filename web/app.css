@@ -126,6 +126,67 @@ select:focus-visible,
   letter-spacing: 0.08em;
 }
 
+.topbar-actions,
+.audio-controls,
+.audio-toggle {
+  display: inline-flex;
+  align-items: center;
+}
+
+.topbar-actions {
+  gap: 10px;
+  justify-content: flex-end;
+}
+
+.audio-controls {
+  gap: 6px;
+}
+
+.audio-toggle {
+  min-height: 36px;
+  padding: 7px 10px;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 850;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: rgba(7, 20, 31, 0.5);
+  cursor: pointer;
+  transition: color 150ms ease, border-color 150ms ease, background 150ms ease;
+}
+
+.audio-toggle:hover {
+  color: var(--ink);
+  border-color: rgba(244, 195, 93, 0.52);
+}
+
+.audio-toggle[data-state="on"] {
+  color: var(--gold-strong);
+  border-color: rgba(244, 195, 93, 0.42);
+  background: rgba(111, 79, 25, 0.34);
+}
+
+.audio-toggle-state {
+  min-width: 26px;
+  padding: 2px 5px;
+  color: var(--ocean-950);
+  font-size: 9px;
+  line-height: 1.2;
+  text-align: center;
+  border-radius: 999px;
+  background: #7f93a3;
+}
+
+.audio-toggle[data-state="on"] .audio-toggle-state {
+  background: var(--gold-strong);
+}
+
+.audio-toggle:disabled {
+  opacity: 0.46;
+  cursor: not-allowed;
+}
+
 .connection {
   display: inline-flex;
   gap: 9px;
@@ -797,6 +858,233 @@ button:disabled {
   to { opacity: 0.7; }
 }
 
+.board-piece {
+  transform-box: fill-box;
+  transform-origin: center;
+}
+
+.board-piece.build-enter {
+  will-change: transform, opacity, filter;
+  animation: board-build-enter 760ms cubic-bezier(0.2, 0.82, 0.24, 1.16) both;
+}
+
+.board-piece.build-enter-road {
+  animation-name: board-road-build-enter;
+}
+
+.build-enter-halo {
+  opacity: 0;
+  filter: drop-shadow(0 0 8px rgba(255, 233, 168, 0.92));
+  transform-box: fill-box;
+  transform-origin: center;
+  animation: board-build-halo 920ms ease-out both;
+}
+
+@keyframes board-build-enter {
+  0% {
+    opacity: 0.08;
+    filter: drop-shadow(0 7px 7px rgba(3, 10, 15, 0.74));
+    transform: translateY(9px) scale(0.42);
+  }
+
+  52% {
+    opacity: 1;
+    filter: drop-shadow(0 7px 5px rgba(3, 10, 15, 0.55));
+    transform: translateY(-3px) scale(1.12);
+  }
+
+  76% {
+    transform: translateY(1.5px) scale(0.97);
+  }
+
+  100% {
+    opacity: 1;
+    filter: none;
+    transform: translateY(0) scale(1);
+  }
+}
+
+@keyframes board-road-build-enter {
+  0% {
+    opacity: 0.08;
+    filter: drop-shadow(0 7px 7px rgba(3, 10, 15, 0.74));
+    transform: translateY(7px) scale(0.5, 0.34);
+  }
+
+  52% {
+    opacity: 1;
+    filter: drop-shadow(0 6px 5px rgba(3, 10, 15, 0.55));
+    transform: translateY(-2px) scale(1.08, 1.16);
+  }
+
+  76% {
+    transform: translateY(1px) scale(0.98, 0.95);
+  }
+
+  100% {
+    opacity: 1;
+    filter: none;
+    transform: translateY(0) scale(1);
+  }
+}
+
+@keyframes board-build-halo {
+  0% {
+    opacity: 0;
+    transform: scale(0.42);
+  }
+
+  34% {
+    opacity: 0.92;
+  }
+
+  100% {
+    opacity: 0;
+    transform: scale(1.55);
+  }
+}
+
+.board-dice-roll-overlay {
+  pointer-events: none;
+  animation: board-dice-overlay-life 1900ms ease-out both;
+}
+
+.board-dice-stage {
+  fill: rgba(6, 22, 31, 0.76);
+  stroke: rgba(255, 231, 168, 0.5);
+  stroke-width: 2;
+  filter: drop-shadow(0 10px 15px rgba(1, 9, 14, 0.6));
+  transform-box: fill-box;
+  transform-origin: center;
+  animation: board-dice-stage-enter 520ms ease-out both;
+}
+
+.board-die {
+  transform-box: fill-box;
+  transform-origin: center;
+  will-change: transform, opacity;
+}
+
+.board-die-first {
+  animation: board-die-roll-first 960ms cubic-bezier(0.16, 0.75, 0.2, 1.06) both;
+}
+
+.board-die-second {
+  animation: board-die-roll-second 960ms cubic-bezier(0.16, 0.75, 0.2, 1.06) both;
+}
+
+.board-die-shadow {
+  fill: rgba(4, 9, 12, 0.72);
+}
+
+.board-die-face {
+  fill: #fff9df;
+  stroke: #5b4631;
+  stroke-width: 2.2;
+  filter: drop-shadow(0 4px 4px rgba(3, 10, 15, 0.38));
+}
+
+.board-die-highlight {
+  fill: none;
+  stroke: rgba(255, 255, 255, 0.9);
+  stroke-width: 2;
+  stroke-linecap: round;
+}
+
+.board-die-pip {
+  fill: #28231f;
+  stroke: rgba(255, 255, 255, 0.28);
+  stroke-width: 0.6;
+}
+
+.board-dice-total {
+  transform-box: fill-box;
+  transform-origin: center;
+  animation: board-dice-total-enter 1120ms ease-out both;
+}
+
+.board-dice-total-badge {
+  fill: #ecd092;
+  stroke: #5b4631;
+  stroke-width: 2;
+  filter: drop-shadow(0 4px 4px rgba(3, 10, 15, 0.45));
+}
+
+.board-dice-total-label {
+  fill: #382b20;
+  font-size: 14px;
+  font-weight: 950;
+  letter-spacing: 0.03em;
+}
+
+@keyframes board-dice-stage-enter {
+  from {
+    opacity: 0;
+    transform: scale(0.72);
+  }
+
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+@keyframes board-die-roll-first {
+  0% {
+    opacity: 0;
+    transform: translate(-112px, -90px) rotate(-440deg) scale(0.68);
+  }
+
+  24% { opacity: 1; }
+  58% { transform: translate(13px, -17px) rotate(-126deg) scale(0.94); }
+  76% { transform: translate(-5px, 4px) rotate(22deg) scale(1.09); }
+  89% { transform: translate(1px, -2px) rotate(-6deg) scale(0.98); }
+  100% {
+    opacity: 1;
+    transform: translate(0) rotate(0) scale(1);
+  }
+}
+
+@keyframes board-die-roll-second {
+  0% {
+    opacity: 0;
+    transform: translate(116px, -96px) rotate(470deg) scale(0.66);
+  }
+
+  22% { opacity: 1; }
+  56% { transform: translate(-14px, -19px) rotate(139deg) scale(0.95); }
+  75% { transform: translate(5px, 4px) rotate(-24deg) scale(1.1); }
+  89% { transform: translate(-1px, -2px) rotate(7deg) scale(0.98); }
+  100% {
+    opacity: 1;
+    transform: translate(0) rotate(0) scale(1);
+  }
+}
+
+@keyframes board-dice-total-enter {
+  0%,
+  66% {
+    opacity: 0;
+    transform: translateY(8px) scale(0.72);
+  }
+
+  84% {
+    opacity: 1;
+    transform: translateY(-1px) scale(1.08);
+  }
+
+  100% {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+@keyframes board-dice-overlay-life {
+  0%,
+  78% { opacity: 1; }
+  100% { opacity: 0; }
+}
+
 .board-legend {
   position: relative;
   display: flex;
@@ -1264,6 +1552,18 @@ noscript {
     padding: 7px 9px;
   }
 
+  .topbar-actions {
+    gap: 6px;
+  }
+
+  .audio-toggle {
+    padding-inline: 9px;
+  }
+
+  .audio-toggle > span:nth-child(2) {
+    display: none;
+  }
+
   #connection-label {
     display: none;
   }
@@ -1333,6 +1633,20 @@ noscript {
 }
 
 @media (max-width: 440px) {
+  .audio-controls {
+    gap: 4px;
+  }
+
+  .audio-toggle {
+    min-width: 34px;
+    padding-inline: 8px;
+    justify-content: center;
+  }
+
+  .audio-toggle-state {
+    display: none;
+  }
+
   .field-row {
     grid-template-columns: 1fr;
   }
@@ -1372,5 +1686,21 @@ noscript {
     animation-duration: 0.01ms !important;
     animation-iteration-count: 1 !important;
     transition-duration: 0.01ms !important;
+  }
+
+  .board-piece.build-enter,
+  .board-die,
+  .board-dice-stage,
+  .board-dice-total,
+  .board-dice-roll-overlay {
+    opacity: 1 !important;
+    filter: none !important;
+    transform: none !important;
+    animation: none !important;
+  }
+
+  .build-enter-halo {
+    display: none;
+    animation: none !important;
   }
 }

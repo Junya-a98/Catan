@@ -21,6 +21,8 @@ make web
 - ready、host開始、host権限の引き継ぎ
 - stable board IDを使う配置操作と、権威サーバーが配る合法手ボタン
 - 同梱の生成地形・海面、確率ドット、立体駒、桟橋付き港を使うローカル版準拠の盤面描画（実行時の外部画像取得なし）
+- 権威snapshotの実際の2個の出目を使うダイス演出と、stable board ID差分から一度だけ再生する建設演出
+- ダイス・建設・交易・勝利の効果音、任意再生のオリジナルBGM、効果音 / BGM個別設定
 - プレイヤーごとの資源・発展カード・勝利点カードのマスキング
 - revision / sequenceによる古い状態と二重操作の拒否
 - ページ再読み込み時の最新状態・対局結果復元
@@ -42,6 +44,8 @@ make web
 - `python/game/network_replay.py`: revision履歴、閲覧者別snapshot、公開リザルトとイベント位置を保持
 - `python/web_main.py`: 起動CLI
 - `web/`: HTML / CSS / JavaScriptクライアント
+
+`web/audio.js` はWeb Audio APIで短い効果音とBGMを端末内合成します。外部音源やCDNへの通信はなく、曲と音色はこのプロジェクト用のオリジナルです。効果音は既定ON、BGMは既定OFFで、どちらもブラウザが認めたユーザー操作後にだけAudioContextを開始します。設定は同一originの `localStorage` に保存し、利用できない環境では安全に既定値へ戻します。
 
 盤面画像は `web/assets/board/` に同梱し、Webサーバーは使用する7個のWebPだけを完全一致の許可リストから配信します。任意のファイルパスや素材フォルダー全体を公開しません。
 

@@ -6,6 +6,7 @@
     <meta name="theme-color" content="#102a43">
     <title>Catan Web Table</title>
     <link rel="stylesheet" href="/app.css">
+    <script src="/audio.js" defer></script>
     <script src="/app.js" defer></script>
   </head>
   <body>
@@ -17,9 +18,23 @@
           <small>権威サーバーで遊ぶローカル版</small>
         </span>
       </a>
-      <div class="connection" id="connection-status" data-state="connecting" role="status" aria-live="polite">
-        <span class="connection-dot" aria-hidden="true"></span>
-        <span id="connection-label">接続準備中</span>
+      <div class="topbar-actions">
+        <div class="audio-controls" role="group" aria-label="音響設定">
+          <button class="audio-toggle" id="audio-sfx-toggle" type="button" aria-pressed="true" aria-label="効果音: オン">
+            <span aria-hidden="true">♪</span>
+            <span>効果音</span>
+            <span class="audio-toggle-state" data-audio-state aria-hidden="true">ON</span>
+          </button>
+          <button class="audio-toggle" id="audio-bgm-toggle" type="button" aria-pressed="false" aria-label="BGM: オフ">
+            <span aria-hidden="true">♫</span>
+            <span>BGM</span>
+            <span class="audio-toggle-state" data-audio-state aria-hidden="true">OFF</span>
+          </button>
+        </div>
+        <div class="connection" id="connection-status" data-state="connecting" role="status" aria-live="polite">
+          <span class="connection-dot" aria-hidden="true"></span>
+          <span id="connection-label">接続準備中</span>
+        </div>
       </div>
     </header>
 

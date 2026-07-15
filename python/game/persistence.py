@@ -28,6 +28,7 @@ from game.match_metrics import (
 )
 from game.resources import ResourceType
 from game.road import Road
+from game.variant import VariantConfig
 
 
 SAVE_FORMAT = "catan-local-save"
@@ -161,6 +162,15 @@ def _house_rules_for_game(game):
     return house_rules
 
 
+def _variant_config_for_game(game):
+    variant_config = getattr(game, "variant_config", None)
+    if variant_config is None:
+        return VariantConfig.standard()
+    if not isinstance(variant_config, VariantConfig):
+        raise SaveGameError("variant設定を保存できません。")
+    return variant_config
+
+
 def _custom_map_for_game(game):
     if getattr(game, "board_mode", None) != "custom":
         return None
@@ -241,8 +251,10 @@ def serialize_game(game):
         latest_event["color"] = list(latest_event["color"])
 
     house_rules = _house_rules_for_game(game)
+    variant_config = _variant_config_for_game(game)
     rules_document = {
         "victory_point_target": int(game.victory_point_target),
+        "variant": variant_config.to_document(),
     }
     if house_rules != HouseRules.standard():
         rules_document["house_rules"] = house_rules.to_document()
@@ -293,6 +305,11 @@ def serialize_game(game):
             "current_player_index": int(game.current_player_index),
             "turn_order": [player_indices[player] for player in game.turn_order],
             "dice_rolled": bool(game.dice_rolled),
+            "last_dice_pair": (
+                list(game.last_dice_pair)
+                if getattr(game, "last_dice_pair", None) is not None
+                else None
+            ),
             "action_mode": game.action_mode,
             "development_card_used_this_turn": bool(game.development_card_used_this_turn),
             "special_phase": game.special_phase,
@@ -437,6 +454,10 @@ def restore_game(game, data, *, runtime_side_effects=True):
         house_rules = HouseRules.from_document(rules_data.get("house_rules"))
     except (TypeError, ValueError) as exc:
         raise SaveGameError("ハウスルール設定が不正です。") from exc
+    try:
+        variant_config = VariantConfig.from_document(rules_data.get("variant"))
+    except (TypeError, ValueError) as exc:
+        raise SaveGameError("variant設定が不正です。") from exc
     victory_point_target = rules_data.get(
         "victory_point_target",
         WINNING_VICTORY_POINTS,
@@ -448,6 +469,7 @@ def restore_game(game, data, *, runtime_side_effects=True):
         raise SaveGameError("勝利点の目標値が不正です。")
     game.victory_point_target = victory_point_target
     game.house_rules = house_rules
+    game.variant_config = variant_config
 
     game.board_mode = board_data["mode"]
     game.board_seed = board_data["seed"]
@@ -586,6 +608,22 @@ def restore_game(game, data, *, runtime_side_effects=True):
     if not isinstance(game.current_player_index, int) or not 0 <= game.current_player_index < len(players):
         raise SaveGameError("現在プレイヤー位置が不正です。")
     game.dice_rolled = bool(phase_data.get("dice_rolled", False))
+    last_dice_pair = phase_data.get("last_dice_pair")
+    if last_dice_pair is None:
+        game.last_dice_pair = None
+    elif (
+        isinstance(last_dice_pair, list)
+        and len(last_dice_pair) == 2
+        and all(
+            isinstance(value, int)
+            and not isinstance(value, bool)
+            and 1 <= value <= 6
+            for value in last_dice_pair
+        )
+    ):
+        game.last_dice_pair = tuple(last_dice_pair)
+    else:
+        raise SaveGameError("直近のダイス結果が不正です。")
     game.action_mode = phase_data.get("action_mode")
     if game.action_mode not in (None, "road", "settlement", "city"):
         raise SaveGameError("建設選択状態が不正です。")

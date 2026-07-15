@@ -1105,6 +1105,7 @@ def _validated_room_settings(value: Mapping[str, Any]) -> dict[str, Any]:
         "ai_personality_mode",
         "custom_map",
         "house_rules",
+        "variant",
     }
     if not required.issubset(value) or not set(value).issubset(required | optional):
         raise ValueError("部屋設定の項目が不足または過剰です。")
@@ -1123,6 +1124,8 @@ def _validated_room_settings(value: Mapping[str, Any]) -> dict[str, Any]:
     for key in ("ai_player_count", "ai_personality_mode"):
         if key not in value:
             public.pop(key, None)
+    if "variant" not in value:
+        public.pop("variant", None)
     return public
 
 

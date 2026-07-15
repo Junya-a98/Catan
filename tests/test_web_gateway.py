@@ -114,6 +114,37 @@ def test_started_match_snapshots_keep_each_viewers_private_hand_private():
     assert viewer_state["command_options"] == []
 
 
+def test_reload_bootstrap_keeps_the_consumed_game_command_sequence():
+    gateway = WebGateway()
+    host = gateway.open_session()
+    guest = gateway.open_session()
+    room_code, _ = create_room(gateway, host)
+    join_room(gateway, guest, room_code)
+    gateway.poll(host)
+    gateway.poll(guest)
+    gateway.handle(host, message("set_ready", ready=True))
+    gateway.handle(guest, message("set_ready", ready=True))
+    started = gateway.handle(host, message("start_game"))
+    state = next(event for event in started if event["type"] == "state_snapshot")
+
+    result = gateway.handle(
+        host,
+        build_game_command(
+            sequence=0,
+            expected_revision=state["revision"],
+            command="roll_dice",
+        ),
+    )
+
+    assert next(
+        event for event in result if event["type"] == "game_command_result"
+    )["accepted"] is True
+    welcome = next(
+        event for event in gateway.bootstrap(host) if event["type"] == "session_welcome"
+    )
+    assert welcome["next_sequence"] == 1
+
+
 def test_web_ai_finish_emits_result_and_authenticated_replay_frames():
     now = [100.0]
 

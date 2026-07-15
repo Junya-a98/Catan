@@ -68,6 +68,21 @@ def test_main_roll_waits_for_animation_before_marking_dice_rolled():
 
         assert game.pending_dice_context is None
         assert game.dice_rolled is True
+        assert game.last_dice_pair == game.dice_overlay.result_values
     finally:
         game.audio.stop()
         pygame.quit()
+
+
+def test_headless_roll_keeps_exact_pair_for_remote_animation(monkeypatch):
+    game = CatanGame(headless=True)
+    try:
+        game.start_main_phase()
+        monkeypatch.setattr("game.game.roll_two_dice", lambda: (2, 6))
+
+        game.handle_roll_dice()
+
+        assert game.dice_rolled is True
+        assert game.last_dice_pair == (2, 6)
+    finally:
+        game.audio.stop()

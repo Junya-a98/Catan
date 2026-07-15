@@ -27,6 +27,7 @@ from game.persistence import (
     restore_game,
     serialize_game,
 )
+from game.variant import VariantConfig
 
 
 __all__ = (
@@ -199,12 +200,18 @@ class ReplayRecorder:
             house_rules = HouseRules.standard()
         if not isinstance(house_rules, HouseRules):
             raise ReplayError("ハウスルール設定を記録できません。")
+        variant_config = getattr(game, "variant_config", None)
+        if variant_config is None:
+            variant_config = VariantConfig.standard()
+        if not isinstance(variant_config, VariantConfig):
+            raise ReplayError("variant設定を記録できません。")
         board_mode = getattr(game, "board_mode", "")
         defaults = {
             "board_mode": board_mode,
             "board_seed": getattr(game, "board_seed", None),
             "victory_point_target": getattr(game, "victory_point_target", None),
             "house_rules_fingerprint": house_rules.fingerprint(),
+            "variant_fingerprint": variant_config.fingerprint(),
             "players": [
                 {
                     "name": str(getattr(player, "name", "")),
@@ -641,6 +648,13 @@ def _snapshot_identity(snapshot: Dict[str, Any], sequence: int) -> Tuple[Any, ..
             "ハウスルール設定が不正です。"
         ) from exc
     house_rules_fingerprint = house_rules.fingerprint()
+    try:
+        variant_config = VariantConfig.from_document(rules.get("variant"))
+    except (TypeError, ValueError) as exc:
+        raise ReplayError(
+            f"リプレイのフレーム {sequence} のvariant設定が不正です。"
+        ) from exc
+    variant_fingerprint = variant_config.fingerprint()
     seats = []
     for player in players:
         if (
@@ -656,6 +670,7 @@ def _snapshot_identity(snapshot: Dict[str, Any], sequence: int) -> Tuple[Any, ..
         victory_target,
         custom_map_fingerprint,
         house_rules_fingerprint,
+        variant_fingerprint,
         tuple(seats),
     )
 
@@ -692,6 +707,14 @@ def _metadata_identity(metadata: Dict[str, Any]) -> Tuple[Any, ...]:
         # Replays created before house-rule settings existed represent the
         # official/default rules.
         house_rules_fingerprint = HouseRules.standard().fingerprint()
+    if "variant_fingerprint" in metadata:
+        variant_fingerprint = _required_fingerprint(
+            metadata["variant_fingerprint"],
+            label="variant",
+        )
+    else:
+        # Replays created before variant settings existed represent standard.
+        variant_fingerprint = VariantConfig.standard().fingerprint()
     players = metadata.get("players")
     if not isinstance(players, list):
         raise ReplayError("リプレイの参加者メタデータが不正です。")
@@ -710,6 +733,7 @@ def _metadata_identity(metadata: Dict[str, Any]) -> Tuple[Any, ...]:
         victory_target,
         custom_map_fingerprint,
         house_rules_fingerprint,
+        variant_fingerprint,
         tuple(seats),
     )
 

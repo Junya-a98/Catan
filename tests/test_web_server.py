@@ -74,7 +74,13 @@ def test_static_client_and_health_have_strict_security_headers(web_server):
     assert response.getheader("X-Content-Type-Options") == "nosniff"
     assert response.getheader("X-Frame-Options") == "DENY"
     assert "script-src 'self'" in response.getheader("Content-Security-Policy")
-    assert "Catan Web" in payload.decode("utf-8")
+    document = payload.decode("utf-8")
+    assert "Catan Web" in document
+    assert document.index('<script src="/audio.js" defer>') < document.index(
+        '<script src="/app.js" defer>'
+    )
+    assert 'id="audio-sfx-toggle"' in document
+    assert 'id="audio-bgm-toggle"' in document
 
     response, payload = request(web_server, "GET", "/api/health")
     assert response.status == 200
@@ -87,6 +93,43 @@ def test_static_client_and_health_have_strict_security_headers(web_server):
     response, payload = request(web_server, "HEAD", "/app.js")
     assert response.status == 200
     assert payload == b""
+
+
+def test_audio_module_is_served_only_from_exact_script_route(web_server):
+    response, payload = request(web_server, "GET", "/audio.js")
+    assert response.status == 200
+    assert response.getheader("Content-Type") == "text/javascript; charset=utf-8"
+    assert response.getheader("X-Content-Type-Options") == "nosniff"
+    assert "script-src 'self'" in response.getheader("Content-Security-Policy")
+    assert b"window.CatanAudio" in payload
+
+    content_length = response.getheader("Content-Length")
+    response, head_payload = request(web_server, "HEAD", "/audio.js")
+    assert response.status == 200
+    assert response.getheader("Content-Type") == "text/javascript; charset=utf-8"
+    assert response.getheader("Content-Length") == content_length
+    assert response.getheader("X-Content-Type-Options") == "nosniff"
+    assert head_payload == b""
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/audio",
+        "/audio.js/extra",
+        "/assets/audio.js",
+        "/%61udio.js",
+    ],
+)
+@pytest.mark.parametrize("method", ["GET", "HEAD"])
+def test_unknown_audio_script_paths_are_rejected(web_server, method, path):
+    response, payload = request(web_server, method, path)
+    assert response.status == 404
+    assert response.getheader("Content-Type") == "application/json; charset=utf-8"
+    if method == "HEAD":
+        assert payload == b""
+    else:
+        assert json.loads(payload)["error"]["code"] == "not_found"
 
 
 @pytest.mark.parametrize(

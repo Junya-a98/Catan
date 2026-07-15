@@ -108,6 +108,7 @@ from game.pre_game_settings_display import (
 )
 from game.resources import BUILD_COSTS, ResourceType
 from game.road import Road
+from game.variant import VariantConfig
 from game.replay import (
     DEFAULT_REPLAY_DIR,
     ReplayError,
@@ -181,6 +182,7 @@ class CatanGame:
         *,
         custom_map=None,
         house_rules=None,
+        variant_config=None,
         ai_player_count=0,
         ai_action_delay_ms=AI_ACTION_DELAY_MS,
         ai_personality_mode=STANDARD,
@@ -203,6 +205,11 @@ class CatanGame:
         self.house_rules = HouseRules.standard() if house_rules is None else house_rules
         if not isinstance(self.house_rules, HouseRules):
             raise TypeError("house_rules must be a HouseRules")
+        self.variant_config = (
+            VariantConfig.standard() if variant_config is None else variant_config
+        )
+        if not isinstance(self.variant_config, VariantConfig):
+            raise TypeError("variant_config must be a VariantConfig")
         self.custom_map_spec = custom_map
         if self.board_mode == "custom":
             if not isinstance(self.custom_map_spec, CustomMapSpec):
@@ -336,6 +343,10 @@ class CatanGame:
         self.pending_dice_context = None
         self.pending_dice_roll = None
         self.pending_dice_player_name = ""
+        # Keep the exact public d6 faces for LAN/Web presentation.  The total
+        # alone is sufficient for rules resolution, but not for faithfully
+        # reproducing the roll animation on another client.
+        self.last_dice_pair = None
         self.configure_players(
             2,
             reset_logs=False,
@@ -1510,6 +1521,7 @@ class CatanGame:
             "victory_target": self.victory_point_target,
             "board_mode": self.board_mode,
             "board_seed": self.board_seed,
+            "variant": self.variant_config.to_document(),
         }
         if self.board_mode == "custom":
             if not isinstance(self.custom_map_spec, CustomMapSpec):
@@ -1857,6 +1869,7 @@ class CatanGame:
 
     def reset_turn_state(self):
         self.dice_rolled = False
+        self.last_dice_pair = None
         self.action_mode = None
         self.development_card_used_this_turn = False
         self.ai_domestic_trade_attempted = False
@@ -2536,19 +2549,23 @@ class CatanGame:
         return self.pending_dice_context is not None and self.dice_overlay.is_active
 
     def start_dice_animation(self, context, dice_values, player_name, title):
+        dice_pair = tuple(int(value) for value in dice_values)
+        if len(dice_pair) != 2 or any(value < 1 or value > 6 for value in dice_pair):
+            raise ValueError("ダイスは1〜6の2個で指定してください。")
+        self.last_dice_pair = dice_pair
         if self.headless:
-            dice_roll = sum(dice_values)
+            dice_roll = sum(dice_pair)
             if context == "initial":
                 self.resolve_initial_key_roll(dice_roll)
             elif context == "main":
                 self.resolve_main_dice_roll(dice_roll)
             return
         self.pending_dice_context = context
-        self.pending_dice_roll = sum(dice_values)
+        self.pending_dice_roll = sum(dice_pair)
         self.pending_dice_player_name = player_name
         self.play_sound("dice")
         subtitle = f"{player_name} が振っています" if player_name else ""
-        self.dice_overlay.start(dice_values, title, subtitle)
+        self.dice_overlay.start(dice_pair, title, subtitle)
 
     def update_dice_animation(self):
         if self.pending_dice_context is None:

@@ -89,6 +89,18 @@ def test_parses_authority_snapshot_without_restoring_a_game(player_snapshot):
     assert view.logs == ("開始", "Player1が街道を建設")
 
 
+def test_snapshot_exposes_exact_last_dice_pair(authority_game):
+    authority_game.last_dice_pair = (2, 6)
+
+    snapshot = build_state_snapshot(
+        authority_game,
+        viewer_player_index=None,
+        revision=8,
+    )
+
+    assert snapshot["state"]["phase"]["last_dice_pair"] == [2, 6]
+
+
 def test_parses_extended_public_match_context_as_immutable_dtos(authority_game):
     authority_game.victory_point_target = 12
     authority_game.bank.resources[ResourceType.WOOD] = 11

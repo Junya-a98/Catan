@@ -32,6 +32,7 @@ _STATIC_ROUTES = {
     "/": ("index.html", "text/html; charset=utf-8"),
     "/index.html": ("index.html", "text/html; charset=utf-8"),
     "/app.css": ("app.css", "text/css; charset=utf-8"),
+    "/audio.js": ("audio.js", "text/javascript; charset=utf-8"),
     "/app.js": ("app.js", "text/javascript; charset=utf-8"),
     "/assets/board/ocean.webp": ("assets/board/ocean.webp", "image/webp"),
     "/assets/board/terrain-brick.webp": (

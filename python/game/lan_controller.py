@@ -117,6 +117,7 @@ def _default_game_factory(
         board_seed=settings.board_seed,
         custom_map=settings.custom_map,
         house_rules=settings.house_rules,
+        variant_config=settings.variant,
         ai_player_count=settings.ai_player_count,
         ai_personality_mode=settings.ai_personality_mode,
         headless=True,
@@ -389,6 +390,7 @@ class LanServerController:
             "ai_personality_mode",
             "custom_map",
             "house_rules",
+            "variant",
         }
         if not required_settings.issubset(raw_settings) or not set(
             raw_settings

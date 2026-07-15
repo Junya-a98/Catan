@@ -20,6 +20,7 @@ from game.lan_lobby import (
     RoomPhase,
     RoomSettings,
 )
+from game.variant import VariantConfig
 
 
 class FakeClock:
@@ -105,6 +106,7 @@ def test_room_settings_are_json_safe_and_allow_both_modes_and_integer_seeds():
         "board_seed": -42,
         "ai_player_count": 0,
         "ai_personality_mode": "standard",
+        "variant": VariantConfig.standard().to_document(),
     }
     assert json.loads(json.dumps(settings.to_public_dict()))["board_seed"] == -42
 

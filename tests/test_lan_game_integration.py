@@ -6,6 +6,7 @@ import pytest
 from game.game import CatanGame
 from game.lan_lobby_flow import LanLobbyFlowDisplayState
 from game.network_protocol import build_state_snapshot
+from game.variant import VariantConfig
 from game.network_view import parse_state_snapshot
 
 
@@ -123,6 +124,7 @@ def test_initial_screen_exposes_exact_room_settings_and_locks_lan_button(game):
         "victory_target": 10,
         "board_mode": "constrained",
         "board_seed": 4242,
+        "variant": VariantConfig.standard().to_document(),
     }
     buttons = {button.action: button for button in game.build_buttons()}
     assert buttons["lan_lobby_open"].enabled is True

@@ -24,6 +24,7 @@ from game.network_protocol import (
     NetworkProtocolError,
     build_game_command,
 )
+from game.variant import VariantConfig
 
 
 class LanServerRuntime:
@@ -170,6 +171,7 @@ class LanClientSession:
         ai_personality_mode: str | None = None,
         custom_map: CustomMapSpec | Mapping[str, Any] | None = None,
         house_rules: HouseRules | Mapping[str, Any] | None = None,
+        variant: VariantConfig | Mapping[str, Any] | None = None,
     ) -> None:
         include_ai_settings = (
             ai_player_count is not None or ai_personality_mode is not None
@@ -185,10 +187,14 @@ class LanClientSession:
             ),
             custom_map=custom_map,
             house_rules=house_rules,
+            variant=variant,
         ).to_public_dict()
         if not include_ai_settings:
             settings.pop("ai_player_count", None)
             settings.pop("ai_personality_mode", None)
+        if variant is None:
+            # Older callers omit the field; the authority restores standard.
+            settings.pop("variant", None)
         self._begin_session_sync()
         self._send(
             "create_room",

@@ -34,6 +34,7 @@ def prepare_complex_main_state(game):
     human, cpu = game.players
     game.start_main_phase()
     game.dice_rolled = True
+    game.last_dice_pair = (3, 5)
 
     human_node = game.board.nodes[0]
     cpu_node = game.board.nodes[12]
@@ -131,6 +132,16 @@ def test_save_is_rejected_during_dice_animation(game, tmp_path):
 
     with pytest.raises(SaveGameError, match="ダイス演出中"):
         save_game(game, tmp_path / "save.json")
+
+
+def test_restore_rejects_invalid_last_dice_pair(game, tmp_path):
+    save_path = save_game(game, tmp_path / "save.json")
+    data = json.loads(save_path.read_text(encoding="utf-8"))
+    data["phase"]["last_dice_pair"] = [0, 7]
+    save_path.write_text(json.dumps(data), encoding="utf-8")
+
+    with pytest.raises(SaveGameError, match="直近のダイス"):
+        load_game(game, save_path)
 
 
 def test_corrupt_save_rolls_back_without_changing_current_game(game, tmp_path):
