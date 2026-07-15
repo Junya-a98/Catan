@@ -89,6 +89,58 @@ def test_static_client_and_health_have_strict_security_headers(web_server):
     assert payload == b""
 
 
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/assets/board/ocean.webp",
+        "/assets/board/terrain-brick.webp",
+        "/assets/board/terrain-desert.webp",
+        "/assets/board/terrain-ore.webp",
+        "/assets/board/terrain-sheep.webp",
+        "/assets/board/terrain-wheat.webp",
+        "/assets/board/terrain-wood.webp",
+    ],
+)
+def test_board_webp_assets_are_served_from_exact_whitelist(web_server, path):
+    response, payload = request(web_server, "GET", path)
+    assert response.status == 200
+    assert response.getheader("Content-Type") == "image/webp"
+    assert response.getheader("Content-Length") == str(len(payload))
+    assert response.getheader("X-Content-Type-Options") == "nosniff"
+    assert "img-src 'self' data:" in response.getheader("Content-Security-Policy")
+    assert payload.startswith(b"RIFF")
+    assert payload[8:12] == b"WEBP"
+
+    response, payload = request(web_server, "HEAD", path)
+    assert response.status == 200
+    assert response.getheader("Content-Type") == "image/webp"
+    assert int(response.getheader("Content-Length")) > 0
+    assert response.getheader("X-Content-Type-Options") == "nosniff"
+    assert payload == b""
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/assets/board/unknown.webp",
+        "/assets/board/README.md",
+        "/assets/board/../app.js",
+        "/assets/board/%2e%2e/app.js",
+    ],
+)
+@pytest.mark.parametrize("method", ["GET", "HEAD"])
+def test_board_asset_route_rejects_paths_outside_exact_whitelist(
+    web_server, method, path
+):
+    response, payload = request(web_server, method, path)
+    assert response.status == 404
+    assert response.getheader("Content-Type") == "application/json; charset=utf-8"
+    if method == "HEAD":
+        assert payload == b""
+    else:
+        assert json.loads(payload)["error"]["code"] == "not_found"
+
+
 def test_http_session_can_create_room_and_restore_events(web_server):
     cookie = session_cookie(web_server)
     create = {

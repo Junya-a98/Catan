@@ -20,6 +20,7 @@ make web
 - プレイヤー参加と公開情報だけを受け取る観戦
 - ready、host開始、host権限の引き継ぎ
 - stable board IDを使う配置操作と、権威サーバーが配る合法手ボタン
+- 同梱の生成地形・海面、確率ドット、立体駒、桟橋付き港を使うローカル版準拠の盤面描画（実行時の外部画像取得なし）
 - プレイヤーごとの資源・発展カード・勝利点カードのマスキング
 - revision / sequenceによる古い状態と二重操作の拒否
 - ページ再読み込み時の最新状態・対局結果復元
@@ -41,6 +42,8 @@ make web
 - `python/game/network_replay.py`: revision履歴、閲覧者別snapshot、公開リザルトとイベント位置を保持
 - `python/web_main.py`: 起動CLI
 - `web/`: HTML / CSS / JavaScriptクライアント
+
+盤面画像は `web/assets/board/` に同梱し、Webサーバーは使用する7個のWebPだけを完全一致の許可リストから配信します。任意のファイルパスや素材フォルダー全体を公開しません。
 
 WebGatewayはHTTPやWebSocket固有のオブジェクトをゲーム側へ渡しません。両transportとも同じ `handle` / `poll` / `bootstrap` 境界を使い、部屋・AI・ゲーム操作は同じcontrollerへ到達します。
 

@@ -17,6 +17,23 @@ const CARD_LABELS = {
   year_of_plenty: "収穫",
   monopoly: "独占",
 };
+const BOARD_RESOURCE_COLORS = {
+  WOOD: [62, 129, 75],
+  SHEEP: [126, 178, 75],
+  WHEAT: [221, 174, 62],
+  BRICK: [177, 91, 64],
+  ORE: [126, 136, 149],
+  DESERT: [214, 178, 111],
+};
+const BOARD_TERRAIN_ASSETS = {
+  WOOD: "/assets/board/terrain-wood.webp",
+  SHEEP: "/assets/board/terrain-sheep.webp",
+  WHEAT: "/assets/board/terrain-wheat.webp",
+  BRICK: "/assets/board/terrain-brick.webp",
+  ORE: "/assets/board/terrain-ore.webp",
+  DESERT: "/assets/board/terrain-desert.webp",
+};
+const TOKEN_PIP_COUNTS = { 2: 1, 3: 2, 4: 3, 5: 4, 6: 5, 8: 5, 9: 4, 10: 3, 11: 2, 12: 1 };
 
 const state = {
   welcome: null,
@@ -682,66 +699,48 @@ function renderBoard(manifest, players) {
   layer.replaceChildren();
   const nodeById = new Map(manifest.nodes.map((node) => [node.id, node]));
   const bounds = manifest.coordinate_space.bounds;
-  const padding = 120;
-  elements["board-svg"].setAttribute(
-    "viewBox",
-    `${bounds.min_x - padding} ${bounds.min_y - padding} ${bounds.max_x - bounds.min_x + padding * 2} ${bounds.max_y - bounds.min_y + padding * 2}`,
-  );
   const boardCenter = {
     x: (bounds.min_x + bounds.max_x) / 2,
     y: (bounds.min_y + bounds.max_y) / 2,
   };
+  const harborLayouts = layoutBoardHarbors(manifest, nodeById, boardCenter);
+  const viewBox = boardVisualBounds(bounds, harborLayouts);
+  elements["board-svg"].setAttribute(
+    "viewBox",
+    `${viewBox.x} ${viewBox.y} ${viewBox.width} ${viewBox.height}`,
+  );
 
+  const definitions = svg("defs");
   const tileLayer = svg("g");
   const harborLayer = svg("g");
   const edgeLayer = svg("g");
-  const pieceLayer = svg("g");
   const targetLayer = svg("g");
-  layer.append(tileLayer, harborLayer, edgeLayer, pieceLayer, targetLayer);
+  const roadLayer = svg("g");
+  const buildingLayer = svg("g");
+  const robberLayer = svg("g");
+  layer.append(
+    definitions,
+    tileLayer,
+    harborLayer,
+    edgeLayer,
+    targetLayer,
+    roadLayer,
+    buildingLayer,
+    robberLayer,
+  );
 
-  for (const tile of manifest.tiles) {
-    const center = tile.center;
-    const points = tile.corner_node_ids
-      .map((id) => nodeById.get(id)?.position)
-      .filter(Boolean);
-    const polygon = svg("polygon", {
-      points: points.map((point) => `${point.x},${point.y}`).join(" "),
-      class: `tile ${tile.resource}${state.targetOptions.has(tile.id) ? " board-target" : ""}`,
-    });
-    addTargetBehavior(polygon, tile.id);
-    tileLayer.append(polygon);
-    tileLayer.append(
-      svgText(center.x, center.y - 29, RESOURCE_LABELS[tile.resource] || tile.resource, "tile-text"),
-    );
-    if (tile.number !== null) {
-      tileLayer.append(svg("circle", { cx: center.x, cy: center.y + 5, r: 25, class: "number-token" }));
-      tileLayer.append(
-        svgText(
-          center.x,
-          center.y + 7,
-          String(tile.number),
-          `number-text${[6, 8].includes(tile.number) ? " hot" : ""}`,
-        ),
-      );
+  manifest.tiles.forEach((tile, index) => {
+    const points = boardTilePoints(tile, nodeById);
+    if (points.length < 3) return;
+    drawBoardTile(definitions, tileLayer, tile, points, index);
+    if (state.targetOptions.has(tile.id)) {
+      drawTileTarget(targetLayer, tile, points);
     }
-    if (tile.robber) {
-      tileLayer.append(svg("circle", { cx: center.x + 29, cy: center.y - 18, r: 12, class: "robber" }));
-      tileLayer.append(svg("rect", { x: center.x + 20, y: center.y - 14, width: 18, height: 26, rx: 7, class: "robber" }));
-    }
-  }
+    if (tile.robber) drawBoardRobber(robberLayer, tile.center);
+  });
 
-  const harborById = new Map(manifest.harbors.map((harbor) => [harbor.id, harbor]));
-  for (const harbor of manifest.harbors) {
-    const nodes = harbor.node_ids.map((id) => nodeById.get(id)?.position).filter(Boolean);
-    if (nodes.length !== 2) continue;
-    const middle = { x: (nodes[0].x + nodes[1].x) / 2, y: (nodes[0].y + nodes[1].y) / 2 };
-    const dx = middle.x - boardCenter.x;
-    const dy = middle.y - boardCenter.y;
-    const length = Math.hypot(dx, dy) || 1;
-    const badge = { x: middle.x + (dx / length) * 54, y: middle.y + (dy / length) * 54 };
-    harborLayer.append(svg("line", { x1: middle.x, y1: middle.y, x2: badge.x, y2: badge.y, class: "harbor-line" }));
-    harborLayer.append(svg("rect", { x: badge.x - 31, y: badge.y - 14, width: 62, height: 28, rx: 8, class: "harbor-badge" }));
-    harborLayer.append(svgText(badge.x, badge.y + 1, harbor.label, "harbor-text"));
+  for (const harborLayout of harborLayouts) {
+    drawBoardHarbor(harborLayer, harborLayout);
   }
 
   for (const edge of manifest.edges) {
@@ -749,74 +748,876 @@ function renderBoard(manifest, players) {
     if (nodes.length !== 2) continue;
     edgeLayer.append(svg("line", { x1: nodes[0].x, y1: nodes[0].y, x2: nodes[1].x, y2: nodes[1].y, class: "edge" }));
     if (edge.road) {
-      pieceLayer.append(svg("line", { x1: nodes[0].x, y1: nodes[0].y, x2: nodes[1].x, y2: nodes[1].y, class: "road-shadow" }));
-      pieceLayer.append(
-        svg("line", {
-          x1: nodes[0].x,
-          y1: nodes[0].y,
-          x2: nodes[1].x,
-          y2: nodes[1].y,
-          class: "road",
-          stroke: playerColor(players, edge.road.owner_player_index),
-        }),
+      drawRoadPiece(
+        roadLayer,
+        nodes[0],
+        nodes[1],
+        players,
+        edge.road.owner_player_index,
       );
     }
     if (state.targetOptions.has(edge.id)) {
-      const target = svg("line", {
-        x1: nodes[0].x,
-        y1: nodes[0].y,
-        x2: nodes[1].x,
-        y2: nodes[1].y,
-        stroke: "#ffdb7a",
-        "stroke-width": 16,
-        "stroke-opacity": 0.7,
-        "stroke-linecap": "round",
-        class: "board-target",
-      });
-      addTargetBehavior(target, edge.id);
-      targetLayer.append(target);
+      drawEdgeTarget(targetLayer, edge.id, nodes[0], nodes[1]);
     }
-    if (edge.harbor_id && !harborById.has(edge.harbor_id)) continue;
   }
 
   for (const node of manifest.nodes) {
-    if (node.building) {
-      const color = playerColor(players, node.building.owner_player_index);
-      if (node.building.type === "city") {
-        pieceLayer.append(svg("rect", { x: node.position.x - 13, y: node.position.y - 13, width: 26, height: 26, rx: 4, fill: color, class: "building" }));
-        pieceLayer.append(svg("rect", { x: node.position.x - 5, y: node.position.y - 22, width: 18, height: 18, rx: 3, fill: color, class: "building" }));
-      } else {
-        pieceLayer.append(
-          svg("polygon", {
-            points: `${node.position.x - 13},${node.position.y + 11} ${node.position.x - 13},${node.position.y - 4} ${node.position.x},${node.position.y - 16} ${node.position.x + 13},${node.position.y - 4} ${node.position.x + 13},${node.position.y + 11}`,
-            fill: color,
-            class: "building",
-          }),
-        );
-      }
-    }
     if (state.targetOptions.has(node.id)) {
-      const target = svg("circle", {
-        cx: node.position.x,
-        cy: node.position.y,
-        r: 14,
-        fill: "#ffdb7a",
-        "fill-opacity": 0.82,
-        stroke: "#fff1bd",
-        "stroke-width": 3,
-        class: "board-target",
-      });
-      addTargetBehavior(target, node.id);
-      targetLayer.append(target);
+      drawNodeTarget(targetLayer, node);
+    }
+    if (node.building) {
+      drawBuildingPiece(
+        buildingLayer,
+        node.position,
+        players,
+        node.building.owner_player_index,
+        node.building.type,
+      );
     }
   }
   renderLegend(players);
+}
+
+function boardTilePoints(tile, nodeById) {
+  return tile.corner_node_ids
+    .map((id) => nodeById.get(id)?.position)
+    .filter(Boolean);
+}
+
+function boardPointList(points) {
+  return points.map((point) => `${point.x},${point.y}`).join(" ");
+}
+
+function appendSvgTitle(element, text) {
+  const title = svg("title");
+  title.textContent = text;
+  element.append(title);
+}
+
+function drawBoardTile(definitions, tileLayer, tile, points, index) {
+  const pointList = boardPointList(points);
+  const fallbackColor = boardRgb(BOARD_RESOURCE_COLORS[tile.resource] || [130, 145, 125]);
+  const fallback = svg("polygon", {
+    points: pointList,
+    class: `tile ${tile.resource}`,
+    fill: fallbackColor,
+  });
+  appendSvgTitle(
+    fallback,
+    `${RESOURCE_LABELS[tile.resource] || tile.resource}${tile.number === null ? "" : ` ${tile.number}`}`,
+  );
+  tileLayer.append(fallback);
+
+  const clipId = `board-tile-clip-${index}`;
+  const clip = svg("clipPath", { id: clipId });
+  clip.append(svg("polygon", { points: pointList }));
+  definitions.append(clip);
+
+  const minX = Math.min(...points.map((point) => point.x));
+  const maxX = Math.max(...points.map((point) => point.x));
+  const minY = Math.min(...points.map((point) => point.y));
+  const maxY = Math.max(...points.map((point) => point.y));
+  const asset = BOARD_TERRAIN_ASSETS[tile.resource];
+  if (asset) {
+    tileLayer.append(
+      svg("image", {
+        href: asset,
+        x: minX,
+        y: minY,
+        width: maxX - minX,
+        height: maxY - minY,
+        preserveAspectRatio: "xMidYMid slice",
+        "clip-path": `url(#${clipId})`,
+        "pointer-events": "none",
+      }),
+    );
+  }
+  tileLayer.append(
+    svg("polygon", {
+      points: pointList,
+      fill: "none",
+      stroke: "#222322",
+      "stroke-width": 3,
+      "stroke-linejoin": "round",
+      "pointer-events": "none",
+    }),
+    svg("polygon", {
+      points: pointList,
+      fill: "none",
+      stroke: "#f0dda4",
+      "stroke-width": 0.9,
+      "stroke-opacity": 0.76,
+      "stroke-linejoin": "round",
+      "pointer-events": "none",
+    }),
+  );
+  if (tile.number !== null) drawNumberToken(tileLayer, tile.center, tile.number);
+}
+
+function drawNumberToken(layer, center, number) {
+  const hot = number === 6 || number === 8;
+  const textColor = hot ? "#b42a2a" : "#1e1e1a";
+  const ringColor = hot ? "#a63026" : "#3f392d";
+  const group = svg("g", { "pointer-events": "none" });
+  group.append(
+    svg("circle", { cx: center.x + 2, cy: center.y + 3, r: 25, fill: "#23221d" }),
+    svg("circle", { cx: center.x, cy: center.y, r: 24, fill: "#f9f5de" }),
+    svg("circle", {
+      cx: center.x,
+      cy: center.y,
+      r: 22.5,
+      fill: "none",
+      stroke: ringColor,
+      "stroke-width": hot ? 3.5 : 3,
+    }),
+    svg("path", {
+      d: boardArcPath(center, 19, 205, 330),
+      fill: "none",
+      stroke: "#fffff8",
+      "stroke-width": 2,
+      "stroke-linecap": "round",
+      "stroke-opacity": 0.9,
+    }),
+  );
+  const label = svg("text", {
+    x: center.x,
+    y: center.y - 7,
+    fill: textColor,
+    "font-size": 27,
+    "font-weight": 950,
+    "text-anchor": "middle",
+    "dominant-baseline": "middle",
+  });
+  label.textContent = String(number);
+  group.append(label);
+
+  const pipCount = TOKEN_PIP_COUNTS[number] || 0;
+  const spacing = 7;
+  const startX = center.x - ((pipCount - 1) * spacing) / 2;
+  for (let index = 0; index < pipCount; index += 1) {
+    group.append(
+      svg("circle", {
+        cx: startX + index * spacing,
+        cy: center.y + 13,
+        r: 2.7,
+        fill: textColor,
+      }),
+    );
+  }
+  layer.append(group);
+}
+
+function boardArcPath(center, radius, startDegrees, endDegrees) {
+  const point = (degrees) => {
+    const radians = degrees * Math.PI / 180;
+    return {
+      x: center.x + Math.cos(radians) * radius,
+      y: center.y + Math.sin(radians) * radius,
+    };
+  };
+  const start = point(startDegrees);
+  const end = point(endDegrees);
+  const largeArc = Math.abs(endDegrees - startDegrees) > 180 ? 1 : 0;
+  return `M ${start.x} ${start.y} A ${radius} ${radius} 0 ${largeArc} 1 ${end.x} ${end.y}`;
+}
+
+function drawBoardRobber(layer, center) {
+  const group = svg("g", { "pointer-events": "none" });
+  appendSvgTitle(group, "盗賊");
+  const bodyPoints = [
+    { x: center.x - 11, y: center.y - 3 },
+    { x: center.x + 11, y: center.y - 3 },
+    { x: center.x + 15, y: center.y + 17 },
+    { x: center.x - 15, y: center.y + 17 },
+  ];
+  group.append(
+    svg("ellipse", {
+      cx: center.x,
+      cy: center.y + 20,
+      rx: 19,
+      ry: 6,
+      fill: "#231d17",
+      "fill-opacity": 0.9,
+    }),
+    svg("polygon", {
+      points: boardPointList(bodyPoints),
+      fill: "#2b2a28",
+      stroke: "#171412",
+      "stroke-width": 5,
+      "stroke-linejoin": "round",
+    }),
+    svg("polygon", {
+      points: boardPointList(bodyPoints),
+      fill: "#2b2a28",
+      stroke: "#edcf90",
+      "stroke-width": 2,
+      "stroke-linejoin": "round",
+    }),
+    svg("circle", { cx: center.x, cy: center.y - 10, r: 12, fill: "#171412" }),
+    svg("circle", {
+      cx: center.x,
+      cy: center.y - 10,
+      r: 10,
+      fill: "#2b2a28",
+      stroke: "#edcf90",
+      "stroke-width": 2,
+    }),
+    svg("circle", { cx: center.x - 3, cy: center.y - 13, r: 3, fill: "#696864" }),
+    svg("line", {
+      x1: center.x - 7,
+      y1: center.y + 1,
+      x2: center.x - 9,
+      y2: center.y + 12,
+      stroke: "#5e5c58",
+      "stroke-width": 2,
+      "stroke-linecap": "round",
+    }),
+  );
+  layer.append(group);
+}
+
+function boardRgb(color) {
+  return `rgb(${color[0]}, ${color[1]}, ${color[2]})`;
+}
+
+function boardPlayerRgb(players, index) {
+  const color = players?.[index]?.color;
+  if (Array.isArray(color) && color.length >= 3) {
+    return color.slice(0, 3).map((channel) => Math.max(0, Math.min(255, Number(channel) || 0)));
+  }
+  return [230, 237, 241];
+}
+
+function mixBoardColor(color, target, amount) {
+  const ratio = Math.max(0, Math.min(1, amount));
+  return color.map((channel, index) => Math.round(channel + (target[index] - channel) * ratio));
+}
+
+function layoutBoardHarbors(manifest, nodeById, boardCenter) {
+  const layouts = [];
+  const occupied = [];
+  const buildingObstacles = manifest.nodes
+    .filter((node) => node.building)
+    .map((node) => ({
+      x: node.position.x - 24,
+      y: node.position.y - 23,
+      width: 48,
+      height: 46,
+    }));
+  const roadSegments = manifest.edges
+    .filter((edge) => edge.perimeter && edge.road)
+    .map((edge) => edge.node_ids.map((id) => nodeById.get(id)?.position).filter(Boolean))
+    .filter((points) => points.length === 2);
+
+  manifest.harbors.forEach((harbor, harborIndex) => {
+    const nodes = harbor.node_ids.map((id) => nodeById.get(id)?.position).filter(Boolean);
+    if (nodes.length !== 2) return;
+    const geometry = harborEdgeGeometry(nodes[0], nodes[1], boardCenter);
+    const labelWidth = Math.max(58, Math.min(88, Array.from(harbor.label || "3:1").length * 13 + 25));
+    const labelHeight = 32;
+    const tangentOffsets = [0, -44, 44, -72, 72, -100, 100];
+    const outwardDistances = [78, 94, 110, 128, 146];
+    let rect = null;
+
+    for (const distance of outwardDistances) {
+      for (const tangentOffset of tangentOffsets) {
+        const center = {
+          x: geometry.midpoint.x + geometry.outward.x * distance + geometry.axis.x * tangentOffset,
+          y: geometry.midpoint.y + geometry.outward.y * distance + geometry.axis.y * tangentOffset,
+        };
+        const candidate = {
+          x: center.x - labelWidth / 2,
+          y: center.y - labelHeight / 2,
+          width: labelWidth,
+          height: labelHeight,
+        };
+        const visualCandidate = boardInflateRect(candidate, 7);
+        const overlapsBadge = occupied.some((previous) => boardRectsOverlap(visualCandidate, previous));
+        const overlapsBuilding = buildingObstacles.some((building) => boardRectsOverlap(visualCandidate, building));
+        const overlapsRoad = roadSegments.some(([start, end]) => (
+          boardSegmentIntersectsRect(start, end, boardInflateRect(candidate, 12))
+        ));
+        const overlapsTile = manifest.tiles.some((tile) => (
+          boardRectOverlapsCircle(visualCandidate, tile.center, 54)
+        ));
+        if (!overlapsBadge && !overlapsBuilding && !overlapsRoad && !overlapsTile) {
+          rect = candidate;
+          break;
+        }
+      }
+      if (rect) break;
+    }
+
+    if (!rect) {
+      const distance = 154 + harborIndex * 3;
+      const tangentOffset = (harborIndex % 2 ? -1 : 1) * 24;
+      const center = {
+        x: geometry.midpoint.x + geometry.outward.x * distance + geometry.axis.x * tangentOffset,
+        y: geometry.midpoint.y + geometry.outward.y * distance + geometry.axis.y * tangentOffset,
+      };
+      rect = {
+        x: center.x - labelWidth / 2,
+        y: center.y - labelHeight / 2,
+        width: labelWidth,
+        height: labelHeight,
+      };
+    }
+
+    const dock = harborDockGeometry(geometry);
+    const badgeCenter = { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2 };
+    const connectorLead = {
+      x: dock.connectorStart.x + geometry.outward.x * 18,
+      y: dock.connectorStart.y + geometry.outward.y * 18,
+    };
+    const connectorEnd = boardRectBoundaryPoint(rect, connectorLead);
+    const visualBounds = boardBoundsForPoints(
+      [
+        dock.innerLeft,
+        dock.innerRight,
+        dock.outerLeft,
+        dock.outerRight,
+        dock.connectorStart,
+        connectorLead,
+        connectorEnd,
+        badgeCenter,
+      ],
+      rect,
+      8,
+    );
+    const layout = {
+      harbor,
+      geometry,
+      dock,
+      rect,
+      connectorLead,
+      connectorEnd,
+      visualBounds,
+    };
+    layouts.push(layout);
+    occupied.push(boardInflateRect(rect, 8));
+  });
+  return layouts;
+}
+
+function harborEdgeGeometry(start, end, boardCenter) {
+  const dx = end.x - start.x;
+  const dy = end.y - start.y;
+  const length = Math.max(1, Math.hypot(dx, dy));
+  const axis = { x: dx / length, y: dy / length };
+  const midpoint = { x: (start.x + end.x) / 2, y: (start.y + end.y) / 2 };
+  let outward = { x: -axis.y, y: axis.x };
+  const radial = { x: midpoint.x - boardCenter.x, y: midpoint.y - boardCenter.y };
+  if (outward.x * radial.x + outward.y * radial.y < 0) {
+    outward = { x: -outward.x, y: -outward.y };
+  }
+  return { start, end, midpoint, axis, outward, length };
+}
+
+function harborDockGeometry(geometry) {
+  const halfSpan = Math.min(12, geometry.length * 0.24);
+  const shoreGap = 7;
+  const pierLength = 13;
+  const local = (along, away) => ({
+    x: geometry.midpoint.x + geometry.axis.x * along + geometry.outward.x * away,
+    y: geometry.midpoint.y + geometry.axis.y * along + geometry.outward.y * away,
+  });
+  return {
+    innerLeft: local(-halfSpan, shoreGap),
+    innerRight: local(halfSpan, shoreGap),
+    outerLeft: local(-halfSpan, shoreGap + pierLength),
+    outerRight: local(halfSpan, shoreGap + pierLength),
+    connectorStart: local(0, shoreGap + pierLength),
+  };
+}
+
+function boardVisualBounds(bounds, harborLayouts) {
+  let minX = bounds.min_x - 24;
+  let minY = bounds.min_y - 24;
+  let maxX = bounds.max_x + 24;
+  let maxY = bounds.max_y + 24;
+  for (const layout of harborLayouts) {
+    minX = Math.min(minX, layout.visualBounds.x);
+    minY = Math.min(minY, layout.visualBounds.y);
+    maxX = Math.max(maxX, layout.visualBounds.x + layout.visualBounds.width);
+    maxY = Math.max(maxY, layout.visualBounds.y + layout.visualBounds.height);
+  }
+  const margin = 28;
+  const x = Math.floor(minX - margin);
+  const y = Math.floor(minY - margin);
+  return {
+    x,
+    y,
+    width: Math.ceil(maxX + margin - x),
+    height: Math.ceil(maxY + margin - y),
+  };
+}
+
+function boardInflateRect(rect, amount) {
+  return {
+    x: rect.x - amount,
+    y: rect.y - amount,
+    width: rect.width + amount * 2,
+    height: rect.height + amount * 2,
+  };
+}
+
+function boardRectsOverlap(first, second) {
+  return first.x < second.x + second.width
+    && first.x + first.width > second.x
+    && first.y < second.y + second.height
+    && first.y + first.height > second.y;
+}
+
+function boardRectOverlapsCircle(rect, center, radius) {
+  const nearestX = Math.max(rect.x, Math.min(center.x, rect.x + rect.width));
+  const nearestY = Math.max(rect.y, Math.min(center.y, rect.y + rect.height));
+  return Math.hypot(center.x - nearestX, center.y - nearestY) < radius;
+}
+
+function boardSegmentIntersectsRect(start, end, rect) {
+  const inside = (point) => point.x >= rect.x
+    && point.x <= rect.x + rect.width
+    && point.y >= rect.y
+    && point.y <= rect.y + rect.height;
+  if (inside(start) || inside(end)) return true;
+  const corners = [
+    { x: rect.x, y: rect.y },
+    { x: rect.x + rect.width, y: rect.y },
+    { x: rect.x + rect.width, y: rect.y + rect.height },
+    { x: rect.x, y: rect.y + rect.height },
+  ];
+  return corners.some((corner, index) => (
+    boardSegmentsIntersect(start, end, corner, corners[(index + 1) % corners.length])
+  ));
+}
+
+function boardSegmentsIntersect(firstStart, firstEnd, secondStart, secondEnd) {
+  const orientation = (a, b, c) => (
+    (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x)
+  );
+  const onSegment = (a, b, point) => point.x >= Math.min(a.x, b.x) - 0.001
+    && point.x <= Math.max(a.x, b.x) + 0.001
+    && point.y >= Math.min(a.y, b.y) - 0.001
+    && point.y <= Math.max(a.y, b.y) + 0.001;
+  const firstA = orientation(firstStart, firstEnd, secondStart);
+  const firstB = orientation(firstStart, firstEnd, secondEnd);
+  const secondA = orientation(secondStart, secondEnd, firstStart);
+  const secondB = orientation(secondStart, secondEnd, firstEnd);
+  if (((firstA > 0 && firstB < 0) || (firstA < 0 && firstB > 0))
+    && ((secondA > 0 && secondB < 0) || (secondA < 0 && secondB > 0))) {
+    return true;
+  }
+  if (Math.abs(firstA) < 0.001 && onSegment(firstStart, firstEnd, secondStart)) return true;
+  if (Math.abs(firstB) < 0.001 && onSegment(firstStart, firstEnd, secondEnd)) return true;
+  if (Math.abs(secondA) < 0.001 && onSegment(secondStart, secondEnd, firstStart)) return true;
+  return Math.abs(secondB) < 0.001 && onSegment(secondStart, secondEnd, firstEnd);
+}
+
+function boardRectBoundaryPoint(rect, toward) {
+  const center = { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2 };
+  const dx = toward.x - center.x;
+  const dy = toward.y - center.y;
+  const ratio = Math.max(
+    Math.abs(dx) / Math.max(1, rect.width / 2),
+    Math.abs(dy) / Math.max(1, rect.height / 2),
+  ) || 1;
+  return { x: center.x + dx / ratio, y: center.y + dy / ratio };
+}
+
+function boardBoundsForPoints(points, rect, padding) {
+  const xs = points.map((point) => point.x).concat(rect.x, rect.x + rect.width + 4);
+  const ys = points.map((point) => point.y).concat(rect.y, rect.y + rect.height + 5);
+  const minX = Math.min(...xs) - padding;
+  const minY = Math.min(...ys) - padding;
+  const maxX = Math.max(...xs) + padding;
+  const maxY = Math.max(...ys) + padding;
+  return { x: minX, y: minY, width: maxX - minX, height: maxY - minY };
+}
+
+function drawBoardHarbor(layer, layout) {
+  const { harbor, geometry, dock, rect, connectorLead, connectorEnd } = layout;
+  const group = svg("g", { "pointer-events": "none" });
+  appendSvgTitle(group, `交換所 ${harbor.label}`);
+  const shadowOffset = { x: geometry.axis.x + geometry.outward.x * 2, y: geometry.axis.y + geometry.outward.y * 2 };
+  const shifted = (point, amount = 1) => ({
+    x: point.x + shadowOffset.x * amount,
+    y: point.y + shadowOffset.y * amount,
+  });
+  const drawPier = (start, end) => {
+    const shadowStart = shifted(start);
+    const shadowEnd = shifted(end);
+    group.append(
+      svg("line", { x1: shadowStart.x, y1: shadowStart.y, x2: shadowEnd.x, y2: shadowEnd.y, stroke: "#251f1b", "stroke-width": 9, "stroke-linecap": "round" }),
+      svg("line", { x1: start.x, y1: start.y, x2: end.x, y2: end.y, stroke: "#463121", "stroke-width": 8, "stroke-linecap": "round" }),
+      svg("line", { x1: start.x, y1: start.y, x2: end.x, y2: end.y, stroke: "#9e693b", "stroke-width": 5, "stroke-linecap": "round" }),
+      svg("line", { x1: start.x - geometry.axis.x, y1: start.y - geometry.axis.y, x2: end.x - geometry.axis.x, y2: end.y - geometry.axis.y, stroke: "#e6b067", "stroke-width": 1.2, "stroke-linecap": "round" }),
+    );
+  };
+  drawPier(dock.innerLeft, dock.outerLeft);
+  drawPier(dock.innerRight, dock.outerRight);
+  drawPier(dock.outerLeft, dock.outerRight);
+  for (const point of [dock.outerLeft, dock.outerRight]) {
+    const shadow = shifted(point, 0.7);
+    group.append(
+      svg("circle", { cx: shadow.x, cy: shadow.y, r: 5, fill: "#34271e" }),
+      svg("circle", { cx: point.x, cy: point.y, r: 4, fill: "#b17642" }),
+      svg("circle", { cx: point.x - 1, cy: point.y - 1, r: 2, fill: "#ebbb76" }),
+    );
+  }
+
+  const connectorPoints = [dock.connectorStart, connectorLead, connectorEnd];
+  const shadowPoints = connectorPoints.map((point) => `${point.x + 2},${point.y + 3}`).join(" ");
+  group.append(
+    svg("polyline", { points: shadowPoints, fill: "none", stroke: "#383027", "stroke-width": 4, "stroke-linejoin": "round", "stroke-linecap": "round" }),
+    svg("polyline", { points: boardPointList(connectorPoints), fill: "none", stroke: "#dabc88", "stroke-width": 2, "stroke-linejoin": "round", "stroke-linecap": "round" }),
+    svg("rect", { x: rect.x + 3, y: rect.y + 4, width: rect.width, height: rect.height, rx: 8, fill: "#2b231d" }),
+    svg("rect", { x: rect.x, y: rect.y, width: rect.width, height: rect.height, rx: 8, fill: "#dab577" }),
+    svg("rect", { x: rect.x + 2, y: rect.y + 2, width: rect.width - 4, height: rect.height - 4, rx: 6, fill: "#eed39f" }),
+    svg("line", { x1: rect.x + 9, y1: rect.y + 5, x2: rect.x + rect.width - 9, y2: rect.y + 5, stroke: "#ffecc1", "stroke-width": 2, "stroke-linecap": "round" }),
+    svg("rect", { x: rect.x, y: rect.y, width: rect.width, height: rect.height, rx: 8, fill: "none", stroke: "#533a27", "stroke-width": 2 }),
+  );
+  const resourceColor = BOARD_RESOURCE_COLORS[harbor.resource];
+  const accent = resourceColor
+    ? resourceColor.map((channel) => Math.round((channel * 2 + 170) / 3))
+    : [95, 145, 178];
+  group.append(
+    svg("rect", { x: rect.x + 5, y: rect.y + 5, width: 7, height: rect.height - 10, rx: 3, fill: boardRgb(accent), stroke: "#49392b", "stroke-width": 1 }),
+  );
+  const label = svg("text", {
+    x: rect.x + rect.width / 2 + 3,
+    y: rect.y + rect.height / 2 + 1,
+    fill: "#483527",
+    "font-size": 12,
+    "font-weight": 850,
+    "text-anchor": "middle",
+    "dominant-baseline": "middle",
+  });
+  label.textContent = harbor.label;
+  group.append(label);
+  layer.append(group);
+}
+
+function drawRoadPiece(layer, nodeStart, nodeEnd, players, ownerIndex) {
+  const dx = nodeEnd.x - nodeStart.x;
+  const dy = nodeEnd.y - nodeStart.y;
+  const fullLength = Math.hypot(dx, dy);
+  if (fullLength < 2) return;
+  const axis = { x: dx / fullLength, y: dy / fullLength };
+  const normal = { x: -axis.y, y: axis.x };
+  const inset = Math.min(6, fullLength * 0.15);
+  const start = {
+    x: nodeStart.x + axis.x * inset,
+    y: nodeStart.y + axis.y * inset,
+  };
+  const length = fullLength - inset * 2;
+  const base = boardPlayerRgb(players, ownerIndex);
+  const light = mixBoardColor(base, [255, 255, 246], 0.52);
+  const shade = mixBoardColor(base, [24, 20, 17], 0.38);
+  const grain = mixBoardColor(base, [44, 30, 21], 0.28);
+  const group = svg("g", { "pointer-events": "none" });
+  appendSvgTitle(group, `${players?.[ownerIndex]?.name || `Player ${ownerIndex + 1}`}の街道`);
+
+  const localPoint = (along, across, offset = { x: 0, y: 0 }) => ({
+    x: start.x + axis.x * along + normal.x * across + offset.x,
+    y: start.y + axis.y * along + normal.y * across + offset.y,
+  });
+  const plank = (width, capExtension, offset = { x: 0, y: 0 }) => {
+    const half = width / 2;
+    const bevel = Math.min(3.5, length * 0.12);
+    return [
+      localPoint(-capExtension, -half * 0.48, offset),
+      localPoint(bevel, -half, offset),
+      localPoint(length - bevel, -half, offset),
+      localPoint(length + capExtension, -half * 0.48, offset),
+      localPoint(length + capExtension, half * 0.48, offset),
+      localPoint(length - bevel, half, offset),
+      localPoint(bevel, half, offset),
+      localPoint(-capExtension, half * 0.48, offset),
+    ];
+  };
+  group.append(
+    svg("polygon", { points: boardPointList(plank(17, 2.2, { x: 2.5, y: 3.5 })), fill: "#181a1c", "stroke-linejoin": "round" }),
+    svg("polygon", { points: boardPointList(plank(16, 2)), fill: "#191c20", "stroke-linejoin": "round" }),
+    svg("polygon", { points: boardPointList(plank(11, 1.4)), fill: boardRgb(base), "stroke-linejoin": "round" }),
+  );
+  const addLocalLine = (fromAlong, fromAcross, toAlong, toAcross, color, width) => {
+    const from = localPoint(fromAlong, fromAcross);
+    const to = localPoint(toAlong, toAcross);
+    group.append(svg("line", {
+      x1: from.x,
+      y1: from.y,
+      x2: to.x,
+      y2: to.y,
+      stroke: boardRgb(color),
+      "stroke-width": width,
+      "stroke-linecap": "round",
+    }));
+  };
+  addLocalLine(3.5, -3.5, length - 3.5, -3.5, light, 2);
+  addLocalLine(3.5, 3.7, length - 3.5, 3.7, shade, 2);
+  for (const [position, side] of [[0.30, -0.4], [0.64, 0.6]]) {
+    const middle = length * position;
+    addLocalLine(middle - 3, side, middle + 3, side, grain, 1);
+  }
+
+  const pattern = Math.abs(Number(players?.[ownerIndex]?.piece_pattern ?? ownerIndex) || 0) % 4;
+  if (pattern < 2) {
+    const positions = pattern === 0 ? [0.5] : [0.40, 0.60];
+    for (const position of positions) {
+      const point = localPoint(length * position, 0);
+      group.append(
+        svg("circle", { cx: point.x, cy: point.y, r: 2.2, fill: boardRgb(grain), stroke: boardRgb(light), "stroke-width": 1 }),
+      );
+    }
+  } else {
+    const positions = pattern === 2 ? [0.5] : [0.38, 0.62];
+    for (const position of positions) {
+      addLocalLine(length * position, -3, length * position, 3, light, 1.2);
+    }
+  }
+  layer.append(group);
+}
+
+function drawBuildingPiece(layer, center, players, ownerIndex, buildingType) {
+  const base = boardPlayerRgb(players, ownerIndex);
+  const light = mixBoardColor(base, [255, 255, 244], 0.50);
+  const roof = mixBoardColor(base, [48, 31, 22], 0.26);
+  const shade = mixBoardColor(base, [22, 19, 18], 0.43);
+  const detail = mixBoardColor(base, [23, 24, 27], 0.58);
+  const group = svg("g", { "pointer-events": "none" });
+  appendSvgTitle(
+    group,
+    `${players?.[ownerIndex]?.name || `Player ${ownerIndex + 1}`}の${buildingType === "city" ? "都市" : "開拓地"}`,
+  );
+  const points = (values, offset = { x: 0, y: 0 }) => values.map(([x, y]) => ({
+    x: center.x + x + offset.x,
+    y: center.y + y + offset.y,
+  }));
+  let silhouette;
+  let markCenter;
+  if (buildingType === "city") {
+    silhouette = [[-16, 12], [-16, -1], [-8, -10], [0, -3], [0, -13], [13, -13], [13, 12]];
+    group.append(
+      svg("ellipse", { cx: center.x, cy: center.y + 12, rx: 17, ry: 5, fill: "#181a1c", "fill-opacity": 0.92 }),
+      svg("polygon", { points: boardPointList(points(silhouette, { x: 2, y: 3 })), fill: "#181a1c", "stroke-linejoin": "round" }),
+      svg("polygon", { points: boardPointList(points(silhouette)), fill: boardRgb(base), "stroke-linejoin": "round" }),
+      svg("polygon", { points: boardPointList(points([[-16, -1], [-8, -10], [0, -3], [0, 1], [-8, -6], [-16, 2]])), fill: boardRgb(roof) }),
+      svg("polygon", { points: boardPointList(points([[0, -13], [13, -13], [10, -9], [0, -9]])), fill: boardRgb(light) }),
+      svg("polygon", { points: boardPointList(points([[10, -9], [13, -13], [13, 12], [9, 9]])), fill: boardRgb(shade) }),
+      svg("line", { x1: center.x - 14, y1: center.y - 1, x2: center.x - 8, y2: center.y - 8, stroke: boardRgb(light), "stroke-width": 2, "stroke-linecap": "round" }),
+      svg("line", { x1: center.x, y1: center.y - 8, x2: center.x, y2: center.y + 10, stroke: boardRgb(detail), "stroke-width": 1 }),
+      svg("rect", { x: center.x + 4, y: center.y - 5, width: 4, height: 5, rx: 1, fill: boardRgb(detail) }),
+      svg("line", { x1: center.x + 4, y1: center.y - 5, x2: center.x + 7, y2: center.y - 5, stroke: boardRgb(light), "stroke-width": 1 }),
+      svg("rect", { x: center.x - 11, y: center.y + 4, width: 5, height: 8, rx: 1, fill: boardRgb(detail) }),
+    );
+    markCenter = { x: center.x + 5, y: center.y + 3 };
+  } else {
+    silhouette = [[-11, 10], [-11, -1], [0, -12], [11, -1], [11, 10]];
+    group.append(
+      svg("ellipse", { cx: center.x + 1.5, cy: center.y + 10.5, rx: 13.5, ry: 4.5, fill: "#181a1c", "fill-opacity": 0.92 }),
+      svg("polygon", { points: boardPointList(points(silhouette, { x: 2, y: 3 })), fill: "#181a1c", "stroke-linejoin": "round" }),
+      svg("polygon", { points: boardPointList(points(silhouette)), fill: boardRgb(base), "stroke-linejoin": "round" }),
+      svg("polygon", { points: boardPointList(points([[-11, -1], [0, -12], [11, -1], [9, 2], [0, -7], [-9, 2]])), fill: boardRgb(roof) }),
+      svg("polygon", { points: boardPointList(points([[7, 2], [11, -1], [11, 10], [7, 8]])), fill: boardRgb(shade) }),
+      svg("rect", { x: center.x - 2, y: center.y + 3, width: 5, height: 7, rx: 1, fill: boardRgb(detail) }),
+      svg("line", { x1: center.x - 9, y1: center.y - 1, x2: center.x, y2: center.y - 10, stroke: boardRgb(light), "stroke-width": 2, "stroke-linecap": "round" }),
+      svg("line", { x1: center.x - 9, y1: center.y + 1, x2: center.x - 9, y2: center.y + 8, stroke: boardRgb(light), "stroke-width": 1 }),
+    );
+    markCenter = { x: center.x, y: center.y - 2 };
+  }
+  drawOwnerPattern(
+    group,
+    markCenter,
+    Number(players?.[ownerIndex]?.piece_pattern ?? ownerIndex) || 0,
+    boardRgb(light),
+    3,
+  );
+  group.append(
+    svg("polygon", {
+      points: boardPointList(points(silhouette)),
+      fill: "none",
+      stroke: "#191c20",
+      "stroke-width": 2,
+      "stroke-linejoin": "round",
+    }),
+  );
+  layer.append(group);
+}
+
+function drawOwnerPattern(layer, center, patternValue, color, radius) {
+  const pattern = Math.abs(patternValue) % 4;
+  if (pattern === 0) {
+    layer.append(svg("circle", { cx: center.x, cy: center.y, r: Math.max(1, radius - 1), fill: color }));
+  } else if (pattern === 1) {
+    layer.append(svg("polygon", { points: boardPointList([
+      { x: center.x, y: center.y - radius },
+      { x: center.x + radius, y: center.y },
+      { x: center.x, y: center.y + radius },
+      { x: center.x - radius, y: center.y },
+    ]), fill: color }));
+  } else if (pattern === 2) {
+    layer.append(svg("polygon", { points: boardPointList([
+      { x: center.x, y: center.y - radius },
+      { x: center.x + radius, y: center.y + radius },
+      { x: center.x - radius, y: center.y + radius },
+    ]), fill: color }));
+  } else {
+    layer.append(svg("rect", {
+      x: center.x - radius + 1,
+      y: center.y - radius + 1,
+      width: radius * 2 - 1,
+      height: radius * 2 - 1,
+      rx: 0.7,
+      fill: color,
+    }));
+  }
+}
+
+function drawTileTarget(layer, tile, points) {
+  const option = state.targetOptions.get(tile.id);
+  const color = targetColor(option, "tile");
+  const group = svg("g", { class: "board-target" });
+  group.append(
+    svg("polygon", {
+      points: boardPointList(points),
+      fill: "#ffffff",
+      "fill-opacity": 0.001,
+      stroke: "none",
+      "pointer-events": "all",
+    }),
+    svg("polygon", {
+      points: boardPointList(points),
+      fill: "none",
+      stroke: "#192630",
+      "stroke-width": 8,
+      "stroke-linejoin": "round",
+      "pointer-events": "none",
+    }),
+    svg("polygon", {
+      points: boardPointList(points),
+      fill: "none",
+      stroke: color,
+      "stroke-width": 5,
+      "stroke-linejoin": "round",
+      "stroke-dasharray": "10 5",
+      "pointer-events": "none",
+    }),
+    svg("polygon", {
+      points: boardPointList(points),
+      fill: "none",
+      stroke: "#fffff5",
+      "stroke-width": 1.2,
+      "stroke-linejoin": "round",
+      "pointer-events": "none",
+    }),
+  );
+  addTargetBehavior(group, tile.id);
+  layer.append(group);
+}
+
+function drawEdgeTarget(layer, targetId, start, end) {
+  const option = state.targetOptions.get(targetId);
+  const color = targetColor(option, "edge");
+  const middle = { x: (start.x + end.x) / 2, y: (start.y + end.y) / 2 };
+  const group = svg("g", { class: "board-target" });
+  group.append(
+    svg("line", {
+      x1: start.x,
+      y1: start.y,
+      x2: end.x,
+      y2: end.y,
+      stroke: "#ffffff",
+      "stroke-width": 28,
+      "stroke-opacity": 0.001,
+      "stroke-linecap": "round",
+      "pointer-events": "stroke",
+    }),
+    svg("line", {
+      x1: start.x,
+      y1: start.y,
+      x2: end.x,
+      y2: end.y,
+      stroke: "#1f2b36",
+      "stroke-width": 13,
+      "stroke-linecap": "round",
+      "pointer-events": "none",
+    }),
+    svg("line", {
+      x1: start.x,
+      y1: start.y,
+      x2: end.x,
+      y2: end.y,
+      stroke: color,
+      "stroke-width": 7,
+      "stroke-linecap": "round",
+      "stroke-dasharray": "10 6",
+      "pointer-events": "none",
+    }),
+    svg("line", {
+      x1: start.x,
+      y1: start.y,
+      x2: end.x,
+      y2: end.y,
+      stroke: "#fffff5",
+      "stroke-width": 1.5,
+      "stroke-linecap": "round",
+      "pointer-events": "none",
+    }),
+    svg("circle", { cx: middle.x, cy: middle.y, r: 8, fill: "#1f2b36", stroke: color, "stroke-width": 2, "pointer-events": "none" }),
+    svg("line", { x1: middle.x - 3, y1: middle.y, x2: middle.x + 3, y2: middle.y, stroke: "#fffff5", "stroke-width": 1.5, "pointer-events": "none" }),
+    svg("line", { x1: middle.x, y1: middle.y - 3, x2: middle.x, y2: middle.y + 3, stroke: "#fffff5", "stroke-width": 1.5, "pointer-events": "none" }),
+  );
+  addTargetBehavior(group, targetId);
+  layer.append(group);
+}
+
+function drawNodeTarget(layer, node) {
+  const option = state.targetOptions.get(node.id);
+  const city = option?.args?.piece === "city";
+  const color = targetColor(option, "node");
+  const { x, y } = node.position;
+  const group = svg("g", { class: "board-target" });
+  group.append(
+    svg("circle", {
+      cx: x,
+      cy: y,
+      r: 23,
+      fill: "#ffffff",
+      "fill-opacity": 0.001,
+      stroke: "none",
+      "pointer-events": "all",
+    }),
+  );
+  if (city) {
+    group.append(
+      svg("rect", { x: x - 20, y: y - 20, width: 40, height: 40, rx: 9, fill: "none", stroke: "#192630", "stroke-width": 7, "pointer-events": "none" }),
+      svg("rect", { x: x - 20, y: y - 20, width: 40, height: 40, rx: 9, fill: "none", stroke: color, "stroke-width": 4, "pointer-events": "none" }),
+      svg("rect", { x: x - 18, y: y - 18, width: 36, height: 36, rx: 7, fill: "none", stroke: "#fffff5", "stroke-width": 1, "pointer-events": "none" }),
+    );
+  } else {
+    group.append(
+      svg("circle", { cx: x, cy: y, r: 15, fill: "none", stroke: "#192630", "stroke-width": 7, "pointer-events": "none" }),
+      svg("circle", { cx: x, cy: y, r: 15, fill: "none", stroke: color, "stroke-width": 4, "pointer-events": "none" }),
+      svg("circle", { cx: x, cy: y, r: 3, fill: "#fffff5", "pointer-events": "none" }),
+    );
+  }
+  addTargetBehavior(group, node.id);
+  layer.append(group);
+}
+
+function targetColor(option, targetKind) {
+  if (targetKind === "edge") return "#e1a0ff";
+  if (targetKind === "tile") {
+    return option?.command === "move_robber" ? "#ffaaa0" : "#ffe89a";
+  }
+  return option?.args?.piece === "city" ? "#ffe086" : "#84ffb2";
 }
 
 function addTargetBehavior(element, targetId) {
   const option = state.targetOptions.get(targetId);
   if (!option) return;
   element.setAttribute("tabindex", "0");
+  element.setAttribute("focusable", "true");
   element.setAttribute("role", "button");
   element.setAttribute("aria-label", commandLabel(option));
   element.addEventListener("click", () => sendGameCommand(option));
@@ -837,7 +1638,10 @@ function renderLegend(players) {
     const dot = document.createElement("span");
     dot.className = "legend-dot";
     dot.style.background = playerColor(players, index);
-    item.append(dot, document.createTextNode(player.name));
+    item.append(
+      dot,
+      document.createTextNode(`${player.marker || ""} ${player.name}`.trim()),
+    );
     legend.append(item);
   });
 }

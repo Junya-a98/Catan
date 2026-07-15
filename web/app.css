@@ -659,17 +659,21 @@ button:disabled {
   min-height: min(76vh, 860px);
   overflow: hidden;
   background:
-    radial-gradient(circle at center, rgba(49, 126, 154, 0.44), transparent 62%),
-    linear-gradient(150deg, rgba(16, 64, 89, 0.94), rgba(7, 31, 48, 0.98));
+    radial-gradient(circle at center, rgba(105, 178, 198, 0.18), transparent 58%),
+    linear-gradient(rgba(15, 62, 88, 0.28), rgba(3, 28, 48, 0.5)),
+    url("/assets/board/ocean.webp") center / 460px 460px repeat;
+  isolation: isolate;
 }
 
 .board-shell::before,
 .board-shell::after {
   position: absolute;
+  z-index: -1;
   width: 220px;
   height: 220px;
   content: "";
-  border: 1px solid rgba(155, 211, 228, 0.1);
+  pointer-events: none;
+  border: 1px solid rgba(199, 231, 239, 0.12);
   border-radius: 50%;
 }
 
@@ -686,7 +690,8 @@ button:disabled {
 #board-svg {
   display: block;
   width: 100%;
-  min-height: min(74vh, 830px);
+  height: min(74vh, 830px);
+  min-height: 560px;
   touch-action: manipulation;
 }
 
@@ -793,14 +798,16 @@ button:disabled {
 }
 
 .board-legend {
-  position: absolute;
-  right: 14px;
-  bottom: 14px;
+  position: relative;
   display: flex;
   flex-wrap: wrap;
-  gap: 6px;
-  justify-content: end;
-  max-width: 70%;
+  gap: 7px;
+  justify-content: center;
+  max-width: none;
+  min-height: 42px;
+  padding: 7px 14px 12px;
+  border-top: 1px solid rgba(215, 232, 240, 0.1);
+  background: linear-gradient(to bottom, rgba(5, 21, 34, 0.12), rgba(5, 21, 34, 0.48));
 }
 
 .legend-item {
@@ -809,7 +816,7 @@ button:disabled {
   align-items: center;
   padding: 5px 8px;
   color: #d9e5eb;
-  font-size: 9px;
+  font-size: 10px;
   font-weight: 800;
   border: 1px solid rgba(215, 232, 240, 0.16);
   border-radius: 999px;
@@ -1219,6 +1226,13 @@ noscript {
   .board-shell {
     position: relative;
     top: 0;
+    min-height: 0;
+  }
+
+  #board-svg {
+    height: auto;
+    min-height: 0;
+    aspect-ratio: 1 / 1;
   }
 
   .game-sidebar {
@@ -1303,12 +1317,14 @@ noscript {
   }
 
   .board-shell {
-    min-height: 62vh;
+    min-height: 0;
     border-radius: 16px;
   }
 
   #board-svg {
-    min-height: 60vh;
+    height: auto;
+    min-height: 0;
+    aspect-ratio: 1 / 1;
   }
 
   .game-sidebar .event-panel {

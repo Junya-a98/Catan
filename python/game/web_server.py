@@ -33,6 +33,31 @@ _STATIC_ROUTES = {
     "/index.html": ("index.html", "text/html; charset=utf-8"),
     "/app.css": ("app.css", "text/css; charset=utf-8"),
     "/app.js": ("app.js", "text/javascript; charset=utf-8"),
+    "/assets/board/ocean.webp": ("assets/board/ocean.webp", "image/webp"),
+    "/assets/board/terrain-brick.webp": (
+        "assets/board/terrain-brick.webp",
+        "image/webp",
+    ),
+    "/assets/board/terrain-desert.webp": (
+        "assets/board/terrain-desert.webp",
+        "image/webp",
+    ),
+    "/assets/board/terrain-ore.webp": (
+        "assets/board/terrain-ore.webp",
+        "image/webp",
+    ),
+    "/assets/board/terrain-sheep.webp": (
+        "assets/board/terrain-sheep.webp",
+        "image/webp",
+    ),
+    "/assets/board/terrain-wheat.webp": (
+        "assets/board/terrain-wheat.webp",
+        "image/webp",
+    ),
+    "/assets/board/terrain-wood.webp": (
+        "assets/board/terrain-wood.webp",
+        "image/webp",
+    ),
 }
 _CONTENT_SECURITY_POLICY = (
     "default-src 'self'; "
