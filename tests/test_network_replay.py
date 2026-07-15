@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 
+import game.network_protocol as network_protocol
 from game.network_replay import (
     NETWORK_REPLAY_FORMAT,
     NetworkReplayError,
@@ -277,6 +278,68 @@ def test_default_capture_reuses_network_snapshot_privacy():
     assert result["completed"] is True
     assert result["winner"] == {"seat": 1, "name": game.players[0].name}
     assert result["replay"] == {"available": True, "frame_count": 2}
+
+
+def test_replay_frames_never_archive_authority_private_variant_state(monkeypatch):
+    from game.game import CatanGame
+
+    private_sentinel = "VARIANT_PRIVATE_SENTINEL_MUST_NOT_ENTER_REPLAY"
+    game = CatanGame(
+        board_seed=7331,
+        ai_player_count=0,
+        ai_action_delay_ms=0,
+        headless=True,
+    )
+    authoritative = network_protocol.serialize_game(game)
+    authoritative["variant_state"]["private"] = {
+        "future_events": [private_sentinel]
+    }
+    monkeypatch.setattr(
+        network_protocol,
+        "serialize_game",
+        lambda _game: copy.deepcopy(authoritative),
+    )
+    store = NetworkReplayStore(max_frames=2)
+
+    store.capture_game("VAR001", game, revision=0)
+
+    for viewer in (None, 0, 1):
+        frame = store.frame_payload(
+            "VAR001",
+            viewer_player_index=viewer,
+            frame_index=0,
+        )
+        variant_state = frame["snapshot"]["state"]["variant_state"]
+        assert set(variant_state) == {
+            "format",
+            "version",
+            "kind",
+            "config_fingerprint",
+            "public",
+        }
+        assert "private" not in variant_state
+        assert private_sentinel not in json.dumps(
+            frame,
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+
+
+def test_replay_rejects_an_already_filtered_snapshot_with_variant_private_data():
+    leaked = snapshot(0, 0)
+    leaked["state"]["variant_state"] = {
+        "format": "catan-variant-state",
+        "version": 1,
+        "kind": "standard",
+        "config_fingerprint": "0" * 64,
+        "public": {},
+        "private": {"sentinel": "must-not-be-stored"},
+    }
+
+    with pytest.raises(NetworkReplayError) as error:
+        NetworkReplayStore().record_snapshot("VAR002", leaked)
+
+    assert error.value.code == "private_state_leak"
 
 
 def test_bounded_history_relinks_events_and_vp_progression_to_retained_frames():

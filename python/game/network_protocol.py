@@ -1,11 +1,13 @@
+from collections.abc import Mapping
+from copy import deepcopy
 import json
 import math
 import re
 import struct
-from copy import deepcopy
 
 from game.custom_map import CustomMapError, CustomMapSpec
 from game.persistence import serialize_game
+from game.variant_state import VariantState
 
 
 NETWORK_PROTOCOL_VERSION = 1
@@ -22,6 +24,15 @@ MAX_GAME_COMMAND_NAME_LENGTH = 64
 MAX_SNAPSHOT_LOG_MESSAGES = 200
 MAX_LIVE_MATCH_EVENTS = 200
 MAX_FINISHED_MATCH_EVENTS = 1_000
+
+_PUBLIC_VARIANT_STATE_FIELDS = (
+    "format",
+    "version",
+    "kind",
+    "config_fingerprint",
+    "public",
+)
+_FULL_VARIANT_STATE_FIELDS = frozenset((*_PUBLIC_VARIANT_STATE_FIELDS, "private"))
 
 _FRAME_HEADER = struct.Struct("!I")
 _GAME_COMMAND_PATTERN = re.compile(
@@ -367,6 +378,10 @@ def build_board_manifest(game):
 def build_state_snapshot(game, *, viewer_player_index=None, revision=0):
     """Build a viewer-specific state without leaking other players' private cards."""
     state = deepcopy(serialize_game(game))
+    if "variant_state" in state:
+        state["variant_state"] = _public_variant_state_document(
+            state["variant_state"]
+        )
     board_state = state.get("board")
     if isinstance(board_state, dict):
         # The manifest already carries every public tile/harbor needed by LAN
@@ -464,6 +479,40 @@ def build_state_snapshot(game, *, viewer_player_index=None, revision=0):
         "viewer_player_index": viewer_player_index,
         "board_manifest": build_board_manifest(game),
         "state": state,
+    }
+
+
+def _public_variant_state_document(value):
+    """Return the canonical public-only runtime variant document.
+
+    ``serialize_game`` persists the authoritative full document, including its
+    server-only ``private`` section.  Network snapshots must never copy that
+    section, even for the player who caused the snapshot or for a finished
+    match.  The central public-document parser validates the selected fields
+    after the private field has been discarded.
+    """
+
+    if not isinstance(value, Mapping):
+        raise NetworkProtocolError("variant_stateが不正です。")
+    if set(value) != _FULL_VARIANT_STATE_FIELDS:
+        raise NetworkProtocolError("variant_stateの完全文書が不正です。")
+    public_document = {
+        field: deepcopy(value[field]) for field in _PUBLIC_VARIANT_STATE_FIELDS
+    }
+    try:
+        public_document = VariantState.from_public_document(
+            public_document
+        ).to_public_document()
+    except (TypeError, ValueError) as exc:
+        raise NetworkProtocolError("variant_stateが不正です。") from exc
+
+    if not isinstance(public_document, Mapping) or set(public_document) != set(
+        _PUBLIC_VARIANT_STATE_FIELDS
+    ):
+        raise NetworkProtocolError("variant_stateの公開文書が不正です。")
+    return {
+        field: deepcopy(public_document[field])
+        for field in _PUBLIC_VARIANT_STATE_FIELDS
     }
 
 

@@ -41,6 +41,9 @@ _PRIVATE_PLAYER_FIELDS = (
     "new_development_cards",
     "victory_point_cards",
 )
+_PUBLIC_VARIANT_STATE_FIELDS = frozenset(
+    {"format", "version", "kind", "config_fingerprint", "public"}
+)
 _PUBLIC_RESULT_FIELDS = frozenset(
     {
         "format",
@@ -536,6 +539,22 @@ def _assert_snapshot_privacy(
     players: Sequence[Any],
     viewer_player_index: int | None,
 ) -> None:
+    if "variant_state" in state:
+        variant_state = state["variant_state"]
+        if not isinstance(variant_state, Mapping):
+            raise NetworkReplayError(
+                "invalid_snapshot", "variant_stateが不正です。"
+            )
+        if "private" in variant_state:
+            raise NetworkReplayError(
+                "private_state_leak",
+                "variantの非公開状態を含むスナップショットは保存できません。",
+            )
+        if set(variant_state) != _PUBLIC_VARIANT_STATE_FIELDS:
+            raise NetworkReplayError(
+                "invalid_snapshot", "variant_stateの公開文書が不正です。"
+            )
+
     for index, raw_player in enumerate(players):
         if not isinstance(raw_player, Mapping):
             raise NetworkReplayError("invalid_snapshot", "プレイヤー状態が不正です。")

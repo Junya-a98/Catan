@@ -1,5 +1,8 @@
+import json
+
 import pytest
 
+import game.network_protocol as network_protocol
 from game.network_protocol import NETWORK_PROTOCOL_VERSION
 from game.lan_controller import LanServerController, OutboundMessage
 from game.network_protocol import build_game_command
@@ -75,7 +78,22 @@ def test_browser_sessions_broadcast_lobby_and_restore_durable_state():
     assert restored[1]["lobby"]["revision"] >= 2
 
 
-def test_started_match_snapshots_keep_each_viewers_private_hand_private():
+def test_started_match_snapshots_keep_each_viewers_private_hand_private(monkeypatch):
+    private_sentinel = "VARIANT_PRIVATE_SENTINEL_MUST_NOT_ENTER_WEB_EVENTS"
+    original_serialize_game = network_protocol.serialize_game
+
+    def serialize_with_private_variant_state(game):
+        document = original_serialize_game(game)
+        document["variant_state"]["private"] = {
+            "server_history": [private_sentinel]
+        }
+        return document
+
+    monkeypatch.setattr(
+        network_protocol,
+        "serialize_game",
+        serialize_with_private_variant_state,
+    )
     gateway = WebGateway()
     host = gateway.open_session()
     guest = gateway.open_session()
@@ -112,6 +130,35 @@ def test_started_match_snapshots_keep_each_viewers_private_hand_private():
     assert host_state["command_options"] == [{"command": "roll_dice", "args": {}}]
     assert guest_state["command_options"] == []
     assert viewer_state["command_options"] == []
+
+    bootstrap_state = next(
+        event
+        for event in gateway.bootstrap(host)
+        if event["type"] == "state_snapshot"
+    )
+    replay_frame = gateway.handle(
+        host,
+        message("replay_frame_request", index=0),
+    )[-1]
+    for envelope in (
+        host_state,
+        guest_state,
+        viewer_state,
+        bootstrap_state,
+        replay_frame,
+    ):
+        encoded = json.dumps(envelope, ensure_ascii=False, allow_nan=False)
+        assert private_sentinel not in encoded
+        snapshot = envelope.get("snapshot", envelope)
+        variant_state = snapshot["state"]["variant_state"]
+        assert "private" not in variant_state
+        assert set(variant_state) == {
+            "format",
+            "version",
+            "kind",
+            "config_fingerprint",
+            "public",
+        }
 
 
 def test_reload_bootstrap_keeps_the_consumed_game_command_sequence():

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
+import hashlib
 import json
 import math
 import re
@@ -40,6 +41,9 @@ __all__ = (
     "PointView",
     "RoadView",
     "TileView",
+    "VARIANT_STATE_FORMAT",
+    "VARIANT_STATE_VERSION",
+    "VariantStateView",
     "parse_network_view",
     "parse_state_snapshot",
 )
@@ -68,6 +72,11 @@ MAX_RESOURCE_SELECTION = 2
 MAX_FREE_ROADS = 2
 MIN_VICTORY_TARGET = 5
 MAX_VICTORY_TARGET = 15
+VARIANT_STATE_FORMAT = "catan-variant-state"
+VARIANT_STATE_VERSION = 1
+VARIANT_CONFIG_VERSION = 1
+MAX_VARIANT_PUBLIC_DEPTH = 12
+MAX_VARIANT_PUBLIC_ITEMS = 2_000
 
 _RESOURCE_KEYS = ("WOOD", "SHEEP", "WHEAT", "BRICK", "ORE")
 _TILE_RESOURCES = frozenset((*_RESOURCE_KEYS, "DESERT"))
@@ -83,6 +92,24 @@ _BUILDING_TYPES = frozenset(("settlement", "city"))
 _BOARD_MODES = frozenset(("constrained", "fully_random", "custom"))
 _DOMESTIC_TRADE_EDIT_SIDES = frozenset(("give", "receive"))
 _FINGERPRINT_PATTERN = re.compile(r"[0-9a-f]{64}\Z")
+_VARIANT_STATE_KEYS = frozenset(
+    {"format", "version", "kind", "config_fingerprint", "public"}
+)
+_VARIANT_CONFIG_KEYS = frozenset({"version", "kind", "options"})
+_STANDARD_VARIANT_CONFIG_DOCUMENT = {
+    "version": VARIANT_CONFIG_VERSION,
+    "kind": "standard",
+    "options": {},
+}
+_STANDARD_VARIANT_CONFIG_FINGERPRINT = hashlib.sha256(
+    json.dumps(
+        _STANDARD_VARIANT_CONFIG_DOCUMENT,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+).hexdigest()
 _ID_PATTERNS = {
     "tile": re.compile(r"tile-[0-9]{1,4}\Z"),
     "node": re.compile(r"node-[0-9]{1,4}\Z"),
@@ -115,6 +142,38 @@ class FrozenCounts(Mapping[str, int]):
 
     def to_dict(self) -> dict[str, int]:
         return dict(self.entries)
+
+
+@dataclass(frozen=True)
+class VariantStateView:
+    """Immutable public-only state for the selected match variant."""
+
+    format: str
+    version: int
+    kind: str
+    config_fingerprint: str
+    public: Mapping[str, Any] = field(hash=False)
+
+    def __post_init__(self) -> None:
+        frozen = _freeze_variant_json(
+            self.public,
+            "variant_state.public",
+            item_budget=[MAX_VARIANT_PUBLIC_ITEMS],
+            allow_tuple=True,
+        )
+        if not isinstance(frozen, Mapping):
+            raise NetworkViewError("variant_state.public must be an object")
+        object.__setattr__(self, "public", frozen)
+
+    @classmethod
+    def standard(cls) -> VariantStateView:
+        return cls(
+            format=VARIANT_STATE_FORMAT,
+            version=VARIANT_STATE_VERSION,
+            kind="standard",
+            config_fingerprint=_STANDARD_VARIANT_CONFIG_FINGERPRINT,
+            public={},
+        )
 
 
 @dataclass(frozen=True)
@@ -323,6 +382,9 @@ class NetworkGameView:
             is_broadcast=False,
         )
     )
+    variant_state: VariantStateView = field(
+        default_factory=VariantStateView.standard
+    )
 
     @property
     def player_by_seat(self) -> Mapping[int, PlayerView]:
@@ -402,7 +464,19 @@ def parse_network_view(envelope: Any) -> NetworkGameView:
         _required(state, "phase", "snapshot.state"),
         player_count,
     )
-    victory_target = _parse_victory_target(_required(state, "rules", "snapshot.state"))
+    rules = _mapping(
+        _required(state, "rules", "snapshot.state"),
+        "snapshot.state.rules",
+    )
+    victory_target = _parse_victory_target(rules)
+    variant_kind, variant_config_fingerprint = _parse_variant_config_identity(rules)
+    has_variant_state = "variant_state" in state
+    variant_state = _parse_variant_state(
+        state.get("variant_state"),
+        present=has_variant_state,
+        expected_kind=variant_kind,
+        expected_config_fingerprint=variant_config_fingerprint,
+    )
     bank_resources = _counts(
         _required(state, "bank", "snapshot.state"),
         _RESOURCE_KEYS,
@@ -544,6 +618,7 @@ def parse_network_view(envelope: Any) -> NetworkGameView:
         ),
         largest_army_size=phase.largest_army_size,
         domestic_trade=domestic_trade,
+        variant_state=variant_state,
     )
 
 
@@ -781,6 +856,116 @@ def _parse_phase(raw: Any, player_count: int) -> _PhaseData:
         longest_road_length=longest_road_length,
         largest_army_owner=largest_army_owner,
         largest_army_size=largest_army_size,
+    )
+
+
+def _parse_variant_config_identity(rules: Mapping[str, Any]) -> tuple[str, str]:
+    """Return the public config kind/fingerprint, defaulting legacy saves."""
+
+    if "variant" not in rules:
+        return "standard", _STANDARD_VARIANT_CONFIG_FINGERPRINT
+    label = "snapshot.state.rules.variant"
+    config = _mapping(rules["variant"], label)
+    if set(config) != _VARIANT_CONFIG_KEYS:
+        raise NetworkViewError(f"{label} has missing or unknown keys")
+    version = _integer(
+        _required(config, "version", label),
+        f"{label}.version",
+        minimum=VARIANT_CONFIG_VERSION,
+        maximum=VARIANT_CONFIG_VERSION,
+    )
+    kind = _text(
+        _required(config, "kind", label),
+        f"{label}.kind",
+        maximum=64,
+    )
+    options = _mapping(
+        _required(config, "options", label),
+        f"{label}.options",
+    )
+    frozen_options = _freeze_variant_json(
+        options,
+        f"{label}.options",
+        item_budget=[MAX_VARIANT_PUBLIC_ITEMS],
+    )
+    if kind == "standard" and frozen_options:
+        raise NetworkViewError(f"{label}.options must be empty for standard")
+    document = {
+        "version": version,
+        "kind": kind,
+        "options": _thaw_variant_json(frozen_options),
+    }
+    try:
+        canonical = json.dumps(
+            document,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError, UnicodeError) as exc:
+        raise NetworkViewError(f"{label} is not safe JSON") from exc
+    return kind, hashlib.sha256(canonical).hexdigest()
+
+
+def _parse_variant_state(
+    raw: Any,
+    *,
+    present: bool,
+    expected_kind: str,
+    expected_config_fingerprint: str,
+) -> VariantStateView:
+    label = "snapshot.state.variant_state"
+    if not present:
+        if expected_kind != "standard":
+            raise NetworkViewError(f"{label} is required for a non-standard variant")
+        return VariantStateView.standard()
+
+    document = _mapping(raw, label)
+    if "private" in document:
+        raise NetworkViewError(f"{label} must never contain a private key")
+    if set(document) != _VARIANT_STATE_KEYS:
+        raise NetworkViewError(f"{label} has missing or unknown keys")
+    if _required(document, "format", label) != VARIANT_STATE_FORMAT:
+        raise NetworkViewError(f"{label}.format is unsupported")
+    version = _integer(
+        _required(document, "version", label),
+        f"{label}.version",
+        minimum=VARIANT_STATE_VERSION,
+        maximum=VARIANT_STATE_VERSION,
+    )
+    kind = _text(
+        _required(document, "kind", label),
+        f"{label}.kind",
+        maximum=64,
+    )
+    if kind != expected_kind:
+        raise NetworkViewError(f"{label}.kind does not match rules.variant")
+    config_fingerprint = _fingerprint(
+        _required(document, "config_fingerprint", label),
+        f"{label}.config_fingerprint",
+    )
+    if config_fingerprint != expected_config_fingerprint:
+        raise NetworkViewError(
+            f"{label}.config_fingerprint does not match rules.variant"
+        )
+    public = _mapping(
+        _required(document, "public", label),
+        f"{label}.public",
+    )
+    if kind == "standard" and public:
+        raise NetworkViewError(f"{label}.public must be empty for standard")
+    frozen_public = _freeze_variant_json(
+        public,
+        f"{label}.public",
+        item_budget=[MAX_VARIANT_PUBLIC_ITEMS],
+    )
+    return VariantStateView(
+        format=VARIANT_STATE_FORMAT,
+        version=version,
+        kind=kind,
+        config_fingerprint=config_fingerprint,
+        public=frozen_public,
     )
 
 
@@ -1464,6 +1649,79 @@ def _validate_manifest_size(manifest: Mapping[str, Any]) -> None:
         raise NetworkViewError("snapshot.board_manifest is not safe JSON") from exc
     if len(encoded) > MAX_BOARD_MANIFEST_BYTES:
         raise NetworkViewError("snapshot.board_manifest exceeds the size limit")
+
+
+def _freeze_variant_json(
+    value: Any,
+    label: str,
+    *,
+    item_budget: list[int],
+    depth: int = 0,
+    allow_tuple: bool = False,
+) -> Any:
+    """Copy a bounded JSON value into immutable client-owned containers."""
+
+    if depth > MAX_VARIANT_PUBLIC_DEPTH:
+        raise NetworkViewError(f"{label} exceeds the nesting limit")
+    if item_budget[0] <= 0:
+        raise NetworkViewError(f"{label} exceeds the item limit")
+    item_budget[0] -= 1
+    if isinstance(value, Mapping):
+        result = {}
+        for key, child in value.items():
+            if (
+                not isinstance(key, str)
+                or not 1 <= len(key) <= 128
+                or any(
+                    unicodedata.category(character).startswith("C")
+                    for character in key
+                )
+            ):
+                raise NetworkViewError(f"{label} has an invalid key")
+            result[key] = _freeze_variant_json(
+                child,
+                f"{label}.{key}",
+                item_budget=item_budget,
+                depth=depth + 1,
+                allow_tuple=allow_tuple,
+            )
+        return MappingProxyType(result)
+    if isinstance(value, list) or (allow_tuple and isinstance(value, tuple)):
+        return tuple(
+            _freeze_variant_json(
+                child,
+                f"{label}[{index}]",
+                item_budget=item_budget,
+                depth=depth + 1,
+                allow_tuple=allow_tuple,
+            )
+            for index, child in enumerate(value)
+        )
+    if value is None or isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        if abs(value) > MAX_SAFE_JSON_INTEGER:
+            raise NetworkViewError(f"{label} is outside the safe integer range")
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise NetworkViewError(f"{label} must be a finite number")
+        return value
+    if isinstance(value, str):
+        if len(value) > MAX_TEXT_LENGTH or any(
+            unicodedata.category(character).startswith("C") for character in value
+        ):
+            raise NetworkViewError(f"{label} is invalid text")
+        return value
+    raise NetworkViewError(f"{label} is not JSON-safe")
+
+
+def _thaw_variant_json(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {key: _thaw_variant_json(child) for key, child in value.items()}
+    if isinstance(value, tuple):
+        return [_thaw_variant_json(child) for child in value]
+    return value
 
 
 def _mapping(value: Any, label: str) -> Mapping[str, Any]:

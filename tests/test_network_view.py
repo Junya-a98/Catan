@@ -1,6 +1,8 @@
 import ast
 from copy import deepcopy
 from dataclasses import FrozenInstanceError
+import hashlib
+import json
 from pathlib import Path
 
 import pytest
@@ -17,6 +19,9 @@ from game.network_view import (
     MAX_NODES,
     MAX_VIEW_LOG_MESSAGES,
     NetworkViewError,
+    VARIANT_STATE_FORMAT,
+    VARIANT_STATE_VERSION,
+    VariantStateView,
     parse_network_view,
     parse_state_snapshot,
 )
@@ -61,6 +66,40 @@ def player_snapshot(authority_game):
     )
 
 
+def _variant_fingerprint(document):
+    canonical = json.dumps(
+        document,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def _set_variant_documents(
+    snapshot,
+    *,
+    kind="standard",
+    options=None,
+    public=None,
+):
+    config = {
+        "version": 1,
+        "kind": kind,
+        "options": {} if options is None else options,
+    }
+    snapshot["state"]["rules"]["variant"] = deepcopy(config)
+    snapshot["state"]["variant_state"] = {
+        "format": VARIANT_STATE_FORMAT,
+        "version": VARIANT_STATE_VERSION,
+        "kind": kind,
+        "config_fingerprint": _variant_fingerprint(config),
+        "public": {} if public is None else public,
+    }
+    return snapshot
+
+
 def test_parses_authority_snapshot_without_restoring_a_game(player_snapshot):
     view = parse_network_view(player_snapshot)
 
@@ -87,6 +126,120 @@ def test_parses_authority_snapshot_without_restoring_a_game(player_snapshot):
     assert view.players[1].resources is None
     assert view.players[1].development_cards is None
     assert view.logs == ("開始", "Player1が街道を建設")
+
+
+def test_parses_public_variant_state_as_an_immutable_dto(player_snapshot):
+    snapshot = _set_variant_documents(deepcopy(player_snapshot))
+
+    view = parse_network_view(snapshot)
+
+    assert isinstance(view.variant_state, VariantStateView)
+    assert view.variant_state.format == VARIANT_STATE_FORMAT
+    assert view.variant_state.version == VARIANT_STATE_VERSION
+    assert view.variant_state.kind == "standard"
+    assert view.variant_state.config_fingerprint == _variant_fingerprint(
+        {"version": 1, "kind": "standard", "options": {}}
+    )
+    assert dict(view.variant_state.public) == {}
+
+    with pytest.raises(TypeError):
+        view.variant_state.public["secret"] = "leak"
+    with pytest.raises(FrozenInstanceError):
+        view.variant_state.kind = "tampered"
+
+
+def test_legacy_snapshot_defaults_to_immutable_standard_variant_state(
+    player_snapshot,
+):
+    snapshot = deepcopy(player_snapshot)
+    snapshot["state"].pop("variant_state", None)
+    snapshot["state"]["rules"].pop("variant", None)
+
+    view = parse_network_view(snapshot)
+
+    assert view.variant_state == VariantStateView.standard()
+    assert dict(view.variant_state.public) == {}
+
+
+def test_rejects_variant_state_tampering_and_private_outer_data(player_snapshot):
+    valid = _set_variant_documents(deepcopy(player_snapshot))
+
+    private_leak = deepcopy(valid)
+    private_leak["state"]["variant_state"]["private"] = {
+        "event_deck": ["must-not-leak"]
+    }
+    with pytest.raises(NetworkViewError, match="private"):
+        parse_network_view(private_leak)
+
+    wrong_fingerprint = deepcopy(valid)
+    wrong_fingerprint["state"]["variant_state"]["config_fingerprint"] = "0" * 64
+    with pytest.raises(NetworkViewError, match="config_fingerprint.*does not match"):
+        parse_network_view(wrong_fingerprint)
+
+    wrong_kind = deepcopy(valid)
+    wrong_kind["state"]["variant_state"]["kind"] = "forecast_events"
+    with pytest.raises(NetworkViewError, match="kind.*does not match"):
+        parse_network_view(wrong_kind)
+
+    nonempty_standard_public = deepcopy(valid)
+    nonempty_standard_public["state"]["variant_state"]["public"] = {
+        "next_event": "rain"
+    }
+    with pytest.raises(NetworkViewError, match="public must be empty for standard"):
+        parse_network_view(nonempty_standard_public)
+
+    extra_outer_key = deepcopy(valid)
+    extra_outer_key["state"]["variant_state"]["unexpected"] = True
+    with pytest.raises(NetworkViewError, match="missing or unknown keys"):
+        parse_network_view(extra_outer_key)
+
+    missing_outer_key = deepcopy(valid)
+    del missing_outer_key["state"]["variant_state"]["public"]
+    with pytest.raises(NetworkViewError, match="missing or unknown keys"):
+        parse_network_view(missing_outer_key)
+
+
+def test_variant_state_must_match_the_full_rules_variant_document(player_snapshot):
+    snapshot = _set_variant_documents(
+        deepcopy(player_snapshot),
+        kind="forecast_events",
+        options={"catalog": "base"},
+        public={"forecast": [{"turn": 3, "event": "rain"}]},
+    )
+
+    view = parse_network_view(snapshot)
+    assert view.variant_state.kind == "forecast_events"
+    assert view.variant_state.public["forecast"][0]["event"] == "rain"
+
+    snapshot["state"]["variant_state"]["public"]["forecast"][0]["event"] = "storm"
+    assert view.variant_state.public["forecast"][0]["event"] == "rain"
+    with pytest.raises(TypeError):
+        view.variant_state.public["forecast"][0]["event"] = "tampered"
+
+    tampered_config = _set_variant_documents(
+        deepcopy(player_snapshot),
+        kind="forecast_events",
+        options={"catalog": "base"},
+        public={},
+    )
+    tampered_config["state"]["rules"]["variant"]["options"]["catalog"] = "expert"
+    with pytest.raises(NetworkViewError, match="config_fingerprint.*does not match"):
+        parse_network_view(tampered_config)
+
+
+def test_nonstandard_variant_state_is_required_when_its_config_is_present(
+    player_snapshot,
+):
+    snapshot = _set_variant_documents(
+        deepcopy(player_snapshot),
+        kind="forecast_events",
+        options={},
+        public={},
+    )
+    del snapshot["state"]["variant_state"]
+
+    with pytest.raises(NetworkViewError, match="required for a non-standard"):
+        parse_network_view(snapshot)
 
 
 def test_snapshot_exposes_exact_last_dice_pair(authority_game):

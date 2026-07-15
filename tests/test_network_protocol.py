@@ -1,6 +1,7 @@
 import json
 import os
 import struct
+from copy import deepcopy
 
 os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
 os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
@@ -8,6 +9,7 @@ os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
 import pygame
 import pytest
 
+import game.network_protocol as network_protocol
 from game.game import CatanGame
 from game.building import Building, BuildingType
 from game.custom_map import CustomMapSpec
@@ -88,6 +90,60 @@ def test_spectator_snapshot_hides_every_players_private_cards(game):
 
     assert all(player["resources"] is None for player in snapshot["state"]["players"])
     assert [player["resource_total"] for player in snapshot["state"]["players"]] == [2, 3, 0]
+
+
+def test_variant_state_is_public_only_for_players_and_spectators(
+    game, monkeypatch
+):
+    private_sentinel = "VARIANT_PRIVATE_SENTINEL_MUST_NOT_CROSS_NETWORK"
+    authoritative = network_protocol.serialize_game(game)
+    authoritative["variant_state"]["private"] = {
+        "hidden_history": [private_sentinel]
+    }
+    expected_public = {
+        key: deepcopy(value)
+        for key, value in authoritative["variant_state"].items()
+        if key != "private"
+    }
+    monkeypatch.setattr(
+        network_protocol,
+        "serialize_game",
+        lambda _game: deepcopy(authoritative),
+    )
+
+    for viewer in (0, None):
+        snapshot = build_state_snapshot(
+            game,
+            viewer_player_index=viewer,
+            revision=8,
+        )
+        assert snapshot["state"]["variant_state"] == expected_public
+        assert "private" not in snapshot["state"]["variant_state"]
+        assert private_sentinel not in json.dumps(
+            snapshot,
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+
+    # Projection must not mutate the authoritative full save document.
+    assert authoritative["variant_state"]["private"] == {
+        "hidden_history": [private_sentinel]
+    }
+
+
+def test_variant_state_public_projection_fails_closed_on_invalid_public_data(
+    game, monkeypatch
+):
+    authoritative = network_protocol.serialize_game(game)
+    authoritative["variant_state"]["public"] = {"unexpected": True}
+    monkeypatch.setattr(
+        network_protocol,
+        "serialize_game",
+        lambda _game: deepcopy(authoritative),
+    )
+
+    with pytest.raises(NetworkProtocolError, match="variant_state"):
+        build_state_snapshot(game, viewer_player_index=0)
 
 
 def test_frame_decoder_handles_fragmented_and_concatenated_messages():

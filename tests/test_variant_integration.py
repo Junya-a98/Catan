@@ -139,9 +139,19 @@ def test_replay_identity_includes_variant_and_loads_legacy_standard(game, tmp_pa
     with pytest.raises(ReplayError, match="メタデータ"):
         load_replay(tampered_path)
 
+    tampered_state = copy.deepcopy(document)
+    tampered_state["frames"][0]["snapshot"]["variant_state"][
+        "config_fingerprint"
+    ] = "0" * 64
+    tampered_state_path = tmp_path / "tampered-variant-state.json"
+    tampered_state_path.write_text(json.dumps(tampered_state), encoding="utf-8")
+    with pytest.raises(ReplayError, match="variant state"):
+        load_replay(tampered_state_path)
+
     legacy = copy.deepcopy(document)
     del legacy["metadata"]["variant_fingerprint"]
     del legacy["frames"][0]["snapshot"]["rules"]["variant"]
+    del legacy["frames"][0]["snapshot"]["variant_state"]
     legacy_path = tmp_path / "legacy-standard.json"
     legacy_path.write_text(json.dumps(legacy), encoding="utf-8")
     assert load_replay(legacy_path).frames[0].sequence == 0

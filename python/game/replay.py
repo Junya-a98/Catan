@@ -28,6 +28,7 @@ from game.persistence import (
     serialize_game,
 )
 from game.variant import VariantConfig
+from game.variant_state import VariantState, VariantStateError
 
 
 __all__ = (
@@ -653,6 +654,15 @@ def _snapshot_identity(snapshot: Dict[str, Any], sequence: int) -> Tuple[Any, ..
     except (TypeError, ValueError) as exc:
         raise ReplayError(
             f"リプレイのフレーム {sequence} のvariant設定が不正です。"
+        ) from exc
+    try:
+        VariantState.from_document(
+            snapshot.get("variant_state"),
+            config=variant_config,
+        )
+    except (VariantStateError, TypeError, ValueError) as exc:
+        raise ReplayError(
+            f"リプレイのフレーム {sequence} のvariant stateが不正です。"
         ) from exc
     variant_fingerprint = variant_config.fingerprint()
     seats = []

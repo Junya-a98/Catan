@@ -29,6 +29,7 @@ from game.match_metrics import (
 from game.resources import ResourceType
 from game.road import Road
 from game.variant import VariantConfig
+from game.variant_state import VariantState, VariantStateError
 
 
 SAVE_FORMAT = "catan-local-save"
@@ -171,6 +172,19 @@ def _variant_config_for_game(game):
     return variant_config
 
 
+def _variant_state_for_game(game, variant_config):
+    variant_state = getattr(game, "variant_state", None)
+    if variant_state is None:
+        return VariantState.initial(variant_config)
+    if not isinstance(variant_state, VariantState):
+        raise SaveGameError("variant stateを保存できません。")
+    try:
+        variant_state.validate_config(variant_config)
+    except VariantStateError as exc:
+        raise SaveGameError("variant stateと設定が一致しません。") from exc
+    return variant_state
+
+
 def _custom_map_for_game(game):
     if getattr(game, "board_mode", None) != "custom":
         return None
@@ -252,6 +266,7 @@ def serialize_game(game):
 
     house_rules = _house_rules_for_game(game)
     variant_config = _variant_config_for_game(game)
+    variant_state = _variant_state_for_game(game, variant_config)
     rules_document = {
         "victory_point_target": int(game.victory_point_target),
         "variant": variant_config.to_document(),
@@ -275,6 +290,7 @@ def serialize_game(game):
         "format": SAVE_FORMAT,
         "version": SAVE_VERSION,
         "rules": rules_document,
+        "variant_state": variant_state.to_document(),
         "match_metrics": _serialize_match_metrics(game),
         "board": board_document,
         "players": [
@@ -458,6 +474,13 @@ def restore_game(game, data, *, runtime_side_effects=True):
         variant_config = VariantConfig.from_document(rules_data.get("variant"))
     except (TypeError, ValueError) as exc:
         raise SaveGameError("variant設定が不正です。") from exc
+    try:
+        variant_state = VariantState.from_document(
+            data.get("variant_state"),
+            config=variant_config,
+        )
+    except (TypeError, ValueError) as exc:
+        raise SaveGameError("variant stateが不正です。") from exc
     victory_point_target = rules_data.get(
         "victory_point_target",
         WINNING_VICTORY_POINTS,
@@ -470,6 +493,7 @@ def restore_game(game, data, *, runtime_side_effects=True):
     game.victory_point_target = victory_point_target
     game.house_rules = house_rules
     game.variant_config = variant_config
+    game.variant_state = variant_state
 
     game.board_mode = board_data["mode"]
     game.board_seed = board_data["seed"]

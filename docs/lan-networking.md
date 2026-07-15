@@ -129,6 +129,7 @@ controllerのroom settingsは `ai_player_count` と `ai_personality_mode` も受
 - NaN / Infinity、過大frame、深すぎるargs、巨大文字列、循環参照を拒否します。
 - lobby snapshotも型・件数・席・roleを検証し、不正データを描画へ渡しません。
 - replayはread-onlyでcommand optionを除去し、他playerの手札、提示前の交易条件、発展カード山札順を保存時にも検査します。
+- バリアントの完全な実行時状態は権威サーバーだけが保持し、live snapshot・観戦・replayには公開領域だけを投影します。`private` キーの混入は保存時にも拒否します。
 - AIはroom専用の乱数状態で1ステップずつ実行し、失敗時はゲーム状態と乱数状態をrollbackします。
 
 Web adapterはこれらに加えてHost / Origin / Fetch Metadata、HttpOnly SameSite cookie、CSP、WebSocket browser mask、JSON object、message sizeを検証します。Web serverは非loopback addressへのbindを拒否します。

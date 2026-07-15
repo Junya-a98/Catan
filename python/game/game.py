@@ -109,6 +109,7 @@ from game.pre_game_settings_display import (
 from game.resources import BUILD_COSTS, ResourceType
 from game.road import Road
 from game.variant import VariantConfig
+from game.variant_state import VariantState
 from game.replay import (
     DEFAULT_REPLAY_DIR,
     ReplayError,
@@ -210,6 +211,7 @@ class CatanGame:
         )
         if not isinstance(self.variant_config, VariantConfig):
             raise TypeError("variant_config must be a VariantConfig")
+        self.variant_state = VariantState.initial(self.variant_config)
         self.custom_map_spec = custom_map
         if self.board_mode == "custom":
             if not isinstance(self.custom_map_spec, CustomMapSpec):
