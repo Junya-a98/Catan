@@ -98,6 +98,7 @@ function loadAnimationFunctions() {
     takePendingBoardAnimations,
     clearPendingBoardAnimations,
     detectNewBoardPieces,
+    detectRevealedTiles,
     detectNewDiceRoll,
     deterministicDicePair,
     dicePipPositions,
@@ -108,6 +109,7 @@ function loadAnimationFunctions() {
     variantConfigDocument,
     variantLabel,
     forecastEventPresentation,
+    frontierPresentation,
     audioCalls: globalThis.__audioCalls,
   };`, sandbox, { filename: "web/app.js" });
   return sandbox.__animationTest;
@@ -175,6 +177,26 @@ test("board diff finds only newly built roads, settlements, and city upgrades", 
   );
   assert.deepEqual(Array.from(animation.detectNewBoardPieces(next, next)), []);
   assert.deepEqual(Array.from(animation.detectNewBoardPieces(previous, manifest({ seed: 99, road: true }))), []);
+});
+
+test("frontier diff identifies only newly revealed stable tile ids", () => {
+  const previous = {
+    mode: "constrained",
+    seed: 0,
+    tiles: [
+      { id: "tile-1", revealed: false, resource: "UNKNOWN" },
+      { id: "tile-2", revealed: true, resource: "WOOD" },
+    ],
+  };
+  const next = {
+    ...previous,
+    tiles: [
+      { id: "tile-1", revealed: true, resource: "ORE" },
+      { id: "tile-2", revealed: true, resource: "WOOD" },
+    ],
+  };
+  assert.deepEqual(Array.from(animation.detectRevealedTiles(previous, next)), ["tile-1"]);
+  assert.deepEqual(Array.from(animation.detectRevealedTiles(next, next)), []);
 });
 
 test("published last_dice_pair is used exactly and agrees with its total", () => {
@@ -349,6 +371,33 @@ test("room creation sends canonical standard and forecast variant documents", ()
   );
   assert.equal(animation.variantLabel({ kind: "forecast_events" }), "予告イベント");
   assert.equal(animation.variantLabel({ kind: "standard" }), "通常ルール");
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(animation.variantConfigDocument("frontier"))),
+    {
+      version: 1,
+      kind: "frontier",
+      options: { initial_radius: 1, reveal_rule: "road_adjacent_v1" },
+    },
+  );
+  assert.equal(animation.variantLabel({ kind: "frontier" }), "フロンティア探索");
+});
+
+test("frontier status presents only public reveal progress", () => {
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(animation.frontierPresentation({
+      kind: "frontier",
+      public: {
+        revealed_tiles: ["-1,0", "0,0", "1,0"],
+        discovery_count: 2,
+      },
+    }))),
+    {
+      visible: true,
+      count: "3 / 19 公開",
+      detail: "街道から2タイルを発見。霧に接する街道で探索を続けられます。",
+    },
+  );
+  assert.equal(animation.frontierPresentation({ kind: "standard" }).visible, false);
 });
 
 test("forecast card presents countdown and active effects from public state only", () => {
@@ -385,6 +434,13 @@ test("forecast mode controls and persistent event card are present and styled", 
   assert.match(indexSource, /id="forecast-active-list"/);
   assert.match(cssSource, /\.forecast-event-card\s*\{/);
   assert.match(cssSource, /\.forecast-event-card\[hidden\]\s*\{[\s\S]*display:\s*none/);
+});
+
+test("frontier mode includes fog status and generated terrain asset", () => {
+  assert.match(indexSource, /<select name="variant_kind">[\s\S]*value="frontier"/);
+  assert.match(indexSource, /id="frontier-status-card" hidden/);
+  assert.match(cssSource, /\.frontier-status-card\s*\{/);
+  assert.match(appSource, /UNKNOWN:\s*"\/assets\/board\/frontier-fog\.webp"/);
 });
 
 test("animation CSS includes bounce, halo, dice landing, and reduced-motion overrides", () => {

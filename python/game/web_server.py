@@ -35,6 +35,10 @@ _STATIC_ROUTES = {
     "/audio.js": ("audio.js", "text/javascript; charset=utf-8"),
     "/app.js": ("app.js", "text/javascript; charset=utf-8"),
     "/assets/board/ocean.webp": ("assets/board/ocean.webp", "image/webp"),
+    "/assets/board/frontier-fog.webp": (
+        "assets/board/frontier-fog.webp",
+        "image/webp",
+    ),
     "/assets/board/terrain-brick.webp": (
         "assets/board/terrain-brick.webp",
         "image/webp",

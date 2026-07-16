@@ -209,6 +209,15 @@ def build_board_manifest(game):
         ],
         key=lambda item: item[0],
     )
+    tile_is_revealed = getattr(game, "is_frontier_tile_revealed", lambda _tile: True)
+    harbor_is_revealed = getattr(
+        game,
+        "is_frontier_harbor_revealed",
+        lambda _harbor: True,
+    )
+    public_harbors = {
+        harbor for _, harbor in harbor_edges if harbor_is_revealed(harbor)
+    }
 
     road_by_edge = {}
     for road in board.roads:
@@ -222,6 +231,7 @@ def build_board_manifest(game):
     harbor_by_edge = {
         frozenset((harbor.node1, harbor.node2)): harbor
         for _, harbor in harbor_edges
+        if harbor in public_harbors
     }
     perimeter_edges = {
         frozenset((node1, node2)) for node1, node2 in board.perimeter_edges
@@ -238,7 +248,8 @@ def build_board_manifest(game):
 
     tiles = []
     for tile in sorted_tiles:
-        number = tile.number
+        revealed = bool(tile_is_revealed(tile))
+        number = tile.number if revealed else None
         if number is not None and (
             isinstance(number, bool) or not isinstance(number, int)
         ):
@@ -251,10 +262,11 @@ def build_board_manifest(game):
                     "x": _validated_coordinate(tile.x),
                     "y": _validated_coordinate(tile.y),
                 },
-                "resource": tile.resource_type.name,
+                "revealed": revealed,
+                "resource": tile.resource_type.name if revealed else "UNKNOWN",
                 "number": number,
                 "corner_node_ids": [node_ids[node] for node in tile.corners],
-                "robber": tile is board.robber_tile,
+                "robber": revealed and tile is board.robber_tile,
             }
         )
 
@@ -280,7 +292,9 @@ def build_board_manifest(game):
                 "adjacent_node_ids": sorted(adjacent_nodes[node]),
                 "edge_ids": sorted(edge_ids_by_node[node]),
                 "harbor_ids": sorted(
-                    harbor_ids[harbor] for harbor in node.harbors
+                    harbor_ids[harbor]
+                    for harbor in node.harbors
+                    if harbor in public_harbors
                 ),
                 "building": building,
             }
@@ -318,6 +332,8 @@ def build_board_manifest(game):
 
     harbors = []
     for edge_id, harbor in harbor_edges:
+        if harbor not in public_harbors:
+            continue
         harbors.append(
             {
                 "id": harbor_ids[harbor],
@@ -346,7 +362,7 @@ def build_board_manifest(game):
         "format": "catan-board-manifest",
         "version": 1,
         "mode": str(board.mode),
-        "seed": board.seed,
+        "seed": 0 if getattr(game, "is_frontier_variant", lambda: False)() else board.seed,
         "coordinate_space": {
             "kind": "board-pixels",
             "bounds": bounds,
@@ -398,6 +414,8 @@ def build_state_snapshot(game, *, viewer_player_index=None, revision=0):
         # state; repeating the editable map document on every live snapshot
         # wastes bandwidth and enlarges the untrusted client input surface.
         board_state.pop("custom_map", None)
+        if getattr(game, "is_frontier_variant", lambda: False)():
+            board_state["seed"] = 0
     player_count = len(state["players"])
     if viewer_player_index is not None and (
         isinstance(viewer_player_index, bool)

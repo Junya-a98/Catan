@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from copy import deepcopy
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import hashlib
 import json
 import random
@@ -48,6 +48,7 @@ from game.network_protocol import (
     build_state_snapshot,
 )
 from game.persistence import restore_game, serialize_game
+from game.frontier import FRONTIER_KIND
 
 
 MAX_ROOMS = 32
@@ -400,6 +401,10 @@ class LanServerController:
                 "settingsのfieldが不正です。",
             )
         settings = RoomSettings(**raw_settings)
+        if settings.variant.kind == FRONTIER_KIND:
+            # The submitted seed must not let any participant reconstruct the
+            # fogged terrain.  Keep the authority seed secret for this mode.
+            settings = replace(settings, board_seed=secrets.randbits(52))
         code = self._new_room_code()
         lobby, grant = LobbyRoom.create(
             settings,

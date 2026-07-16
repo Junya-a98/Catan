@@ -136,6 +136,7 @@ def test_unknown_audio_script_paths_are_rejected(web_server, method, path):
     "path",
     [
         "/assets/board/ocean.webp",
+        "/assets/board/frontier-fog.webp",
         "/assets/board/terrain-brick.webp",
         "/assets/board/terrain-desert.webp",
         "/assets/board/terrain-ore.webp",

@@ -58,6 +58,43 @@ def create_room(
     return welcome["room_code"], welcome["reconnect_token"], outbound
 
 
+def test_frontier_room_replaces_submitted_seed_and_masks_authority_seed(monkeypatch):
+    monkeypatch.setattr(
+        "game.lan_controller.secrets.randbits",
+        lambda bits: 999_999 if bits == 52 else 111,
+    )
+    controller = LanServerController()
+    outbound = controller.handle(
+        "host",
+        message(
+            "create_room",
+            display_name="Host",
+            settings={
+                "player_count": 2,
+                "victory_target": 5,
+                "board_mode": "constrained",
+                "board_seed": 4242,
+                "variant": {
+                    "version": 1,
+                    "kind": "frontier",
+                    "options": {
+                        "initial_radius": 1,
+                        "reveal_rule": "road_adjacent_v1",
+                    },
+                },
+            },
+        ),
+    )
+    lobby_message = next(
+        item.message for item in outbound if item.message["type"] == "lobby_snapshot"
+    )
+    lobby = lobby_message["lobby"]
+    room_code = lobby["room_code"]
+
+    assert lobby["settings"]["board_seed"] == 0
+    assert controller._rooms[room_code].lobby.settings.board_seed == 999_999
+
+
 def join_player(controller, room_code, connection="guest", name="Guest"):
     outbound = controller.handle(
         connection,

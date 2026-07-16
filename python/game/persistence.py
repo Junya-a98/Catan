@@ -30,6 +30,7 @@ from game.resources import ResourceType
 from game.road import Road
 from game.variant import STANDARD_VARIANT_KIND, VariantConfig
 from game.variant_state import VariantState, VariantStateError
+from game.frontier import FRONTIER_KIND
 
 
 SAVE_FORMAT = "catan-local-save"
@@ -477,6 +478,8 @@ def restore_game(game, data, *, runtime_side_effects=True):
         variant_config = VariantConfig.from_document(rules_data.get("variant"))
     except (TypeError, ValueError) as exc:
         raise SaveGameError("variant設定が不正です。") from exc
+    if variant_config.kind == FRONTIER_KIND and custom_map is not None:
+        raise SaveGameError("frontier variantは生成盤面でのみ利用できます。")
     try:
         variant_state = VariantState.from_document(
             data.get("variant_state"),
@@ -615,6 +618,11 @@ def restore_game(game, data, *, runtime_side_effects=True):
         label="盗賊位置",
         allow_none=False,
     )
+    if (
+        game.variant_config.kind == FRONTIER_KIND
+        and not game.is_frontier_tile_revealed(game.board.robber_tile)
+    ):
+        raise SaveGameError("frontier stateで盗賊タイルが未公開です。")
 
     game.bank.resources = _resource_map_from_json(data.get("bank"), label="銀行")
     deck = data.get("development_deck")

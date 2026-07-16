@@ -21,12 +21,18 @@ from game.forecast_events import (
     ForecastEventError,
     canonical_forecast_options,
 )
+from game.frontier import (
+    DEFAULT_FRONTIER_OPTIONS,
+    FRONTIER_KIND,
+    FrontierError,
+    canonical_frontier_options,
+)
 
 
 VARIANT_CONFIG_VERSION = 1
 STANDARD_VARIANT_KIND = "standard"
 SUPPORTED_VARIANT_KINDS = frozenset(
-    {STANDARD_VARIANT_KIND, FORECAST_EVENTS_KIND}
+    {STANDARD_VARIANT_KIND, FORECAST_EVENTS_KIND, FRONTIER_KIND}
 )
 _DOCUMENT_KEYS = frozenset({"version", "kind", "options"})
 
@@ -57,11 +63,16 @@ class VariantConfig:
             if self.options:
                 raise ValueError("standard variant の options は空にしてください。")
             canonical_options = {}
-        else:
+        elif self.kind == FORECAST_EVENTS_KIND:
             try:
                 canonical_options = canonical_forecast_options(self.options)
             except ForecastEventError as exc:
                 raise ValueError("forecast_events options が不正です。") from exc
+        else:
+            try:
+                canonical_options = canonical_frontier_options(self.options)
+            except FrontierError as exc:
+                raise ValueError("frontier options が不正です。") from exc
 
         # Never retain a caller-owned mutable mapping in a room or running
         # match.
@@ -92,6 +103,12 @@ class VariantConfig:
         if event_interval_turns is not None:
             options["event_interval_turns"] = event_interval_turns
         return cls(kind=FORECAST_EVENTS_KIND, options=options)
+
+    @classmethod
+    def frontier(cls) -> VariantConfig:
+        """Return the standard-board fog-of-exploration configuration."""
+
+        return cls(kind=FRONTIER_KIND, options=dict(DEFAULT_FRONTIER_OPTIONS))
 
     @classmethod
     def from_document(
@@ -176,4 +193,5 @@ __all__ = (
     "VARIANT_CONFIG_VERSION",
     "VariantConfig",
     "FORECAST_EVENTS_KIND",
+    "FRONTIER_KIND",
 )

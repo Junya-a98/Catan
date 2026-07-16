@@ -26,6 +26,15 @@ from game.forecast_events import (
     validate_forecast_public,
     validate_forecast_schedule,
 )
+from game.frontier import (
+    FRONTIER_KIND,
+    FrontierError,
+    axial_key,
+    create_initial_frontier_documents,
+    reveal_frontier_tiles,
+    validate_frontier_documents,
+    validate_frontier_public,
+)
 from game.variant import (
     STANDARD_VARIANT_KIND,
     SUPPORTED_VARIANT_KINDS,
@@ -103,7 +112,7 @@ class VariantState:
                     raise VariantStateError(
                         "standard variant の private state は空にしてください。"
                     )
-            else:
+            elif self.kind == FORECAST_EVENTS_KIND:
                 validate_forecast_public(self.public)
                 if self._projection_only:
                     if self.private:
@@ -112,8 +121,19 @@ class VariantState:
                         )
                 else:
                     validate_forecast_documents(self.public, self.private)
+            else:
+                validate_frontier_public(self.public)
+                if self._projection_only:
+                    if self.private:
+                        raise VariantStateError(
+                            "公開variant stateにprivate情報を含められません。"
+                        )
+                else:
+                    validate_frontier_documents(self.public, self.private)
         except ForecastEventError as exc:
             raise VariantStateError("forecast variant stateが不正です。") from exc
+        except FrontierError as exc:
+            raise VariantStateError("frontier variant stateが不正です。") from exc
 
         # Never retain a caller-owned mutable document in a room or match.
         object.__setattr__(self, "public", _freeze_json(self.public))
@@ -125,6 +145,7 @@ class VariantState:
         config: VariantConfig,
         *,
         deck_seed: str | None = None,
+        frontier_robber_axial: tuple[int, int] | None = None,
     ) -> VariantState:
         """Create a new runtime state bound to a validated config."""
 
@@ -140,6 +161,16 @@ class VariantState:
                 )
             except ForecastEventError as exc:
                 raise VariantStateError("forecast variant stateを作成できません。") from exc
+        elif config.kind == FRONTIER_KIND:
+            if frontier_robber_axial is None:
+                raise VariantStateError("frontierには初期盗賊タイルが必要です。")
+            try:
+                public, private = create_initial_frontier_documents(
+                    config.options,
+                    robber_axial=frontier_robber_axial,
+                )
+            except FrontierError as exc:
+                raise VariantStateError("frontier variant stateを作成できません。") from exc
         else:  # pragma: no cover - VariantConfig rejects this first.
             raise VariantStateError(f"未対応のvariant state kindです: {config.kind}")
         return cls(
@@ -293,6 +324,35 @@ class VariantState:
             return forecast_event_id(self.public)
         except ForecastEventError as exc:  # pragma: no cover - constructor validates.
             raise VariantStateError("forecast stateが不正です。") from exc
+
+    def is_frontier_tile_revealed(self, axial: tuple[int, int]) -> bool:
+        if self.kind != FRONTIER_KIND:
+            return True
+        try:
+            return axial_key(axial) in self.public["revealed_tiles"]
+        except FrontierError as exc:
+            raise VariantStateError("frontier tile座標が不正です。") from exc
+
+    def reveal_frontier_tiles(
+        self,
+        axials: tuple[tuple[int, int], ...] | list[tuple[int, int]],
+    ) -> tuple[VariantState, tuple[tuple[int, int], ...]]:
+        """Return a full state with authority-approved tiles made public."""
+
+        self.ensure_full()
+        if self.kind != FRONTIER_KIND:
+            return self, ()
+        try:
+            public, private, revealed = reveal_frontier_tiles(
+                self.public,
+                self.private,
+                axials,
+            )
+        except FrontierError as exc:
+            raise VariantStateError("frontier tileを公開できません。") from exc
+        if not revealed:
+            return self, ()
+        return self._with_documents(public, private), revealed
 
     def to_document(self) -> dict[str, Any]:
         """Return a fresh full-save document including private state."""

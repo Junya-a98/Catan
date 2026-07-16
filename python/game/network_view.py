@@ -79,7 +79,7 @@ MAX_VARIANT_PUBLIC_DEPTH = 12
 MAX_VARIANT_PUBLIC_ITEMS = 2_000
 
 _RESOURCE_KEYS = ("WOOD", "SHEEP", "WHEAT", "BRICK", "ORE")
-_TILE_RESOURCES = frozenset((*_RESOURCE_KEYS, "DESERT"))
+_TILE_RESOURCES = frozenset((*_RESOURCE_KEYS, "DESERT", "UNKNOWN"))
 _DEVELOPMENT_KEYS = (
     "KNIGHT",
     "ROAD_BUILDING",
@@ -215,6 +215,7 @@ class TileView:
     number: Optional[int]
     corner_node_ids: tuple[str, ...]
     robber: bool
+    revealed: bool = True
 
 
 @dataclass(frozen=True)
@@ -1258,8 +1259,17 @@ def _parse_tile(raw: Any, index: int, bounds: BoundsView) -> TileView:
         _TILE_RESOURCES,
         f"{label}.resource",
     )
+    revealed = _boolean(tile.get("revealed", True), f"{label}.revealed")
     number = tile.get("number")
-    if resource == "DESERT":
+    robber = _boolean(_required(tile, "robber", label), f"{label}.robber")
+    if not revealed:
+        if resource != "UNKNOWN" or number is not None or robber:
+            raise NetworkViewError(
+                f"{label} hidden tile must mask resource, number, and robber"
+            )
+    elif resource == "UNKNOWN":
+        raise NetworkViewError(f"{label}.resource cannot be UNKNOWN when revealed")
+    elif resource == "DESERT":
         if number is not None:
             raise NetworkViewError(f"{label}.number must be null for desert")
     else:
@@ -1280,7 +1290,8 @@ def _parse_tile(raw: Any, index: int, bounds: BoundsView) -> TileView:
         resource=resource,
         number=number,
         corner_node_ids=corners,
-        robber=_boolean(_required(tile, "robber", label), f"{label}.robber"),
+        robber=robber,
+        revealed=revealed,
     )
 
 

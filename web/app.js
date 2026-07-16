@@ -9,6 +9,7 @@ const RESOURCE_LABELS = {
   BRICK: "土",
   ORE: "鉄",
   DESERT: "砂漠",
+  UNKNOWN: "未探索",
 };
 const PIECE_LABELS = { road: "街道", settlement: "開拓地", city: "都市" };
 const CARD_LABELS = {
@@ -24,6 +25,7 @@ const BOARD_RESOURCE_COLORS = {
   BRICK: [177, 91, 64],
   ORE: [126, 136, 149],
   DESERT: [214, 178, 111],
+  UNKNOWN: [30, 78, 91],
 };
 const BOARD_TERRAIN_ASSETS = {
   WOOD: "/assets/board/terrain-wood.webp",
@@ -32,12 +34,17 @@ const BOARD_TERRAIN_ASSETS = {
   BRICK: "/assets/board/terrain-brick.webp",
   ORE: "/assets/board/terrain-ore.webp",
   DESERT: "/assets/board/terrain-desert.webp",
+  UNKNOWN: "/assets/board/frontier-fog.webp",
 };
 const TOKEN_PIP_COUNTS = { 2: 1, 3: 2, 4: 3, 5: 4, 6: 5, 8: 5, 9: 4, 10: 3, 11: 2, 12: 1 };
 const DEFAULT_FORECAST_OPTIONS = {
   catalog: "core_v1",
   forecast_lead_turns: 2,
   event_interval_turns: 6,
+};
+const DEFAULT_FRONTIER_OPTIONS = {
+  initial_radius: 1,
+  reveal_rule: "road_adjacent_v1",
 };
 const FORECAST_EVENT_PRESENTATION = {
   wheat_harvest_v1: {
@@ -77,6 +84,7 @@ const state = {
   reconnecting: false,
   targetOptions: new Map(),
   pendingBuildAnimations: new Set(),
+  pendingRevealAnimations: new Set(),
   pendingDiceAnimation: null,
   pendingAnimationRevision: null,
   currentView: null,
@@ -124,6 +132,9 @@ const elements = Object.fromEntries(
     "forecast-event-title",
     "forecast-event-detail",
     "forecast-active-list",
+    "frontier-status-card",
+    "frontier-status-count",
+    "frontier-status-detail",
     "ai-commentary",
     "ai-commentary-title",
     "ai-commentary-detail",
@@ -160,11 +171,38 @@ function variantConfigDocument(kind) {
       options: { ...DEFAULT_FORECAST_OPTIONS },
     };
   }
+  if (kind === "frontier") {
+    return {
+      version: 1,
+      kind,
+      options: { ...DEFAULT_FRONTIER_OPTIONS },
+    };
+  }
   return { version: 1, kind: "standard", options: {} };
 }
 
 function variantLabel(variant) {
-  return variant?.kind === "forecast_events" ? "予告イベント" : "通常ルール";
+  if (variant?.kind === "forecast_events") return "予告イベント";
+  if (variant?.kind === "frontier") return "フロンティア探索";
+  return "通常ルール";
+}
+
+function frontierPresentation(variantState) {
+  if (variantState?.kind !== "frontier") return { visible: false };
+  const publicState = variantState.public || {};
+  const revealed = Array.isArray(publicState.revealed_tiles)
+    ? publicState.revealed_tiles.length
+    : 0;
+  const discoveries = Number.isInteger(publicState.discovery_count)
+    ? publicState.discovery_count
+    : 0;
+  return {
+    visible: true,
+    count: `${revealed} / 19 公開`,
+    detail: discoveries > 0
+      ? `街道から${discoveries}タイルを発見。霧に接する街道で探索を続けられます。`
+      : "外周は未探索です。霧に接する街道を建設すると資源・数字・港が公開されます。",
+  };
 }
 
 function forecastEventPresentation(variantState) {
@@ -510,6 +548,12 @@ function queueLiveBoardAnimations(previousSnapshot, nextSnapshot) {
   for (const build of builds) {
     state.pendingBuildAnimations.add(`${build.kind}:${build.targetId}`);
   }
+  for (const targetId of detectRevealedTiles(
+    previousSnapshot?.board_manifest,
+    nextSnapshot?.board_manifest,
+  )) {
+    state.pendingRevealAnimations.add(targetId);
+  }
   const dice = detectNewDiceRoll(previousSnapshot, nextSnapshot);
   if (dice) state.pendingDiceAnimation = dice;
   state.pendingAnimationRevision = nextSnapshot.revision;
@@ -555,10 +599,11 @@ function takePendingBoardAnimations(snapshot) {
     && snapshot?.revision === state.pendingAnimationRevision;
   if (!isCurrentLive) {
     if (state.pendingAnimationRevision !== null) clearPendingBoardAnimations();
-    return { buildKeys: new Set(), dice: null };
+    return { buildKeys: new Set(), revealIds: new Set(), dice: null };
   }
   const plan = {
     buildKeys: new Set(state.pendingBuildAnimations),
+    revealIds: new Set(state.pendingRevealAnimations),
     dice: state.pendingDiceAnimation,
   };
   clearPendingBoardAnimations();
@@ -567,6 +612,7 @@ function takePendingBoardAnimations(snapshot) {
 
 function clearPendingBoardAnimations() {
   state.pendingBuildAnimations.clear();
+  state.pendingRevealAnimations.clear();
   state.pendingDiceAnimation = null;
   state.pendingAnimationRevision = null;
 }
@@ -604,6 +650,30 @@ function detectNewBoardPieces(previousManifest, nextManifest) {
     }
   }
   return builds;
+}
+
+function detectRevealedTiles(previousManifest, nextManifest) {
+  if (!previousManifest || !nextManifest) return [];
+  if (
+    previousManifest.mode !== nextManifest.mode
+    || previousManifest.seed !== nextManifest.seed
+    || previousManifest.custom_map_fingerprint !== nextManifest.custom_map_fingerprint
+  ) {
+    return [];
+  }
+  const previousTiles = new Map(
+    (previousManifest.tiles || []).map((tile) => [
+      tile.id,
+      tile.revealed !== false && tile.resource !== "UNKNOWN",
+    ]),
+  );
+  return (nextManifest.tiles || [])
+    .filter((tile) => (
+      previousTiles.get(tile.id) === false
+      && tile.revealed !== false
+      && tile.resource !== "UNKNOWN"
+    ))
+    .map((tile) => tile.id);
 }
 
 function detectNewDiceRoll(previousSnapshot, nextSnapshot) {
@@ -901,6 +971,7 @@ function renderGame() {
   elements["latest-event-title"].textContent = latest.title || "進行中";
   elements["latest-event-detail"].textContent = latest.detail || "次の操作を待っています。";
   renderForecastEvent(gameState.variant_state);
+  renderFrontierStatus(gameState.variant_state);
   renderAICommentary(gameState.ai?.status);
   const finished = state.liveSnapshot?.state?.phase?.name === "finished";
   elements["result-dashboard"].hidden = !finished;
@@ -932,6 +1003,15 @@ function renderForecastEvent(variantState) {
   for (const label of activeLabels) {
     activeList.append(textElement("span", label, "forecast-active-chip"));
   }
+}
+
+function renderFrontierStatus(variantState) {
+  const presentation = frontierPresentation(variantState);
+  const card = elements["frontier-status-card"];
+  card.hidden = !presentation.visible;
+  if (!presentation.visible) return;
+  elements["frontier-status-count"].textContent = presentation.count;
+  elements["frontier-status-detail"].textContent = presentation.detail;
 }
 
 function renderAICommentary(status) {
@@ -994,7 +1074,11 @@ async function sendGameCommand(option) {
   }
 }
 
-function renderBoard(manifest, players, animationPlan = { buildKeys: new Set(), dice: null }) {
+function renderBoard(
+  manifest,
+  players,
+  animationPlan = { buildKeys: new Set(), revealIds: new Set(), dice: null },
+) {
   if (!manifest) return;
   const layer = elements["board-layer"];
   layer.replaceChildren();
@@ -1035,7 +1119,14 @@ function renderBoard(manifest, players, animationPlan = { buildKeys: new Set(), 
   manifest.tiles.forEach((tile, index) => {
     const points = boardTilePoints(tile, nodeById);
     if (points.length < 3) return;
-    drawBoardTile(definitions, tileLayer, tile, points, index);
+    drawBoardTile(
+      definitions,
+      tileLayer,
+      tile,
+      points,
+      index,
+      animationPlan.revealIds?.has(tile.id) || false,
+    );
     if (state.targetOptions.has(tile.id)) {
       drawTileTarget(targetLayer, tile, points);
     }
@@ -1104,12 +1195,12 @@ function appendSvgTitle(element, text) {
   element.append(title);
 }
 
-function drawBoardTile(definitions, tileLayer, tile, points, index) {
+function drawBoardTile(definitions, tileLayer, tile, points, index, animateReveal = false) {
   const pointList = boardPointList(points);
   const fallbackColor = boardRgb(BOARD_RESOURCE_COLORS[tile.resource] || [130, 145, 125]);
   const fallback = svg("polygon", {
     points: pointList,
-    class: `tile ${tile.resource}`,
+    class: `tile ${tile.resource}${animateReveal ? " frontier-reveal-enter" : ""}`,
     fill: fallbackColor,
   });
   appendSvgTitle(
@@ -1139,6 +1230,7 @@ function drawBoardTile(definitions, tileLayer, tile, points, index) {
         preserveAspectRatio: "xMidYMid slice",
         "clip-path": `url(#${clipId})`,
         "pointer-events": "none",
+        class: animateReveal ? "frontier-reveal-enter" : "",
       }),
     );
   }
@@ -1161,6 +1253,30 @@ function drawBoardTile(definitions, tileLayer, tile, points, index) {
       "pointer-events": "none",
     }),
   );
+  if (tile.revealed === false || tile.resource === "UNKNOWN") {
+    const unknownGroup = svg("g", { "pointer-events": "none", class: "frontier-unknown-mark" });
+    unknownGroup.append(
+      svg("circle", {
+        cx: tile.center.x,
+        cy: tile.center.y,
+        r: 20,
+        fill: "rgba(8, 31, 43, 0.68)",
+        stroke: "#9ed8d1",
+        "stroke-width": 2,
+      }),
+      svg("text", {
+        x: tile.center.x,
+        y: tile.center.y + 9,
+        "text-anchor": "middle",
+        fill: "#e6f3e6",
+        "font-size": 28,
+        "font-weight": 900,
+      }),
+    );
+    unknownGroup.lastChild.textContent = "?";
+    tileLayer.append(unknownGroup);
+    return;
+  }
   if (tile.number !== null) drawNumberToken(tileLayer, tile.center, tile.number);
 }
 

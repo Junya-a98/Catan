@@ -113,9 +113,10 @@
               <select name="variant_kind">
                 <option value="standard" selected>通常ルール</option>
                 <option value="forecast_events">予告イベント</option>
+                <option value="frontier">フロンティア探索</option>
               </select>
             </label>
-            <p class="field-note">予告イベントは、豊作や大干ばつを数手番前に公開する別モードです。</p>
+            <p class="field-note">予告イベントは全体効果を事前公開。フロンティア探索は街道で外周の霧を開きます。</p>
             <label>
               Seed
               <div class="input-action-row">
@@ -245,6 +246,14 @@
                 <h2 id="forecast-event-title">イベント予告</h2>
                 <p id="forecast-event-detail">次のイベントを確認しています。</p>
                 <div class="forecast-active-list" id="forecast-active-list"></div>
+              </div>
+              <div class="frontier-status-card" id="frontier-status-card" hidden>
+                <div class="frontier-status-heading">
+                  <span>FRONTIER MAP</span>
+                  <strong id="frontier-status-count">7 / 19 公開</strong>
+                </div>
+                <h2>未知領域を探索</h2>
+                <p id="frontier-status-detail">霧に接する街道から探索できます。</p>
               </div>
               <p class="eyebrow">LATEST EVENT</p>
               <h2 id="latest-event-title">対局準備</h2>

@@ -1170,9 +1170,16 @@ class GameBoard:
 
         return local_point(0, shore_gap + pier_length)
 
-    def _draw_harbors(self, screen):
+    def _draw_harbors(self, screen, visible_harbors=None):
         font = _load_font(17)
         placements = self._layout_harbor_badges(font)
+        if visible_harbors is not None:
+            visible_harbors = set(visible_harbors)
+            placements = [
+                placement
+                for placement in placements
+                if placement[0] in visible_harbors
+            ]
 
         # Draw every dock/connector first. Placement geometry keeps badges away
         # from pieces; this second pass additionally prevents one long fallback
@@ -1230,11 +1237,27 @@ class GameBoard:
             pygame.draw.rect(screen, (73, 57, 43), accent_rect, 1, border_radius=3)
             screen.blit(text_surface, text_surface.get_rect(center=badge_rect.center))
 
-    def draw(self, screen):
+    def draw(self, screen, *, revealed_tiles=None, visible_harbors=None):
+        revealed_set = None if revealed_tiles is None else set(revealed_tiles)
         for tile in self.tiles:
-            tile.draw(screen, robber_tile=self.robber_tile)
+            if revealed_set is None or tile in revealed_set:
+                tile.draw(screen, robber_tile=self.robber_tile)
+                continue
+            points = [(round(node.x), round(node.y)) for node in tile.corners]
+            pygame.draw.polygon(screen, (35, 71, 82), points)
+            pygame.draw.polygon(screen, (83, 139, 145), points, 4)
+            pygame.draw.polygon(screen, (180, 211, 196), points, 1)
+            center = (round(tile.x), round(tile.y))
+            for radius, alpha_color in (
+                (36, (49, 91, 99)),
+                (25, (65, 112, 116)),
+                (13, (91, 139, 137)),
+            ):
+                pygame.draw.circle(screen, alpha_color, center, radius, 2)
+            unknown = _load_font(27).render("?", True, (216, 230, 214))
+            screen.blit(unknown, unknown.get_rect(center=center))
 
-        self._draw_harbors(screen)
+        self._draw_harbors(screen, visible_harbors=visible_harbors)
 
         for road in self.roads:
             road.draw(screen)

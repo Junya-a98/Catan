@@ -967,6 +967,14 @@ def _draw_tile(
     pygame.draw.polygon(surface, (34, 35, 34), vertices, max(2, radius // 22))
     pygame.draw.lines(surface, (240, 221, 164), True, vertices, 1)
 
+    if resource == "UNKNOWN":
+        for ring_radius in (round(radius * 0.52), round(radius * 0.34)):
+            pygame.draw.circle(surface, (93, 151, 150), center, ring_radius, 2)
+        font = get_font(_clamp(round(radius * 0.48), 16, 31), bold=True)
+        text = font.render("?", True, (218, 232, 216))
+        surface.blit(text, text.get_rect(center=center))
+        return
+
     if number is not None:
         token_radius = _clamp(round(radius * 0.34), 11, 23)
         token_center = center

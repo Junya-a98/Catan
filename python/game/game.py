@@ -57,6 +57,7 @@ from game.forecast_events import (
     WHEAT_HARVEST_EVENT_ID,
     event_definition,
 )
+from game.frontier import FRONTIER_KIND
 from game.game_board import GameBoard
 from game.house_rules import HouseRules
 from game.guidance import (
@@ -217,15 +218,17 @@ class CatanGame:
         )
         if not isinstance(self.variant_config, VariantConfig):
             raise TypeError("variant_config must be a VariantConfig")
-        self.variant_state = VariantState.initial(self.variant_config)
         self.custom_map_spec = custom_map
         if self.board_mode == "custom":
             if not isinstance(self.custom_map_spec, CustomMapSpec):
                 raise ValueError("custom board mode requires a CustomMapSpec")
         elif self.custom_map_spec is not None:
             raise ValueError("custom_map is only valid in custom board mode")
+        if self.variant_config.kind == FRONTIER_KIND and self.board_mode == "custom":
+            raise ValueError("frontier variant is available only on generated boards")
         self.board = self.create_board_from_settings()
         self.board_rules = BoardRules(self.board)
+        self.variant_state = self.create_initial_variant_state()
         self.running = True
         self.audio = _SilentAudio() if self.headless else GameAudio()
         self.dice_overlay = (
@@ -494,6 +497,7 @@ class CatanGame:
             "盗賊",
             "イベント予告",
             "イベント発動",
+            "発見",
         )
         is_important = points_changed or any(
             term in str(label) for term in important_terms
@@ -994,7 +998,7 @@ class CatanGame:
             if node.building is None or node.building.owner is not player:
                 continue
             multiplier = node.building.resource_multiplier
-            for tile in node.tiles:
+            for tile in self.get_public_node_tiles(node):
                 if tile.resource_type == ResourceType.DESERT:
                     continue
                 scores[tile.resource_type] += (
@@ -1036,6 +1040,21 @@ class CatanGame:
             mode=self.board_mode,
             seed=self.board_seed,
             custom_map=(self.custom_map_spec if self.board_mode == "custom" else None),
+        )
+
+    def create_initial_variant_state(self):
+        """Bind fresh variant state to the board that owns hidden information."""
+
+        robber_axial = None
+        if self.variant_config.kind == FRONTIER_KIND:
+            if self.board_mode == "custom":
+                raise ValueError("frontier variant is available only on generated boards")
+            if self.board.robber_tile is None:
+                raise ValueError("frontier variant requires a robber tile")
+            robber_axial = self.board.robber_tile.axial
+        return VariantState.initial(
+            self.variant_config,
+            frontier_robber_axial=robber_axial,
         )
 
     def get_active_feedback(self):
@@ -1167,11 +1186,10 @@ class CatanGame:
         ai_label = (
             self.get_ai_personality_mode_label() if self.ai_player_count else "なし"
         )
-        variant_label = (
-            "予告イベント"
-            if self.variant_config.kind == FORECAST_EVENTS_KIND
-            else "通常"
-        )
+        variant_label = {
+            FORECAST_EVENTS_KIND: "予告イベント",
+            FRONTIER_KIND: "フロンティア探索",
+        }.get(self.variant_config.kind, "通常")
         return (
             f"{mode_label} / seed {self.board_seed} / AI {self.ai_player_count}人（{ai_label}）/ "
             f"勝利{self.victory_point_target}点 / モード {variant_label} / "
@@ -1222,11 +1240,10 @@ class CatanGame:
                 ("勝利条件", f"{self.victory_point_target} VP"),
                 (
                     "モード",
-                    (
-                        "予告イベント"
-                        if self.variant_config.kind == FORECAST_EVENTS_KIND
-                        else "通常"
-                    ),
+                    {
+                        FORECAST_EVENTS_KIND: "予告イベント",
+                        FRONTIER_KIND: "フロンティア探索",
+                    }.get(self.variant_config.kind, "通常"),
                 ),
             ],
             "description": description,
@@ -1721,6 +1738,7 @@ class CatanGame:
         player_count = len(self.players) or 2
         self.board = self.create_board_from_settings()
         self.get_board_rules().set_board(self.board)
+        self.variant_state = self.create_initial_variant_state()
         self.configure_players(player_count, reset_logs=False)
         self.feedback.clear()
         self.clear_log()
@@ -1764,7 +1782,7 @@ class CatanGame:
         self.board_seed_text = str(self.board_seed)
         self.board = self.create_board_from_settings()
         self.get_board_rules().set_board(self.board)
-        self.variant_state = VariantState.initial(self.variant_config)
+        self.variant_state = self.create_initial_variant_state()
         self.configure_players(player_count, reset_logs=False)
         self.clear_log()
         self.add_log(f"再戦準備: {self.get_board_configuration_summary()}")
@@ -1902,6 +1920,81 @@ class CatanGame:
 
     def is_forecast_variant(self):
         return self.variant_config.kind == FORECAST_EVENTS_KIND
+
+    def is_frontier_variant(self):
+        return self.variant_config.kind == FRONTIER_KIND
+
+    def is_frontier_tile_revealed(self, tile):
+        if not self.is_frontier_variant():
+            return True
+        return self.variant_state.is_frontier_tile_revealed(tile.axial)
+
+    def get_public_node_tiles(self, node):
+        """Return only terrain an AI or viewer is allowed to evaluate."""
+
+        return tuple(tile for tile in node.tiles if self.is_frontier_tile_revealed(tile))
+
+    def is_frontier_harbor_revealed(self, harbor):
+        if not self.is_frontier_variant():
+            return True
+        adjacent = self.board.get_edge_adjacent_tiles((harbor.node1, harbor.node2))
+        return any(self.is_frontier_tile_revealed(tile) for tile in adjacent)
+
+    def get_public_node_harbors(self, node):
+        return tuple(
+            harbor for harbor in node.harbors if self.is_frontier_harbor_revealed(harbor)
+        )
+
+    def get_frontier_edge_discovery_tiles(self, edge):
+        if not self.is_frontier_variant():
+            return ()
+        return tuple(
+            tile
+            for tile in self.board.get_edge_adjacent_tiles(edge)
+            if not self.is_frontier_tile_revealed(tile)
+        )
+
+    def get_frontier_edge_discovery_count(self, edge):
+        return len(self.get_frontier_edge_discovery_tiles(edge))
+
+    def frontier_edge_is_reachable(self, edge):
+        if not self.is_frontier_variant():
+            return True
+        return any(
+            self.is_frontier_tile_revealed(tile)
+            for tile in self.board.get_edge_adjacent_tiles(edge)
+        )
+
+    def reveal_frontier_from_road(self, road):
+        """Reveal hidden terrain touched by a newly built authority road."""
+
+        hidden_tiles = self.get_frontier_edge_discovery_tiles((road.node1, road.node2))
+        if not hidden_tiles:
+            return ()
+        self.variant_state, revealed_axials = self.variant_state.reveal_frontier_tiles(
+            [tile.axial for tile in hidden_tiles]
+        )
+        if not revealed_axials:
+            return ()
+        revealed_set = set(revealed_axials)
+        revealed_tiles = tuple(
+            tile for tile in hidden_tiles if tile.axial in revealed_set
+        )
+        descriptions = []
+        for tile in revealed_tiles:
+            resource = RESOURCE_LABELS.get(tile.resource_type, tile.resource_type.name)
+            number = "数字なし" if tile.number is None else str(tile.number)
+            descriptions.append(f"{resource} {number}")
+        detail = " / ".join(descriptions)
+        self.add_log(f"フロンティア発見 — {detail}")
+        self.record_event(
+            f"{road.owner.name}が未知タイルを発見",
+            detail,
+            level="success",
+            actor=road.owner,
+            include_in_turn=self.phase == "main",
+        )
+        return revealed_tiles
 
     def is_forecast_event_active(self, event_id):
         return bool(
@@ -2291,7 +2384,22 @@ class CatanGame:
     def get_trade_rates(self, player):
         if player is None:
             return {}
-        rates = dict(self.board.get_player_trade_rates(player))
+        rates = {resource_type: 4 for resource_type in RESOURCE_TYPES}
+        seen_harbors = set()
+        for node in self.board.nodes:
+            if node.building is None or node.building.owner is not player:
+                continue
+            for harbor in self.get_public_node_harbors(node):
+                if harbor in seen_harbors:
+                    continue
+                seen_harbors.add(harbor)
+                if harbor.resource_type is None:
+                    for resource_type in rates:
+                        rates[resource_type] = min(rates[resource_type], harbor.trade_rate)
+                else:
+                    rates[harbor.resource_type] = min(
+                        rates[harbor.resource_type], harbor.trade_rate
+                    )
         if self.house_rules.bank_trade_3_to_1:
             return {
                 resource_type: min(rate, 3) for resource_type, rate in rates.items()
@@ -2299,23 +2407,33 @@ class CatanGame:
         return rates
 
     def get_buildable_road_edges(self, player, require_affordability=True):
-        return self.get_board_rules().get_buildable_road_edges(
+        candidates = self.get_board_rules().get_buildable_road_edges(
             player, require_affordability=require_affordability
         )
+        return [edge for edge in candidates if self.frontier_edge_is_reachable(edge)]
 
     def get_buildable_settlement_nodes(self, player):
-        return self.get_board_rules().get_buildable_settlement_nodes(player)
+        return [
+            node
+            for node in self.get_board_rules().get_buildable_settlement_nodes(player)
+            if self.get_public_node_tiles(node)
+        ]
 
     def get_buildable_city_nodes(self, player):
         return self.get_board_rules().get_buildable_city_nodes(player)
 
     def get_initial_settlement_candidates(self):
-        return self.get_board_rules().get_initial_settlement_candidates()
+        return [
+            node
+            for node in self.get_board_rules().get_initial_settlement_candidates()
+            if self.get_public_node_tiles(node)
+        ]
 
     def get_initial_road_candidates(self, player):
-        return self.get_board_rules().get_initial_road_candidates(
+        candidates = self.get_board_rules().get_initial_road_candidates(
             player, self.last_settlement_node
         )
+        return [edge for edge in candidates if self.frontier_edge_is_reachable(edge)]
 
     def get_steal_target_nodes(self):
         return self.get_board_rules().get_steal_target_nodes(self.robber_target_players)
@@ -2329,7 +2447,7 @@ class CatanGame:
         ):
             initial_player = self.initial_placement_order[self.initial_player_index]
 
-        return self.get_board_rules().get_board_highlights(
+        highlights = self.get_board_rules().get_board_highlights(
             BoardHighlightState(
                 phase=self.phase,
                 initial_dice_phase=self.initial_dice_phase,
@@ -2345,6 +2463,22 @@ class CatanGame:
                 last_settlement_node=self.last_settlement_node,
             )
         )
+        highlights["settlement_nodes"] = [
+            node
+            for node in highlights["settlement_nodes"]
+            if self.get_public_node_tiles(node)
+        ]
+        highlights["edge_highlights"] = [
+            edge
+            for edge in highlights["edge_highlights"]
+            if self.frontier_edge_is_reachable(edge)
+        ]
+        highlights["tile_highlights"] = [
+            tile
+            for tile in highlights["tile_highlights"]
+            if self.is_frontier_tile_revealed(tile)
+        ]
+        return highlights
 
     def get_phase_tracker_data(self):
         if self.phase == "initial" and self.initial_dice_phase:
@@ -4363,16 +4497,25 @@ class CatanGame:
         return self.get_board_rules().player_has_road_touching_node(player, node)
 
     def can_place_initial_settlement(self, node):
-        return self.get_board_rules().can_place_initial_settlement(node)
+        allowed, message = self.get_board_rules().can_place_initial_settlement(node)
+        if allowed and not self.get_public_node_tiles(node):
+            return False, "未探索タイルだけに接する交差点には配置できません。"
+        return allowed, message
 
     def can_place_main_settlement(self, player, node):
-        return self.get_board_rules().can_place_main_settlement(player, node)
+        allowed, message = self.get_board_rules().can_place_main_settlement(player, node)
+        if allowed and not self.get_public_node_tiles(node):
+            return False, "未探索タイルだけに接する交差点には建設できません。"
+        return allowed, message
 
     def can_use_node_for_road_connection(self, player, node):
         return self.get_board_rules().can_use_node_for_road_connection(player, node)
 
     def can_place_road(self, player, node1, node2):
-        return self.get_board_rules().can_place_road(player, node1, node2)
+        allowed, message = self.get_board_rules().can_place_road(player, node1, node2)
+        if allowed and not self.frontier_edge_is_reachable((node1, node2)):
+            return False, "街道は公開済みタイルの境界から探索を進めてください。"
+        return allowed, message
 
     def can_upgrade_to_city(self, player, node):
         return self.get_board_rules().can_upgrade_to_city(player, node)
@@ -4469,7 +4612,9 @@ class CatanGame:
         self.discard_player = None
         self.discard_remaining = 0
         self.robber_tile_candidates = [
-            tile for tile in self.board.tiles if tile != self.board.robber_tile
+            tile
+            for tile in self.board.tiles
+            if tile != self.board.robber_tile and self.is_frontier_tile_revealed(tile)
         ]
         self.add_log("盗賊を移動してください。現在いる地形には置けません。")
 
@@ -4835,7 +4980,8 @@ class CatanGame:
             return
 
         current_player.roads_remaining -= 1
-        self.board.roads.append(Road(current_player, node1, node2))
+        new_road = Road(current_player, node1, node2)
+        self.board.roads.append(new_road)
         self.match_metrics.record_build(
             self.get_match_metric_player_id(current_player), "road"
         )
@@ -4851,6 +4997,7 @@ class CatanGame:
             level="success",
             actor=current_player,
         )
+        self.reveal_frontier_from_road(new_road)
         self.update_longest_road()
         self.check_for_winner(current_player)
         if self.phase == "finished":
@@ -4891,7 +5038,7 @@ class CatanGame:
 
     def grant_initial_resources(self, player, settlement_node):
         gained_resources = {}
-        for tile in settlement_node.tiles:
+        for tile in self.get_public_node_tiles(settlement_node):
             if tile.resource_type == ResourceType.DESERT:
                 continue
             if self.give_resource_from_bank(player, tile.resource_type):
@@ -5189,6 +5336,11 @@ class CatanGame:
         if self.road_exists_between(self.last_settlement_node, candidate_node):
             self.notify_invalid("その辺には既に街道があります。")
             return
+        if not self.frontier_edge_is_reachable(
+            (self.last_settlement_node, candidate_node)
+        ):
+            self.notify_invalid("公開済みタイルの境界から探索を進めてください。")
+            return
         if current_player.roads_remaining <= 0:
             self.notify_invalid("街道コマが残っていません。")
             return
@@ -5211,6 +5363,7 @@ class CatanGame:
             actor=current_player,
             include_in_turn=False,
         )
+        self.reveal_frontier_from_road(new_road)
         self.initial_placement_counts[current_player.name] += 1
         self.waiting_for_road = False
         self.last_settlement_node = None
@@ -5423,7 +5576,8 @@ class CatanGame:
 
         self.pay_resource_cost(current_player, BUILD_COSTS["road"])
         current_player.roads_remaining -= 1
-        self.board.roads.append(Road(current_player, node1, node2))
+        new_road = Road(current_player, node1, node2)
+        self.board.roads.append(new_road)
         self.match_metrics.record_build(
             self.get_match_metric_player_id(current_player), "road"
         )
@@ -5437,6 +5591,7 @@ class CatanGame:
             level="success",
             actor=current_player,
         )
+        self.reveal_frontier_from_road(new_road)
         self.update_longest_road()
         self.check_for_winner(current_player)
 
@@ -5793,7 +5948,11 @@ class CatanGame:
         gains_by_player = {}
         self.last_resource_distribution = {}
         demands = {resource_type: {} for resource_type in RESOURCE_TYPES}
-        tiles = self.board.get_tiles_with_number(dice_roll)
+        tiles = [
+            tile
+            for tile in self.board.get_tiles_with_number(dice_roll)
+            if self.is_frontier_tile_revealed(tile)
+        ]
         for tile in tiles:
             if tile == self.board.robber_tile:
                 self.add_log(
@@ -5989,7 +6148,22 @@ class CatanGame:
             return
         self.screen.fill(COLORS["BACKGROUND"])
         draw_ocean_background(self.screen)
-        self.board.draw(self.screen)
+        revealed_tiles = None
+        visible_harbors = None
+        if self.is_frontier_variant():
+            revealed_tiles = [
+                tile for tile in self.board.tiles if self.is_frontier_tile_revealed(tile)
+            ]
+            visible_harbors = [
+                harbor
+                for harbor in self.board.harbors
+                if self.is_frontier_harbor_revealed(harbor)
+            ]
+        self.board.draw(
+            self.screen,
+            revealed_tiles=revealed_tiles,
+            visible_harbors=visible_harbors,
+        )
         if self.replay_mode:
             highlight_data = {
                 "settlement_nodes": [],

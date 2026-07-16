@@ -36,6 +36,7 @@ from game.ai_personality import (
 from game.custom_map import CustomMapError, CustomMapSpec
 from game.house_rules import HouseRules
 from game.variant import VariantConfig
+from game.frontier import FRONTIER_KIND
 
 
 __all__ = (
@@ -174,6 +175,10 @@ class RoomSettings:
             raise LobbyValidationError(
                 "variant must be a validated variant document"
             )
+        if variant.kind == FRONTIER_KIND and self.board_mode == "custom":
+            raise LobbyValidationError(
+                "frontier variant is available only on generated boards"
+            )
 
         # Never retain caller-owned mutable documents inside a room.  LAN
         # snapshots and the authority factory now share immutable domain
@@ -189,7 +194,9 @@ class RoomSettings:
             "player_count": self.player_count,
             "victory_target": self.victory_target,
             "board_mode": self.board_mode,
-            "board_seed": self.board_seed,
+            "board_seed": (
+                0 if self.variant.kind == FRONTIER_KIND else self.board_seed
+            ),
             "ai_player_count": self.ai_player_count,
             "ai_personality_mode": self.ai_personality_mode,
             "variant": self.variant.to_document(),

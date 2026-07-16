@@ -614,6 +614,8 @@ class SimpleAI:
     def _monopoly_public_score(self, game, player, resource_type):
         score = 0
         for tile in game.board.tiles:
+            if not game.is_frontier_tile_revealed(tile):
+                continue
             if tile.resource_type != resource_type:
                 continue
             pip_value = get_token_pip_count(tile.number)
@@ -662,7 +664,7 @@ class SimpleAI:
         for node in game.board.nodes:
             if node.building is None or node.building.owner is not player:
                 continue
-            for tile in node.tiles:
+            for tile in game.get_public_node_tiles(node):
                 if tile.resource_type == ResourceType.DESERT:
                     continue
                 scores[tile.resource_type] += (
@@ -766,17 +768,17 @@ class SimpleAI:
         need_weights = self._resource_need_weights(game, player)
         pip_score = sum(
             get_token_pip_count(tile.number) * need_weights[tile.resource_type]
-            for tile in node.tiles
+            for tile in game.get_public_node_tiles(node)
             if tile.resource_type != ResourceType.DESERT
         )
         resources = {
             tile.resource_type
-            for tile in node.tiles
+            for tile in game.get_public_node_tiles(node)
             if tile.resource_type != ResourceType.DESERT
         }
         production = self._player_production_scores(game, player)
         harbor_bonus = 0
-        for harbor in node.harbors:
+        for harbor in game.get_public_node_harbors(node):
             if harbor.resource_type is None:
                 harbor_bonus = max(harbor_bonus, profile.generic_harbor_bonus)
             else:
@@ -819,6 +821,12 @@ class SimpleAI:
                 score += opponent_contacts * profile.opponent_contact_bonus
         if game.get_player_longest_road_length(player) >= 4:
             score += profile.longest_road_bonus
+        discovery_count = getattr(
+            game,
+            "get_frontier_edge_discovery_count",
+            lambda _edge: 0,
+        )(edge)
+        score += discovery_count * 10
         return score
 
     def _robber_score(self, game, tile, player):
