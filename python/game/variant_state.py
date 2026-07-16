@@ -1,9 +1,9 @@
 """Versioned runtime-state boundary for optional match variants.
 
 Full saves retain both public and authority-private state.  Network and
-spectator projections must use :meth:`VariantState.to_public_document`, which
-omits the ``private`` key entirely rather than exposing an empty placeholder.
-Only the no-op ``standard`` state is supported in this stage.
+spectator projections omit the ``private`` key entirely.  The standard mode
+remains an empty no-op document; forecast-events keeps its future draw pile in
+the private half and exposes only announced/active events.
 """
 
 from __future__ import annotations
@@ -13,7 +13,24 @@ from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any
 
-from game.variant import SUPPORTED_VARIANT_KINDS, VariantConfig
+from game.forecast_events import (
+    FORECAST_EVENTS_KIND,
+    ForecastEventError,
+    ForecastTurnUpdate,
+    active_event_ids,
+    advance_forecast_documents,
+    consume_active_effect,
+    create_initial_forecast_documents,
+    forecast_event_id,
+    validate_forecast_documents,
+    validate_forecast_public,
+    validate_forecast_schedule,
+)
+from game.variant import (
+    STANDARD_VARIANT_KIND,
+    SUPPORTED_VARIANT_KINDS,
+    VariantConfig,
+)
 
 
 VARIANT_STATE_FORMAT = "catan-variant-state"
@@ -37,16 +54,26 @@ class VariantStateError(ValueError):
 
 @dataclass(frozen=True)
 class VariantState:
-    """Immutable full runtime state owned by the authoritative game."""
+    """Immutable runtime state owned by the authoritative game.
+
+    ``_projection_only`` is used only by untrusted network validation.  Such an
+    object can emit another public document but can never become a full save.
+    """
 
     format: str = VARIANT_STATE_FORMAT
     version: int = VARIANT_STATE_VERSION
-    kind: str = "standard"
+    kind: str = STANDARD_VARIANT_KIND
     config_fingerprint: str = field(
         default_factory=lambda: VariantConfig.standard().fingerprint()
     )
     public: Mapping[str, Any] = field(default_factory=dict, hash=False)
     private: Mapping[str, Any] = field(default_factory=dict, hash=False)
+    _projection_only: bool = field(
+        default=False,
+        repr=False,
+        compare=False,
+        hash=False,
+    )
 
     def __post_init__(self) -> None:
         if self.format != VARIANT_STATE_FORMAT:
@@ -63,24 +90,63 @@ class VariantState:
             raise VariantStateError("variant state public はオブジェクトで指定してください。")
         if not isinstance(self.private, Mapping):
             raise VariantStateError("variant state private はオブジェクトで指定してください。")
-        if self.public:
-            raise VariantStateError("standard variant の public state は空にしてください。")
-        if self.private:
-            raise VariantStateError("standard variant の private state は空にしてください。")
+        if type(self._projection_only) is not bool:
+            raise VariantStateError("variant state projection flagが不正です。")
 
-        # Do not retain mutable caller-owned documents in a running match.
-        object.__setattr__(self, "public", MappingProxyType({}))
-        object.__setattr__(self, "private", MappingProxyType({}))
+        try:
+            if self.kind == STANDARD_VARIANT_KIND:
+                if self.public:
+                    raise VariantStateError(
+                        "standard variant の public state は空にしてください。"
+                    )
+                if self.private:
+                    raise VariantStateError(
+                        "standard variant の private state は空にしてください。"
+                    )
+            else:
+                validate_forecast_public(self.public)
+                if self._projection_only:
+                    if self.private:
+                        raise VariantStateError(
+                            "公開variant stateにprivate情報を含められません。"
+                        )
+                else:
+                    validate_forecast_documents(self.public, self.private)
+        except ForecastEventError as exc:
+            raise VariantStateError("forecast variant stateが不正です。") from exc
+
+        # Never retain a caller-owned mutable document in a room or match.
+        object.__setattr__(self, "public", _freeze_json(self.public))
+        object.__setattr__(self, "private", _freeze_json(self.private))
 
     @classmethod
-    def initial(cls, config: VariantConfig) -> VariantState:
-        """Create the empty runtime state bound to a validated config."""
+    def initial(
+        cls,
+        config: VariantConfig,
+        *,
+        deck_seed: str | None = None,
+    ) -> VariantState:
+        """Create a new runtime state bound to a validated config."""
 
         if not isinstance(config, VariantConfig):
             raise VariantStateError("variant設定が不正です。")
+        if config.kind == STANDARD_VARIANT_KIND:
+            public, private = {}, {}
+        elif config.kind == FORECAST_EVENTS_KIND:
+            try:
+                public, private = create_initial_forecast_documents(
+                    config.options,
+                    deck_seed=deck_seed,
+                )
+            except ForecastEventError as exc:
+                raise VariantStateError("forecast variant stateを作成できません。") from exc
+        else:  # pragma: no cover - VariantConfig rejects this first.
+            raise VariantStateError(f"未対応のvariant state kindです: {config.kind}")
         return cls(
             kind=config.kind,
             config_fingerprint=config.fingerprint(),
+            public=public,
+            private=private,
         )
 
     @classmethod
@@ -96,11 +162,18 @@ class VariantState:
         *,
         config: VariantConfig | None = None,
     ) -> VariantState:
-        """Parse a strict full-save document, or initialize a legacy save."""
+        """Parse a strict full-save document, or a legacy standard save."""
 
         validated_config = _optional_config(config)
         if document is None:
-            state = cls.initial(validated_config or VariantConfig.standard())
+            if (
+                validated_config is not None
+                and validated_config.kind != STANDARD_VARIANT_KIND
+            ):
+                raise VariantStateError(
+                    "standard以外のvariantにはruntime stateが必要です。"
+                )
+            state = cls.standard()
         else:
             _validate_document_keys(document, _FULL_DOCUMENT_KEYS, "variant state")
             state = cls(
@@ -122,7 +195,7 @@ class VariantState:
         *,
         config: VariantConfig | None = None,
     ) -> VariantState:
-        """Parse the strict public projection where ``private`` is forbidden."""
+        """Parse a strict public projection where ``private`` is forbidden."""
 
         validated_config = _optional_config(config)
         _validate_document_keys(
@@ -137,6 +210,7 @@ class VariantState:
             config_fingerprint=document["config_fingerprint"],
             public=document["public"],
             private={},
+            _projection_only=True,
         )
         if validated_config is not None:
             state.validate_config(validated_config)
@@ -153,17 +227,84 @@ class VariantState:
             raise VariantStateError(
                 "variant state fingerprintが設定と一致しません。"
             )
+        if self.kind == FORECAST_EVENTS_KIND:
+            try:
+                validate_forecast_schedule(self.public, config.options)
+            except ForecastEventError as exc:
+                raise VariantStateError(
+                    "forecast event周期が設定と一致しません。"
+                ) from exc
+
+    def ensure_full(self) -> None:
+        """Reject a viewer-only projection at an authority/save boundary."""
+
+        if self._projection_only:
+            raise VariantStateError("公開variant stateは完全保存に利用できません。")
+
+    def advance_forecast_turn(
+        self,
+        config: VariantConfig,
+        *,
+        player_count: int,
+    ) -> tuple[VariantState, ForecastTurnUpdate]:
+        """Advance one completed turn in forecast-events mode."""
+
+        self.ensure_full()
+        self.validate_config(config)
+        if self.kind != FORECAST_EVENTS_KIND:
+            raise VariantStateError("forecast_events以外では手番を進められません。")
+        try:
+            public, private, update = advance_forecast_documents(
+                _thaw_json(self.public),
+                _thaw_json(self.private),
+                config.options,
+                player_count=player_count,
+            )
+        except ForecastEventError as exc:
+            raise VariantStateError("forecast eventの手番更新に失敗しました。") from exc
+        return self._with_documents(public, private), update
+
+    def consume_forecast_effect(self, event_id: str) -> tuple[VariantState, bool]:
+        """Consume a triggered public effect without changing the secret deck."""
+
+        self.ensure_full()
+        if self.kind != FORECAST_EVENTS_KIND:
+            return self, False
+        try:
+            public, consumed = consume_active_effect(self.public, event_id)
+        except ForecastEventError as exc:
+            raise VariantStateError("forecast event効果を消費できません。") from exc
+        if not consumed:
+            return self, False
+        return self._with_documents(public, _thaw_json(self.private)), True
+
+    def active_forecast_event_ids(self) -> tuple[str, ...]:
+        if self.kind != FORECAST_EVENTS_KIND:
+            return ()
+        try:
+            return active_event_ids(self.public)
+        except ForecastEventError as exc:  # pragma: no cover - constructor validates.
+            raise VariantStateError("forecast active stateが不正です。") from exc
+
+    def next_forecast_event_id(self) -> str | None:
+        if self.kind != FORECAST_EVENTS_KIND:
+            return None
+        try:
+            return forecast_event_id(self.public)
+        except ForecastEventError as exc:  # pragma: no cover - constructor validates.
+            raise VariantStateError("forecast stateが不正です。") from exc
 
     def to_document(self) -> dict[str, Any]:
         """Return a fresh full-save document including private state."""
 
+        self.ensure_full()
         return {
             "format": self.format,
             "version": self.version,
             "kind": self.kind,
             "config_fingerprint": self.config_fingerprint,
-            "public": {},
-            "private": {},
+            "public": _thaw_json(self.public),
+            "private": _thaw_json(self.private),
         }
 
     def to_public_document(self) -> dict[str, Any]:
@@ -174,8 +315,22 @@ class VariantState:
             "version": self.version,
             "kind": self.kind,
             "config_fingerprint": self.config_fingerprint,
-            "public": {},
+            "public": _thaw_json(self.public),
         }
+
+    def _with_documents(
+        self,
+        public: Mapping[str, Any],
+        private: Mapping[str, Any],
+    ) -> VariantState:
+        return type(self)(
+            format=self.format,
+            version=self.version,
+            kind=self.kind,
+            config_fingerprint=self.config_fingerprint,
+            public=public,
+            private=private,
+        )
 
     def __copy__(self) -> VariantState:
         return self
@@ -185,7 +340,17 @@ class VariantState:
         return self
 
     def __reduce__(self):
-        return (type(self).from_document, (self.to_document(),))
+        factory = (
+            type(self).from_public_document
+            if self._projection_only
+            else type(self).from_document
+        )
+        document = (
+            self.to_public_document()
+            if self._projection_only
+            else self.to_document()
+        )
+        return (factory, (document,))
 
 
 def _optional_config(config: VariantConfig | None) -> VariantConfig | None:
@@ -213,6 +378,28 @@ def _validate_document_keys(
         detail.append(f"不足: {', '.join(missing)}")
     suffix = f"（{' / '.join(detail)}）" if detail else ""
     raise VariantStateError(f"{label}の項目が不正です。{suffix}")
+
+
+def _freeze_json(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        if any(not isinstance(key, str) for key in value):
+            raise VariantStateError("variant stateのkeyが不正です。")
+        return MappingProxyType(
+            {key: _freeze_json(child) for key, child in value.items()}
+        )
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze_json(child) for child in value)
+    if value is None or isinstance(value, (str, int, bool)):
+        return value
+    raise VariantStateError("variant stateにJSONで表せない値があります。")
+
+
+def _thaw_json(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {key: _thaw_json(child) for key, child in value.items()}
+    if isinstance(value, tuple):
+        return [_thaw_json(child) for child in value]
+    return value
 
 
 def _valid_fingerprint(value: Any) -> bool:

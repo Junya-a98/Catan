@@ -1231,6 +1231,66 @@ button:disabled {
   font-size: 16px;
 }
 
+.forecast-event-card {
+  display: grid;
+  gap: 7px;
+  margin-bottom: 16px;
+  padding: 13px;
+  border: 1px solid rgba(244, 195, 93, 0.48);
+  border-radius: 13px;
+  background:
+    linear-gradient(135deg, rgba(108, 73, 28, 0.48), rgba(24, 69, 78, 0.4));
+}
+
+.forecast-event-card[hidden] {
+  display: none;
+}
+
+.forecast-event-heading {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.forecast-event-heading span {
+  color: var(--gold);
+  font-size: 9px;
+  font-weight: 900;
+  letter-spacing: 0.14em;
+}
+
+.forecast-event-heading strong {
+  padding: 4px 7px;
+  color: #17202a;
+  font-size: 9px;
+  border-radius: 999px;
+  background: var(--gold);
+}
+
+#forecast-event-detail {
+  margin: 0;
+  color: #d8e2e7;
+  font-size: 10px;
+  line-height: 1.6;
+}
+
+.forecast-active-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+
+.forecast-active-chip {
+  padding: 4px 7px;
+  color: #bff3e9;
+  font-size: 9px;
+  font-weight: 800;
+  border: 1px solid rgba(85, 214, 190, 0.35);
+  border-radius: 999px;
+  background: rgba(26, 88, 84, 0.4);
+}
+
 #latest-event-detail {
   margin: 8px 0 0;
   color: var(--muted);

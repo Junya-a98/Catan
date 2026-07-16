@@ -5,6 +5,7 @@ import vm from "node:vm";
 
 const appSource = readFileSync(new URL("../web/app.js", import.meta.url), "utf8");
 const cssSource = readFileSync(new URL("../web/app.css", import.meta.url), "utf8");
+const indexSource = readFileSync(new URL("../web/index.html", import.meta.url), "utf8");
 
 class FakeElement {
   constructor(id = "") {
@@ -104,6 +105,9 @@ function loadAnimationFunctions() {
     tradeActivityTotal,
     activePlayerIndex,
     phaseTitle,
+    variantConfigDocument,
+    variantLabel,
+    forecastEventPresentation,
     audioCalls: globalThis.__audioCalls,
   };`, sandbox, { filename: "web/app.js" });
   return sandbox.__animationTest;
@@ -324,6 +328,63 @@ test("initial-phase heading follows dice and placement actors", () => {
   const placementActor = animation.activePlayerIndex(placementState);
   assert.equal(placementActor, 0);
   assert.match(animation.phaseTitle(placementState, placementActor).title, /Host/);
+});
+
+test("room creation sends canonical standard and forecast variant documents", () => {
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(animation.variantConfigDocument("standard"))),
+    { version: 1, kind: "standard", options: {} },
+  );
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(animation.variantConfigDocument("forecast_events"))),
+    {
+      version: 1,
+      kind: "forecast_events",
+      options: {
+        catalog: "core_v1",
+        forecast_lead_turns: 2,
+        event_interval_turns: 6,
+      },
+    },
+  );
+  assert.equal(animation.variantLabel({ kind: "forecast_events" }), "予告イベント");
+  assert.equal(animation.variantLabel({ kind: "standard" }), "通常ルール");
+});
+
+test("forecast card presents countdown and active effects from public state only", () => {
+  const presentation = animation.forecastEventPresentation({
+    kind: "forecast_events",
+    public: {
+      completed_turns: 5,
+      forecast: {
+        event_id: "sheep_drought_v1",
+        announced_turn: 2,
+        resolve_turn: 8,
+      },
+      active_effects: [{
+        event_id: "wheat_harvest_v1",
+        started_turn: 2,
+        expires_turn: null,
+      }],
+      resolved_count: 1,
+    },
+  });
+  assert.equal(presentation.visible, true);
+  assert.equal(presentation.title, "大干ばつ");
+  assert.equal(presentation.countdown, "あと3手番");
+  assert.deepEqual(Array.from(presentation.active), ["豊作: 次の麦生産に+1"]);
+  assert.equal(
+    animation.forecastEventPresentation({ kind: "standard", public: {} }).visible,
+    false,
+  );
+});
+
+test("forecast mode controls and persistent event card are present and styled", () => {
+  assert.match(indexSource, /<select name="variant_kind">[\s\S]*value="forecast_events"/);
+  assert.match(indexSource, /id="forecast-event-card" hidden/);
+  assert.match(indexSource, /id="forecast-active-list"/);
+  assert.match(cssSource, /\.forecast-event-card\s*\{/);
+  assert.match(cssSource, /\.forecast-event-card\[hidden\]\s*\{[\s\S]*display:\s*none/);
 });
 
 test("animation CSS includes bounce, halo, dice landing, and reduced-motion overrides", () => {

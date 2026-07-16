@@ -34,6 +34,23 @@ const BOARD_TERRAIN_ASSETS = {
   DESERT: "/assets/board/terrain-desert.webp",
 };
 const TOKEN_PIP_COUNTS = { 2: 1, 3: 2, 4: 3, 5: 4, 6: 5, 8: 5, 9: 4, 10: 3, 11: 2, 12: 1 };
+const DEFAULT_FORECAST_OPTIONS = {
+  catalog: "core_v1",
+  forecast_lead_turns: 2,
+  event_interval_turns: 6,
+};
+const FORECAST_EVENT_PRESENTATION = {
+  wheat_harvest_v1: {
+    title: "豊作",
+    description: "次の麦生産で、銀行在庫に余裕があれば生産対象者へ麦を1枚追加します。",
+    active: "豊作: 次の麦生産に+1",
+  },
+  sheep_drought_v1: {
+    title: "大干ばつ",
+    description: "発動から全員が1手番を終えるまで、羊タイルは生産しません。",
+    active: "大干ばつ: 羊の生産停止",
+  },
+};
 
 const state = {
   welcome: null,
@@ -102,6 +119,11 @@ const elements = Object.fromEntries(
     "player-list",
     "latest-event-title",
     "latest-event-detail",
+    "forecast-event-card",
+    "forecast-event-countdown",
+    "forecast-event-title",
+    "forecast-event-detail",
+    "forecast-active-list",
     "ai-commentary",
     "ai-commentary-title",
     "ai-commentary-detail",
@@ -128,6 +150,52 @@ const elements = Object.fromEntries(
 
 function wireMessage(type, payload = {}) {
   return { type, protocol_version: PROTOCOL_VERSION, ...payload };
+}
+
+function variantConfigDocument(kind) {
+  if (kind === "forecast_events") {
+    return {
+      version: 1,
+      kind,
+      options: { ...DEFAULT_FORECAST_OPTIONS },
+    };
+  }
+  return { version: 1, kind: "standard", options: {} };
+}
+
+function variantLabel(variant) {
+  return variant?.kind === "forecast_events" ? "予告イベント" : "通常ルール";
+}
+
+function forecastEventPresentation(variantState) {
+  if (variantState?.kind !== "forecast_events") return { visible: false };
+  const publicState = variantState.public || {};
+  const forecast = publicState.forecast || {};
+  const event = FORECAST_EVENT_PRESENTATION[forecast.event_id] || {
+    title: "未対応イベント",
+    description: "表示を更新してください。",
+    active: "未対応イベント",
+  };
+  const completed = Number.isInteger(publicState.completed_turns)
+    ? publicState.completed_turns
+    : 0;
+  const resolveTurn = Number.isInteger(forecast.resolve_turn)
+    ? forecast.resolve_turn
+    : completed;
+  const remaining = Math.max(0, resolveTurn - completed);
+  const active = Array.isArray(publicState.active_effects)
+    ? publicState.active_effects.map((effect) => {
+      const definition = FORECAST_EVENT_PRESENTATION[effect?.event_id];
+      return definition?.active || "未対応イベント";
+    })
+    : [];
+  return {
+    visible: true,
+    title: event.title,
+    description: event.description,
+    countdown: remaining === 0 ? "発動処理中" : `あと${remaining}手番`,
+    active,
+  };
 }
 
 async function api(path, options = {}) {
@@ -795,6 +863,7 @@ function renderLobbySettings(settings) {
     ["AI", settings.ai_player_count ? `${settings.ai_player_count}人 · ${aiPersonalityLabel(settings.ai_personality_mode)}` : "なし"],
     ["勝利条件", `${settings.victory_target} VP`],
     ["盤面", boardModeLabel(settings.board_mode)],
+    ["モード", variantLabel(settings.variant)],
     ["Seed", String(settings.board_seed)],
     ["追加ルール", houseRulesLabel(settings.house_rules)],
   ];
@@ -831,6 +900,7 @@ function renderGame() {
   const latest = gameState.history?.latest_event || {};
   elements["latest-event-title"].textContent = latest.title || "進行中";
   elements["latest-event-detail"].textContent = latest.detail || "次の操作を待っています。";
+  renderForecastEvent(gameState.variant_state);
   renderAICommentary(gameState.ai?.status);
   const finished = state.liveSnapshot?.state?.phase?.name === "finished";
   elements["result-dashboard"].hidden = !finished;
@@ -840,6 +910,27 @@ function renderGame() {
       state.resultAnnounced = true;
       window.requestAnimationFrame(() => focusAndScroll(elements["result-dashboard"], "start"));
     }
+  }
+}
+
+function renderForecastEvent(variantState) {
+  const presentation = forecastEventPresentation(variantState);
+  const card = elements["forecast-event-card"];
+  card.hidden = !presentation.visible;
+  if (!presentation.visible) {
+    elements["forecast-active-list"].replaceChildren();
+    return;
+  }
+  elements["forecast-event-countdown"].textContent = presentation.countdown;
+  elements["forecast-event-title"].textContent = presentation.title;
+  elements["forecast-event-detail"].textContent = presentation.description;
+  const activeList = elements["forecast-active-list"];
+  activeList.replaceChildren();
+  const activeLabels = presentation.active.length
+    ? presentation.active
+    : ["現在発動中の効果なし"];
+  for (const label of activeLabels) {
+    activeList.append(textElement("span", label, "forecast-active-chip"));
   }
 }
 
@@ -2523,6 +2614,7 @@ elements["create-form"].addEventListener("submit", async (event) => {
           victory_target: Number(form.get("victory_target")),
           board_mode: String(form.get("board_mode")),
           board_seed: Number(form.get("board_seed")),
+          variant: variantConfigDocument(String(form.get("variant_kind"))),
         },
       }),
     );

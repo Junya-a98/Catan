@@ -1,9 +1,9 @@
 """Versioned configuration boundary for optional match variants.
 
-Only the no-op ``standard`` kind is supported in the first stage.  Keeping the
-configuration independent from Pygame and the game engine lets lobby, save,
-replay, and network code share one strict canonical document without making
-future variant fields part of the small ``HouseRules`` model.
+The no-op ``standard`` kind and the separately selectable ``forecast_events``
+kind share one strict document.  Keeping this configuration independent from
+Pygame and the game engine lets lobby, save, replay, and network code agree on
+identity without making variant fields part of the small ``HouseRules`` model.
 """
 
 from __future__ import annotations
@@ -15,10 +15,19 @@ import json
 from types import MappingProxyType
 from typing import Any
 
+from game.forecast_events import (
+    DEFAULT_FORECAST_OPTIONS,
+    FORECAST_EVENTS_KIND,
+    ForecastEventError,
+    canonical_forecast_options,
+)
+
 
 VARIANT_CONFIG_VERSION = 1
 STANDARD_VARIANT_KIND = "standard"
-SUPPORTED_VARIANT_KINDS = frozenset({STANDARD_VARIANT_KIND})
+SUPPORTED_VARIANT_KINDS = frozenset(
+    {STANDARD_VARIANT_KIND, FORECAST_EVENTS_KIND}
+)
 _DOCUMENT_KEYS = frozenset({"version", "kind", "options"})
 
 
@@ -26,9 +35,9 @@ _DOCUMENT_KEYS = frozenset({"version", "kind", "options"})
 class VariantConfig:
     """Immutable, strictly validated configuration for one match variant.
 
-    The options mapping is intentionally empty while only ``standard`` exists.
-    It is still present in the versioned document so future kinds can add their
-    own strict option schema without changing the outer transport boundary.
+    ``standard`` requires an empty mapping. ``forecast_events`` uses a small,
+    exact options schema so its schedule is reproducible across saves and
+    clients without changing the outer transport boundary.
     """
 
     version: int = VARIANT_CONFIG_VERSION
@@ -44,18 +53,45 @@ class VariantConfig:
             raise ValueError(f"未対応のvariant kindです: {self.kind}")
         if not isinstance(self.options, Mapping):
             raise ValueError("variant options はオブジェクトで指定してください。")
-        if self.options:
-            raise ValueError("standard variant の options は空にしてください。")
+        if self.kind == STANDARD_VARIANT_KIND:
+            if self.options:
+                raise ValueError("standard variant の options は空にしてください。")
+            canonical_options = {}
+        else:
+            try:
+                canonical_options = canonical_forecast_options(self.options)
+            except ForecastEventError as exc:
+                raise ValueError("forecast_events options が不正です。") from exc
 
         # Never retain a caller-owned mutable mapping in a room or running
-        # match.  Future kinds can replace this with their own immutable model.
-        object.__setattr__(self, "options", MappingProxyType({}))
+        # match.
+        object.__setattr__(
+            self,
+            "options",
+            MappingProxyType(canonical_options),
+        )
 
     @classmethod
     def standard(cls) -> VariantConfig:
         """Return the no-op configuration used by current official rules."""
 
         return cls()
+
+    @classmethod
+    def forecast_events(
+        cls,
+        *,
+        forecast_lead_turns: int | None = None,
+        event_interval_turns: int | None = None,
+    ) -> VariantConfig:
+        """Return the supported forecast-events configuration."""
+
+        options = dict(DEFAULT_FORECAST_OPTIONS)
+        if forecast_lead_turns is not None:
+            options["forecast_lead_turns"] = forecast_lead_turns
+        if event_interval_turns is not None:
+            options["event_interval_turns"] = event_interval_turns
+        return cls(kind=FORECAST_EVENTS_KIND, options=options)
 
     @classmethod
     def from_document(
@@ -98,7 +134,7 @@ class VariantConfig:
         return {
             "version": self.version,
             "kind": self.kind,
-            "options": {},
+            "options": dict(self.options),
         }
 
     def __copy__(self) -> VariantConfig:
@@ -139,4 +175,5 @@ __all__ = (
     "SUPPORTED_VARIANT_KINDS",
     "VARIANT_CONFIG_VERSION",
     "VariantConfig",
+    "FORECAST_EVENTS_KIND",
 )

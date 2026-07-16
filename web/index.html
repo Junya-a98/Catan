@@ -109,6 +109,14 @@
               </select>
             </label>
             <label>
+              ゲームモード
+              <select name="variant_kind">
+                <option value="standard" selected>通常ルール</option>
+                <option value="forecast_events">予告イベント</option>
+              </select>
+            </label>
+            <p class="field-note">予告イベントは、豊作や大干ばつを数手番前に公開する別モードです。</p>
+            <label>
               Seed
               <div class="input-action-row">
                 <input name="board_seed" type="number" min="0" value="86712347" required>
@@ -229,6 +237,15 @@
             </section>
 
             <section class="panel event-panel" aria-live="polite">
+              <div class="forecast-event-card" id="forecast-event-card" hidden>
+                <div class="forecast-event-heading">
+                  <span>EVENT FORECAST</span>
+                  <strong id="forecast-event-countdown">あと—手番</strong>
+                </div>
+                <h2 id="forecast-event-title">イベント予告</h2>
+                <p id="forecast-event-detail">次のイベントを確認しています。</p>
+                <div class="forecast-active-list" id="forecast-active-list"></div>
+              </div>
               <p class="eyebrow">LATEST EVENT</p>
               <h2 id="latest-event-title">対局準備</h2>
               <p id="latest-event-detail">イベントを待っています。</p>

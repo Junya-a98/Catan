@@ -28,7 +28,7 @@ from game.match_metrics import (
 )
 from game.resources import ResourceType
 from game.road import Road
-from game.variant import VariantConfig
+from game.variant import STANDARD_VARIANT_KIND, VariantConfig
 from game.variant_state import VariantState, VariantStateError
 
 
@@ -175,10 +175,13 @@ def _variant_config_for_game(game):
 def _variant_state_for_game(game, variant_config):
     variant_state = getattr(game, "variant_state", None)
     if variant_state is None:
-        return VariantState.initial(variant_config)
+        if variant_config.kind == STANDARD_VARIANT_KIND:
+            return VariantState.initial(variant_config)
+        raise SaveGameError("standard以外のvariant stateがありません。")
     if not isinstance(variant_state, VariantState):
         raise SaveGameError("variant stateを保存できません。")
     try:
+        variant_state.ensure_full()
         variant_state.validate_config(variant_config)
     except VariantStateError as exc:
         raise SaveGameError("variant stateと設定が一致しません。") from exc

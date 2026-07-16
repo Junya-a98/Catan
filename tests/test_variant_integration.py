@@ -8,6 +8,7 @@ from game.game import CatanGame
 from game.lan_controller import LanServerController
 from game.lan_lobby import LobbyValidationError, RoomSettings
 from game.network_protocol import NETWORK_PROTOCOL_VERSION, build_state_snapshot
+from game.network_view import parse_state_snapshot
 from game.persistence import SaveGameError, restore_game, serialize_game
 from game.replay import ReplayError, ReplayRecorder, load_replay
 from game.variant import VariantConfig
@@ -15,6 +16,8 @@ from game.variant import VariantConfig
 
 STANDARD = VariantConfig.standard()
 STANDARD_DOCUMENT = STANDARD.to_document()
+FORECAST = VariantConfig.forecast_events()
+FORECAST_DOCUMENT = FORECAST.to_document()
 
 
 def _message(message_type, **payload):
@@ -95,6 +98,42 @@ def test_lobby_factory_and_network_snapshot_keep_the_standard_variant():
 
     assert welcome["room_code"]
     assert snapshot["state"]["rules"]["variant"] == STANDARD_DOCUMENT
+
+
+def test_lobby_factory_and_network_view_support_the_forecast_variant():
+    controller = LanServerController()
+    created = controller.handle(
+        "forecast-host",
+        _message(
+            "create_room",
+            display_name="Host",
+            settings={
+                "player_count": 2,
+                "victory_target": 5,
+                "board_mode": "constrained",
+                "board_seed": 8181,
+                "ai_player_count": 1,
+                "variant": copy.deepcopy(FORECAST_DOCUMENT),
+            },
+        ),
+    )
+    lobby = next(
+        item.message["lobby"]
+        for item in created
+        if item.message["type"] == "lobby_snapshot"
+    )
+    assert lobby["settings"]["variant"] == FORECAST_DOCUMENT
+
+    controller.handle("forecast-host", _message("set_ready", ready=True))
+    controller.handle("forecast-host", _message("start_game"))
+    snapshot = controller.snapshot_for_connection("forecast-host")
+
+    assert snapshot["state"]["rules"]["variant"] == FORECAST_DOCUMENT
+    assert snapshot["state"]["variant_state"]["kind"] == "forecast_events"
+    assert "private" not in snapshot["state"]["variant_state"]
+    view = parse_state_snapshot(snapshot)
+    assert view.variant_state.kind == "forecast_events"
+    assert view.variant_state.public["forecast"]["resolve_turn"] == 2
 
 
 def test_save_restore_and_network_snapshot_support_legacy_default(game):

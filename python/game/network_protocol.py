@@ -7,6 +7,7 @@ import struct
 
 from game.custom_map import CustomMapError, CustomMapSpec
 from game.persistence import serialize_game
+from game.variant import VariantConfig
 from game.variant_state import VariantState
 
 
@@ -379,8 +380,16 @@ def build_state_snapshot(game, *, viewer_player_index=None, revision=0):
     """Build a viewer-specific state without leaking other players' private cards."""
     state = deepcopy(serialize_game(game))
     if "variant_state" in state:
+        rules = state.get("rules")
+        try:
+            variant_config = VariantConfig.from_document(
+                rules.get("variant") if isinstance(rules, Mapping) else None
+            )
+        except (TypeError, ValueError) as exc:
+            raise NetworkProtocolError("variant設定が不正です。") from exc
         state["variant_state"] = _public_variant_state_document(
-            state["variant_state"]
+            state["variant_state"],
+            variant_config=variant_config,
         )
     board_state = state.get("board")
     if isinstance(board_state, dict):
@@ -482,7 +491,7 @@ def build_state_snapshot(game, *, viewer_player_index=None, revision=0):
     }
 
 
-def _public_variant_state_document(value):
+def _public_variant_state_document(value, *, variant_config):
     """Return the canonical public-only runtime variant document.
 
     ``serialize_game`` persists the authoritative full document, including its
@@ -501,7 +510,8 @@ def _public_variant_state_document(value):
     }
     try:
         public_document = VariantState.from_public_document(
-            public_document
+            public_document,
+            config=variant_config,
         ).to_public_document()
     except (TypeError, ValueError) as exc:
         raise NetworkProtocolError("variant_stateが不正です。") from exc

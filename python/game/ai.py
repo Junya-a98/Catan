@@ -6,6 +6,10 @@ from game.ai_personality import (
     get_ai_personality_profile,
 )
 from game.development_cards import DevelopmentCardType
+from game.forecast_events import (
+    SHEEP_DROUGHT_EVENT_ID,
+    WHEAT_HARVEST_EVENT_ID,
+)
 from game.hex_tile import get_token_pip_count
 from game.resources import BUILD_COSTS, ResourceType
 
@@ -732,6 +736,21 @@ class SimpleAI:
                     ResourceType.ORE: 1.55,
                 },
             }[profile_key]
+        active_event = getattr(
+            game,
+            "is_forecast_event_active",
+            lambda _event: False,
+        )
+        next_event = getattr(game, "get_next_forecast_event_id", lambda: None)()
+        if active_event(SHEEP_DROUGHT_EVENT_ID):
+            weights[ResourceType.SHEEP] *= 0.35
+        elif next_event == SHEEP_DROUGHT_EVENT_ID:
+            weights[ResourceType.SHEEP] *= 0.80
+        if (
+            active_event(WHEAT_HARVEST_EVENT_ID)
+            or next_event == WHEAT_HARVEST_EVENT_ID
+        ):
+            weights[ResourceType.WHEAT] *= 1.20
         production = self._player_production_scores(game, player)
         strongest = max(production.values(), default=0)
         for resource_type in weights:

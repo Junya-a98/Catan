@@ -51,6 +51,12 @@ from game.development_cards import (
 )
 from game.dice import roll_two_dice
 from game.feedback import FeedbackManager
+from game.forecast_events import (
+    FORECAST_EVENTS_KIND,
+    SHEEP_DROUGHT_EVENT_ID,
+    WHEAT_HARVEST_EVENT_ID,
+    event_definition,
+)
 from game.game_board import GameBoard
 from game.house_rules import HouseRules
 from game.guidance import (
@@ -486,6 +492,8 @@ class CatanGame:
             "騎士",
             "略奪",
             "盗賊",
+            "イベント予告",
+            "イベント発動",
         )
         is_important = points_changed or any(
             term in str(label) for term in important_terms
@@ -1159,9 +1167,15 @@ class CatanGame:
         ai_label = (
             self.get_ai_personality_mode_label() if self.ai_player_count else "なし"
         )
+        variant_label = (
+            "予告イベント"
+            if self.variant_config.kind == FORECAST_EVENTS_KIND
+            else "通常"
+        )
         return (
             f"{mode_label} / seed {self.board_seed} / AI {self.ai_player_count}人（{ai_label}）/ "
-            f"勝利{self.victory_point_target}点 / 追加ルール {self.house_rules.compact_label()}"
+            f"勝利{self.victory_point_target}点 / モード {variant_label} / "
+            f"追加ルール {self.house_rules.compact_label()}"
         )
 
     def get_board_rules(self):
@@ -1206,6 +1220,14 @@ class CatanGame:
                     else "なし",
                 ),
                 ("勝利条件", f"{self.victory_point_target} VP"),
+                (
+                    "モード",
+                    (
+                        "予告イベント"
+                        if self.variant_config.kind == FORECAST_EVENTS_KIND
+                        else "通常"
+                    ),
+                ),
             ],
             "description": description,
             "accent": accent,
@@ -1742,6 +1764,7 @@ class CatanGame:
         self.board_seed_text = str(self.board_seed)
         self.board = self.create_board_from_settings()
         self.get_board_rules().set_board(self.board)
+        self.variant_state = VariantState.initial(self.variant_config)
         self.configure_players(player_count, reset_logs=False)
         self.clear_log()
         self.add_log(f"再戦準備: {self.get_board_configuration_summary()}")
@@ -1876,6 +1899,75 @@ class CatanGame:
         self.development_card_used_this_turn = False
         self.ai_domestic_trade_attempted = False
         self.reset_special_phase_state()
+
+    def is_forecast_variant(self):
+        return self.variant_config.kind == FORECAST_EVENTS_KIND
+
+    def is_forecast_event_active(self, event_id):
+        return bool(
+            self.is_forecast_variant()
+            and event_id in self.variant_state.active_forecast_event_ids()
+        )
+
+    def get_next_forecast_event_id(self):
+        if not self.is_forecast_variant():
+            return None
+        return self.variant_state.next_forecast_event_id()
+
+    def announce_initial_forecast_event(self):
+        if not self.is_forecast_variant():
+            return
+        event_id = self.get_next_forecast_event_id()
+        if event_id is None:
+            return
+        definition = event_definition(event_id)
+        public = self.variant_state.public
+        remaining = (
+            public["forecast"]["resolve_turn"] - public["completed_turns"]
+        )
+        detail = f"あと{remaining}手番で発動: {definition.description}"
+        self.add_log(f"イベント予告 — {definition.title}: {detail}")
+        self.record_event(
+            f"イベント予告: {definition.title}",
+            detail,
+            level="warning",
+            include_in_turn=False,
+        )
+
+    def advance_forecast_event_turn(self):
+        if not self.is_forecast_variant():
+            return
+        self.variant_state, update = self.variant_state.advance_forecast_turn(
+            self.variant_config,
+            player_count=len(self.turn_order),
+        )
+        for event_id in update.expired_event_ids:
+            definition = event_definition(event_id)
+            self.add_log(f"イベント終了 — {definition.title}")
+        if update.activated_event_id is None:
+            return
+        activated = event_definition(update.activated_event_id)
+        announced = event_definition(update.announced_event_id)
+        interval = self.variant_config.options["event_interval_turns"]
+        refresh_note = (
+            "同じ効果が有効なため重複せず、発動時点を更新しました。 / "
+            if update.refreshed_event_id is not None
+            else ""
+        )
+        detail = (
+            f"{activated.description} / {refresh_note}次回予告: {announced.title}"
+            f"（あと{interval}手番）"
+        )
+        self.add_log(f"イベント発動 — {activated.title}: {activated.description}")
+        self.add_log(
+            f"次回イベント予告 — {announced.title}: あと{interval}手番"
+        )
+        self.record_event(
+            f"イベント発動: {activated.title}",
+            detail,
+            level="warning",
+            include_in_turn=False,
+        )
 
     def reset_initial_setup_state(self):
         self.initial_dice_phase = True
@@ -5035,6 +5127,7 @@ class CatanGame:
             actor=first_player,
             include_in_turn=False,
         )
+        self.announce_initial_forecast_event()
         if self.should_hide_for_handoff(previous_player, first_player):
             self.begin_player_handoff(first_player, context="最初の手番")
         if first_player is not None and first_player.is_ai:
@@ -5213,6 +5306,7 @@ class CatanGame:
         self.check_for_winner(next_player)
         if self.phase == "finished":
             return
+        self.advance_forecast_event_turn()
         self.add_log(f"{next_player.name} の手番です。")
         self.add_log(
             "スペースでダイス、発展カードは K/B/Y/M、銀行交易は T、交渉は P です。"
@@ -5717,11 +5811,19 @@ class CatanGame:
         for resource_type, player_demands in demands.items():
             if not player_demands:
                 continue
+            if (
+                resource_type is ResourceType.SHEEP
+                and self.is_forecast_event_active(SHEEP_DROUGHT_EVENT_ID)
+            ):
+                self.add_log(
+                    "大干ばつのため、この出目では羊タイルが生産しません。"
+                )
+                continue
             total_demand = sum(player_demands.values())
             available = self.bank.available(resource_type)
 
             if total_demand <= available:
-                grants = player_demands
+                grants = dict(player_demands)
             elif len(player_demands) == 1:
                 player, requested = next(iter(player_demands.items()))
                 grants = {player: min(requested, available)}
@@ -5736,10 +5838,18 @@ class CatanGame:
                 )
                 continue
 
+            granted_players = []
             for player, amount in grants.items():
                 if amount <= 0:
                     continue
-                self.give_resource_from_bank(player, resource_type, amount)
+                amount = self.give_resource_from_bank(
+                    player,
+                    resource_type,
+                    amount,
+                )
+                if amount <= 0:
+                    continue
+                granted_players.append(player)
                 self.add_log(
                     f"{player.name} が {RESOURCE_LABELS[resource_type]} を {amount} 枚獲得しました。"
                 )
@@ -5749,6 +5859,37 @@ class CatanGame:
                 player_gains = gains_by_player.setdefault(player, {})
                 player_gains[resource_type] = (
                     player_gains.get(resource_type, 0) + amount
+                )
+
+            if (
+                resource_type is ResourceType.WHEAT
+                and granted_players
+                and self.is_forecast_event_active(WHEAT_HARVEST_EVENT_ID)
+            ):
+                bonus_required = len(granted_players)
+                if self.bank.available(ResourceType.WHEAT) >= bonus_required:
+                    for player in granted_players:
+                        self.give_resource_from_bank(
+                            player,
+                            ResourceType.WHEAT,
+                            1,
+                        )
+                        gain_summaries.append(f"{player.name}: 麦 +1（豊作）")
+                        player_gains = gains_by_player.setdefault(player, {})
+                        player_gains[ResourceType.WHEAT] = (
+                            player_gains.get(ResourceType.WHEAT, 0) + 1
+                        )
+                    self.add_log(
+                        "豊作ボーナス: 麦を生産した各プレイヤーが追加で1枚獲得しました。"
+                    )
+                else:
+                    self.add_log(
+                        "豊作ボーナスは銀行の麦不足により配布されませんでした。"
+                    )
+                self.variant_state, _consumed = (
+                    self.variant_state.consume_forecast_effect(
+                        WHEAT_HARVEST_EVENT_ID
+                    )
                 )
         for player, bundle in gains_by_player.items():
             self.last_resource_distribution[player.name] = dict(bundle)
