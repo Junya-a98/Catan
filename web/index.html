@@ -19,6 +19,10 @@
         </span>
       </a>
       <div class="topbar-actions">
+        <button class="audio-toggle rules-toggle" id="rules-toggle" type="button" aria-expanded="false" aria-controls="rules-drawer" aria-label="ルール・建設コストを表示">
+          <span aria-hidden="true">?</span>
+          <span>ルール・建設コスト</span>
+        </button>
         <div class="audio-controls" role="group" aria-label="音響設定">
           <button class="audio-toggle" id="audio-sfx-toggle" type="button" aria-pressed="true" aria-label="効果音: オン">
             <span aria-hidden="true">♪</span>
@@ -30,6 +34,10 @@
             <span>BGM</span>
             <span class="audio-toggle-state" data-audio-state aria-hidden="true">OFF</span>
           </button>
+          <label class="audio-volume" for="audio-volume">
+            <span>音量</span>
+            <input id="audio-volume" type="range" min="0" max="100" value="65" step="5" aria-label="全体音量 65%">
+          </label>
         </div>
         <div class="connection" id="connection-status" data-state="connecting" role="status" aria-live="polite">
           <span class="connection-dot" aria-hidden="true"></span>
@@ -340,6 +348,81 @@
         </section>
       </section>
     </main>
+
+    <div class="modal-backdrop rules-backdrop" id="rules-drawer" role="dialog" aria-modal="true" aria-labelledby="rules-title" hidden>
+      <section class="rules-sheet" tabindex="-1">
+        <div class="modal-heading">
+          <div>
+            <p class="eyebrow">QUICK RULES</p>
+            <h2 id="rules-title">ルール・建設コスト</h2>
+            <p>必要なときだけ開ける早見表です。権威サーバーが実際の合法性を最終確認します。</p>
+          </div>
+          <button class="modal-close" id="rules-close" type="button" aria-label="ルールを閉じる">×</button>
+        </div>
+        <div class="rules-variant-note" id="rules-variant-note">
+          <strong>標準ルール</strong>
+          <span>部屋を作成すると、選択中のモードやハウスルールによる例外をここへ表示します。</span>
+        </div>
+
+        <div class="build-cost-grid" aria-label="建設コスト一覧">
+          <article class="cost-card" data-piece="road">
+            <span class="cost-symbol" aria-hidden="true">━</span>
+            <div><strong>街道</strong><small>自分の街道・建物へ接続</small></div>
+            <p><span>木 1</span><span>土 1</span></p>
+          </article>
+          <article class="cost-card" data-piece="settlement">
+            <span class="cost-symbol" aria-hidden="true">⌂</span>
+            <div><strong>開拓地</strong><small>隣接する全交差点に建物がない</small></div>
+            <p><span>木 1</span><span>羊 1</span><span>麦 1</span><span>土 1</span></p>
+          </article>
+          <article class="cost-card" data-piece="city">
+            <span class="cost-symbol" aria-hidden="true">♜</span>
+            <div><strong>都市</strong><small>自分の開拓地を強化</small></div>
+            <p><span>麦 2</span><span>鉄 3</span></p>
+          </article>
+          <article class="cost-card" data-piece="development">
+            <span class="cost-symbol" aria-hidden="true">✦</span>
+            <div><strong>発展カード</strong><small>原則、購入した手番には使用不可</small></div>
+            <p><span>羊 1</span><span>麦 1</span><span>鉄 1</span></p>
+          </article>
+        </div>
+
+        <div class="rules-grid">
+          <article>
+            <h3>手番の流れ</h3>
+            <ol><li>ダイスを振る</li><li>建設・交易・発展カード</li><li>手番終了</li></ol>
+          </article>
+          <article>
+            <h3>盗賊と「7」</h3>
+            <p>手札8枚以上なら半分（端数切捨て）を捨て、盗賊を別タイルへ動かします。隣接する相手からランダムに1枚奪えます。</p>
+          </article>
+          <article>
+            <h3>国内交易</h3>
+            <p>手番プレイヤーと他プレイヤーだけが交換できます。双方が1枚以上を渡し、同じ資源を両側には指定できません。</p>
+          </article>
+          <article>
+            <h3>銀行・港</h3>
+            <p>通常は同じ資源4枚を任意の1枚へ交換。開拓地・都市が接続する港に応じて3:1または指定資源2:1になります。</p>
+          </article>
+        </div>
+      </section>
+    </div>
+
+    <div class="modal-backdrop trade-prompt-backdrop" id="trade-prompt" role="dialog" aria-modal="true" aria-labelledby="trade-prompt-title" hidden>
+      <section class="trade-prompt-card" tabindex="-1">
+        <div class="modal-heading">
+          <div>
+            <p class="eyebrow" id="trade-prompt-kicker">TRADE REQUEST</p>
+            <h2 id="trade-prompt-title">交易の申し込み</h2>
+            <p id="trade-prompt-description">条件を確認しています。</p>
+          </div>
+          <button class="modal-close" id="trade-prompt-close" type="button" aria-label="交渉通知を閉じる">×</button>
+        </div>
+        <div class="trade-prompt-terms" id="trade-prompt-terms"></div>
+        <div class="trade-prompt-actions" id="trade-prompt-actions"></div>
+        <p class="modal-footnote">閉じても、右の「選べる行動」から回答できます。</p>
+      </section>
+    </div>
 
     <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
     <noscript>このWeb版を遊ぶにはJavaScriptを有効にしてください。</noscript>

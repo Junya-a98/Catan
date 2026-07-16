@@ -20,7 +20,9 @@
   let bgmGain = null;
   let bgmActive = false;
   let bgmTimer = null;
+  let bgmRestartTimer = null;
   let bgmMeasure = 0;
+  let currentScene = "home";
   const bgmNodes = new Set();
 
   // This quiet four-measure theme is synthesized locally and was composed
@@ -43,6 +45,48 @@
       melody: Object.freeze([369.99, 440.0, 554.37, 493.88]),
     }),
   ]);
+  const BGM_SCENES = Object.freeze({
+    home: Object.freeze({
+      measures: BGM_MEASURES,
+      interval: 4600,
+      duration: 4.65,
+      melodyStep: 0.94,
+      chordLevel: 0.075,
+      melodyLevel: 0.045,
+      waveform: "sine",
+      gain: 0.12,
+    }),
+    lobby: Object.freeze({
+      measures: Object.freeze([BGM_MEASURES[0], BGM_MEASURES[2], BGM_MEASURES[1], BGM_MEASURES[3]]),
+      interval: 4400,
+      duration: 4.45,
+      melodyStep: 0.9,
+      chordLevel: 0.082,
+      melodyLevel: 0.052,
+      waveform: "triangle",
+      gain: 0.13,
+    }),
+    game: Object.freeze({
+      measures: BGM_MEASURES,
+      interval: 4100,
+      duration: 4.15,
+      melodyStep: 0.82,
+      chordLevel: 0.09,
+      melodyLevel: 0.06,
+      waveform: "triangle",
+      gain: 0.14,
+    }),
+    trade: Object.freeze({
+      measures: Object.freeze([BGM_MEASURES[2], BGM_MEASURES[1], BGM_MEASURES[3], BGM_MEASURES[1]]),
+      interval: 3500,
+      duration: 3.55,
+      melodyStep: 0.66,
+      chordLevel: 0.078,
+      melodyLevel: 0.052,
+      waveform: "triangle",
+      gain: 0.125,
+    }),
+  });
 
   function readStorage(key) {
     try {
@@ -285,6 +329,34 @@
     return true;
   }
 
+  function playTradeInvite() {
+    if (!canPlaySfx()) {
+      return false;
+    }
+    const start = audioContext.currentTime + 0.01;
+    [523.25, 659.25].forEach((frequency, index) => {
+      scheduleTone(
+        frequency,
+        start + index * 0.13,
+        0.3,
+        0.16,
+        "triangle",
+        sfxGain,
+        { attack: 0.025, release: 0.18 },
+      );
+    });
+    scheduleTone(
+      261.63,
+      start,
+      0.48,
+      0.07,
+      "sine",
+      sfxGain,
+      { attack: 0.04, release: 0.3 },
+    );
+    return true;
+  }
+
   function playVictory() {
     if (!canPlaySfx()) {
       return false;
@@ -321,16 +393,18 @@
       !bgmEnabled ||
       !audioContext ||
       audioContext.state !== "running" ||
-      !bgmGain
+      !bgmGain ||
+      document.hidden
     ) {
       bgmActive = false;
       bgmTimer = null;
       return;
     }
-    const measure = BGM_MEASURES[bgmMeasure % BGM_MEASURES.length];
+    const profile = BGM_SCENES[currentScene];
+    const measure = profile.measures[bgmMeasure % profile.measures.length];
     const start = audioContext.currentTime + 0.05;
     measure.chord.forEach((frequency) => {
-      scheduleTone(frequency, start, 4.35, 0.1, "sine", bgmGain, {
+      scheduleTone(frequency, start, profile.duration, profile.chordLevel, "sine", bgmGain, {
         attack: 0.65,
         release: 1.15,
         trackBgm: true,
@@ -339,16 +413,16 @@
     measure.melody.forEach((frequency, index) => {
       scheduleTone(
         frequency,
-        start + 0.42 + index * 0.88,
+        start + 0.34 + index * profile.melodyStep,
         0.72,
-        0.065,
-        "triangle",
+        profile.melodyLevel,
+        profile.waveform,
         bgmGain,
         { attack: 0.12, release: 0.3, trackBgm: true },
       );
     });
-    bgmMeasure = (bgmMeasure + 1) % BGM_MEASURES.length;
-    bgmTimer = window.setTimeout(scheduleBgmMeasure, 4300);
+    bgmMeasure = (bgmMeasure + 1) % profile.measures.length;
+    bgmTimer = window.setTimeout(scheduleBgmMeasure, profile.interval);
   }
 
   function startBgm() {
@@ -357,30 +431,82 @@
       !bgmEnabled ||
       !interactionObserved ||
       !audioContext ||
-      audioContext.state !== "running"
+      audioContext.state !== "running" ||
+      document.hidden
     ) {
       return bgmActive;
     }
+    if (bgmRestartTimer !== null) {
+      window.clearTimeout(bgmRestartTimer);
+      bgmRestartTimer = null;
+    }
+    const profile = BGM_SCENES[currentScene];
+    bgmGain.gain.setValueAtTime(MIN_GAIN, audioContext.currentTime);
+    bgmGain.gain.setTargetAtTime(
+      profile.gain,
+      audioContext.currentTime,
+      0.08,
+    );
     bgmActive = true;
     scheduleBgmMeasure();
     return true;
   }
 
-  function stopBgm() {
+  function stopBgm({ fade = false } = {}) {
     bgmActive = false;
     if (bgmTimer !== null) {
       window.clearTimeout(bgmTimer);
       bgmTimer = null;
     }
+    if (bgmRestartTimer !== null) {
+      window.clearTimeout(bgmRestartTimer);
+      bgmRestartTimer = null;
+    }
+    const stopAt =
+      fade && audioContext
+        ? audioContext.currentTime + 0.12
+        : undefined;
+    if (fade && bgmGain && audioContext) {
+      bgmGain.gain.setTargetAtTime(
+        MIN_GAIN,
+        audioContext.currentTime,
+        0.035,
+      );
+    }
     bgmNodes.forEach((node) => {
       try {
-        node.stop();
+        if (stopAt === undefined) node.stop();
+        else node.stop(stopAt);
       } catch (_error) {
         // Nodes that already ended cannot be stopped twice.
       }
     });
     bgmNodes.clear();
     bgmMeasure = 0;
+  }
+
+  function setScene(scene) {
+    if (!Object.prototype.hasOwnProperty.call(BGM_SCENES, scene)) {
+      return currentScene;
+    }
+    if (scene === currentScene) {
+      return currentScene;
+    }
+    currentScene = scene;
+    const shouldRestart =
+      bgmActive
+      && bgmEnabled
+      && interactionObserved
+      && !document.hidden;
+    if (shouldRestart) {
+      stopBgm({ fade: true });
+      bgmRestartTimer = window.setTimeout(() => {
+        bgmRestartTimer = null;
+        if (bgmEnabled && interactionObserved && !document.hidden) startBgm();
+      }, 150);
+    }
+    notifySettingsChanged();
+    return currentScene;
   }
 
   function setSfxEnabled(enabled) {
@@ -449,6 +575,7 @@
       sfxEnabled,
       bgmEnabled,
       volume,
+      scene: currentScene,
     });
   }
 
@@ -477,6 +604,12 @@
       "BGM",
       bgmEnabled,
     );
+    const volumeControl = document.getElementById("audio-volume");
+    if (volumeControl) {
+      const percentage = Math.round(volume * 100);
+      volumeControl.value = String(percentage);
+      volumeControl.setAttribute("aria-label", "全体音量 " + percentage + "%");
+    }
   }
 
   function notifySettingsChanged() {
@@ -508,6 +641,7 @@
     updateControls();
     const sfxButton = document.getElementById("audio-sfx-toggle");
     const bgmButton = document.getElementById("audio-bgm-toggle");
+    const volumeControl = document.getElementById("audio-volume");
     if (sfxButton) {
       sfxButton.addEventListener("click", (event) => {
         observeInteraction(event);
@@ -518,6 +652,14 @@
       bgmButton.addEventListener("click", (event) => {
         observeInteraction(event);
         toggleBgm();
+      });
+    }
+    if (volumeControl) {
+      volumeControl.addEventListener("input", (event) => {
+        const percentage = Number(event.currentTarget.value);
+        if (Number.isFinite(percentage)) {
+          setVolume(Math.max(0, Math.min(100, percentage)) / 100);
+        }
       });
     }
   }
@@ -539,6 +681,7 @@
     playDice,
     playBuild,
     playTrade,
+    playTradeInvite,
     playVictory,
     setSfxEnabled,
     toggleSfx,
@@ -548,6 +691,8 @@
     isBgmEnabled: () => bgmEnabled,
     setVolume,
     getVolume: () => volume,
+    setScene,
+    getScene: () => currentScene,
     getState,
   });
 

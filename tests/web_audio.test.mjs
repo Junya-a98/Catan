@@ -201,12 +201,15 @@ function createAudioContextClass(counter) {
 
 function createHarness({ initialStorage = {}, storageThrows = false } = {}) {
   const storage = new FakeStorage(initialStorage, storageThrows);
-  const counter = { instances: 0 };
+  const counter = { instances: 0, timeouts: 0, clears: 0 };
   const sfxButton = new FakeButton("audio-sfx-toggle");
   const bgmButton = new FakeButton("audio-bgm-toggle");
+  const volumeControl = new FakeButton("audio-volume");
+  volumeControl.value = "";
   const buttons = new Map([
     [sfxButton.id, sfxButton],
     [bgmButton.id, bgmButton],
+    [volumeControl.id, volumeControl],
   ]);
   const document = new FakeEventTarget();
   document.readyState = "complete";
@@ -216,8 +219,13 @@ function createHarness({ initialStorage = {}, storageThrows = false } = {}) {
   const window = new FakeEventTarget();
   window.AudioContext = createAudioContextClass(counter);
   window.localStorage = storage;
-  window.setTimeout = () => 1;
-  window.clearTimeout = () => {};
+  window.setTimeout = () => {
+    counter.timeouts += 1;
+    return counter.timeouts;
+  };
+  window.clearTimeout = () => {
+    counter.clears += 1;
+  };
 
   class FakeCustomEvent {
     constructor(type, options = {}) {
@@ -241,7 +249,7 @@ function createHarness({ initialStorage = {}, storageThrows = false } = {}) {
 
   return {
     audio: window.CatanAudio,
-    buttons: { sfx: sfxButton, bgm: bgmButton },
+    buttons: { sfx: sfxButton, bgm: bgmButton, volume: volumeControl },
     contextCounter: counter,
     document,
     navigator,
@@ -261,6 +269,7 @@ test("audio defaults to SFX on and BGM off without creating a context", () => {
   assert.equal(state.sfxEnabled, true);
   assert.equal(state.bgmEnabled, false);
   assert.equal(state.volume, 0.65);
+  assert.equal(state.scene, "home");
   assert.equal(state.unlocked, false);
   assert.equal(harness.contextCounter.instances, 0);
   assert.equal(harness.buttons.sfx.getAttribute("aria-pressed"), "true");
@@ -273,6 +282,7 @@ test("untrusted or absent activation cannot create audio or play effects", async
   assert.equal(harness.audio.playDice(), false);
   assert.equal(harness.audio.playBuild("road"), false);
   assert.equal(harness.audio.playTrade(), false);
+  assert.equal(harness.audio.playTradeInvite(), false);
   assert.equal(harness.audio.playVictory(), false);
   assert.equal(await harness.audio.unlock(), false);
 
@@ -293,6 +303,7 @@ test("a trusted interaction unlocks the context and all effects can play", async
   assert.equal(harness.audio.playDice(), true);
   assert.equal(harness.audio.playBuild("city"), true);
   assert.equal(harness.audio.playTrade(), true);
+  assert.equal(harness.audio.playTradeInvite(), true);
   assert.equal(harness.audio.playVictory(), true);
 });
 
@@ -332,4 +343,47 @@ test("invalid or unavailable localStorage falls back without throwing", () => {
   assert.doesNotThrow(() => unavailable.audio.toggleSfx());
   assert.doesNotThrow(() => unavailable.audio.toggleBgm());
   assert.doesNotThrow(() => unavailable.audio.setVolume(0.25));
+});
+
+test("scene changes are validated, idempotent, and never unlock audio", async () => {
+  const harness = createHarness({
+    initialStorage: { [STORAGE_KEYS.bgm]: "true" },
+  });
+
+  assert.equal(harness.audio.setScene("lobby"), "lobby");
+  assert.equal(harness.audio.setScene("unknown"), "lobby");
+  assert.equal(harness.contextCounter.instances, 0);
+
+  harness.document.dispatch("pointerdown", { isTrusted: true });
+  await flushMicrotasks();
+  assert.equal(harness.contextCounter.instances, 1);
+  const beforeChange = harness.contextCounter.timeouts;
+  assert.equal(harness.audio.setScene("game"), "game");
+  assert.ok(harness.contextCounter.timeouts > beforeChange);
+  const afterChange = harness.contextCounter.timeouts;
+  assert.equal(harness.audio.setScene("game"), "game");
+  assert.equal(harness.contextCounter.timeouts, afterChange);
+  assert.equal(harness.audio.getState().scene, "game");
+});
+
+test("volume slider restores and persists the validated master volume", () => {
+  const harness = createHarness({
+    initialStorage: { [STORAGE_KEYS.volume]: "0.42" },
+  });
+  assert.equal(harness.buttons.volume.value, "42");
+  assert.equal(
+    harness.buttons.volume.getAttribute("aria-label"),
+    "全体音量 42%",
+  );
+
+  harness.buttons.volume.value = "30";
+  harness.buttons.volume.dispatch("input", {
+    currentTarget: harness.buttons.volume,
+  });
+  assert.equal(harness.audio.getVolume(), 0.3);
+  assert.equal(harness.storage.getItem(STORAGE_KEYS.volume), "0.30");
+  assert.equal(
+    harness.buttons.volume.getAttribute("aria-label"),
+    "全体音量 30%",
+  );
 });

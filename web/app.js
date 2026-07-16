@@ -11,6 +11,7 @@ const RESOURCE_LABELS = {
   DESERT: "砂漠",
   UNKNOWN: "未探索",
 };
+const TRADE_RESOURCE_KEYS = Object.freeze(["WOOD", "SHEEP", "WHEAT", "BRICK", "ORE"]);
 const PIECE_LABELS = { road: "街道", settlement: "開拓地", city: "都市" };
 const CARD_LABELS = {
   knight: "騎士",
@@ -88,12 +89,20 @@ const state = {
   pendingDiceAnimation: null,
   pendingAnimationRevision: null,
   currentView: null,
+  tradePromptSignature: null,
+  tradePromptDismissed: new Set(),
+  tradePromptNotified: new Set(),
 };
 
 const elements = Object.fromEntries(
   [
     "connection-status",
     "connection-label",
+    "rules-toggle",
+    "rules-drawer",
+    "rules-close",
+    "rules-variant-note",
+    "audio-volume",
     "home-view",
     "lobby-view",
     "game-view",
@@ -123,6 +132,13 @@ const elements = Object.fromEntries(
     "revision-badge",
     "action-list",
     "action-hint",
+    "trade-prompt",
+    "trade-prompt-kicker",
+    "trade-prompt-title",
+    "trade-prompt-description",
+    "trade-prompt-terms",
+    "trade-prompt-actions",
+    "trade-prompt-close",
     "victory-target-label",
     "player-list",
     "latest-event-title",
@@ -829,6 +845,10 @@ function resetRoomState(renderNow = true) {
   state.nextSequence = 0;
   state.commandPending = false;
   state.targetOptions.clear();
+  state.tradePromptSignature = null;
+  state.tradePromptDismissed.clear();
+  state.tradePromptNotified.clear();
+  hideTradePrompt();
   clearPendingBoardAnimations();
   sessionStorage.removeItem("catan-reconnect");
   if (renderNow) render();
@@ -843,6 +863,8 @@ function render() {
   elements["game-view"].hidden = !hasGame;
   if (hasLobby) renderLobby();
   if (hasGame) renderGame();
+  if (!hasGame) hideTradePrompt();
+  syncAudioScene(nextView);
   if (state.currentView !== nextView) {
     state.currentView = nextView;
     window.requestAnimationFrame(() => window.scrollTo(0, 0));
@@ -966,6 +988,7 @@ function renderGame() {
   const animationPlan = takePendingBoardAnimations(snapshot);
   renderBoard(snapshot.board_manifest, gameState.players || [], animationPlan);
   renderActions(options);
+  renderIncomingTradePrompt(gameState, options, ownSeat);
   renderPlayers(gameState, activeSeat, ownSeat);
   const latest = gameState.history?.latest_event || {};
   elements["latest-event-title"].textContent = latest.title || "進行中";
@@ -1026,29 +1049,481 @@ function renderActions(options) {
   const list = elements["action-list"];
   list.replaceChildren();
   const direct = options.filter((option) => !option?.args?.target);
-  for (const option of direct) {
-    const button = document.createElement("button");
-    button.type = "button";
-    button.className = "action-button";
-    if (["roll_dice", "end_turn", "trade_accept", "trade_submit"].includes(option.command)) {
-      button.classList.add("primary-action");
+  const gameState = state.snapshot?.state || {};
+  const isTradeEditor =
+    gameState.phase?.special_phase === "domestic_trade_edit"
+    && gameState.domestic_trade?.editor === state.welcome?.seat_index
+    && direct.some((option) => option.command === "trade_adjust");
+  if (isTradeEditor) {
+    renderTradeEditor(list, gameState, direct);
+  } else {
+    for (const option of direct) {
+      list.append(createActionButton(option));
     }
-    if (["cancel", "trade_reject"].includes(option.command)) {
-      button.classList.add("danger-action");
-    }
-    button.textContent = commandLabel(option);
-    button.disabled = state.commandPending;
-    button.addEventListener("click", () => sendGameCommand(option));
-    list.append(button);
   }
   const targetCount = state.targetOptions.size;
   elements["action-hint"].textContent = targetCount
     ? `盤面上で光っている候補を選べます（${targetCount}か所）。`
+    : isTradeEditor
+      ? "「− / ＋」で条件を調整します。同じ資源は交換の両側へ指定できません。"
     : direct.length
       ? "行動を選ぶと権威サーバーが合法性を再確認します。"
       : state.welcome?.role === "spectator"
         ? "観戦中です。操作はプレイヤーだけに表示されます。"
         : "ほかのプレイヤーの操作を待っています。";
+}
+
+function createActionButton(option, label = commandLabel(option)) {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "action-button";
+  if (["roll_dice", "end_turn", "trade_accept", "trade_submit", "trade_reveal"].includes(option.command)) {
+    button.classList.add("primary-action");
+  }
+  if (["cancel", "trade_reject"].includes(option.command)) {
+    button.classList.add("danger-action");
+  }
+  button.textContent = label;
+  button.disabled = state.commandPending;
+  button.addEventListener("click", () => sendGameCommand(option));
+  return button;
+}
+
+function renderTradeEditor(list, gameState, options) {
+  const viewerSeat = state.welcome?.seat_index;
+  const presentation = domesticTradePresentation(gameState, viewerSeat);
+  const editor = document.createElement("section");
+  editor.className = "trade-editor";
+  editor.setAttribute("aria-label", "交易条件の編集");
+
+  const heading = document.createElement("div");
+  heading.className = "trade-editor-heading";
+  const headingTitle = presentation.isCounter
+    ? presentation.counterpartyName + "への条件変更"
+    : presentation.isBroadcast
+      ? "全員へ募集する条件"
+      : presentation.counterpartyName + "への提案";
+  heading.append(
+    textElement("strong", headingTitle),
+    textElement(
+      "span",
+      "左があなたの支払い、右があなたの受け取りです。相手の手札内訳は公開されません。",
+    ),
+    textElement(
+      "div",
+      "あなた: " + formatTradeBundle(presentation.outgoing) + " → "
+        + formatTradeBundle(presentation.incoming),
+      "trade-live-summary",
+    ),
+  );
+  editor.append(heading);
+
+  const grid = document.createElement("div");
+  grid.className = "trade-editor-grid";
+  grid.append(
+    buildTradeSideEditor({
+      className: "outgoing",
+      title: "あなたが渡す",
+      subtitle: ownResourceSummary(gameState, viewerSeat),
+      side: presentation.outgoingSide,
+      bundle: presentation.outgoing,
+      options,
+    }),
+    buildTradeSideEditor({
+      className: "incoming",
+      title: "あなたが受け取る",
+      subtitle: presentation.counterpartyName + "の手札内訳は非公開",
+      side: presentation.incomingSide,
+      bundle: presentation.incoming,
+      options,
+    }),
+  );
+  editor.append(grid);
+
+  const actions = document.createElement("div");
+  actions.className = "trade-editor-actions";
+  const submit = options.find((option) => option.command === "trade_submit");
+  if (submit) {
+    const submitLabel = presentation.isCounter
+      ? "この条件で再提案"
+      : presentation.isBroadcast
+        ? "この条件で全員に募集"
+        : "この条件で提案";
+    actions.append(createActionButton(submit, submitLabel));
+  } else {
+    const disabledSubmit = document.createElement("button");
+    disabledSubmit.type = "button";
+    disabledSubmit.className = "action-button primary-action";
+    disabledSubmit.textContent = "双方1枚以上で提案できます";
+    disabledSubmit.disabled = true;
+    actions.append(disabledSubmit);
+  }
+  const cancel = options.find((option) => option.command === "cancel");
+  if (cancel) actions.append(createActionButton(cancel, "交渉をやめる"));
+  editor.append(actions);
+  editor.append(
+    textElement(
+      "p",
+      "「＋」が押せない資源は、手札不足か反対側ですでに指定されています。",
+      "trade-editor-help",
+    ),
+  );
+  list.append(editor);
+}
+
+function buildTradeSideEditor({
+  className,
+  title,
+  subtitle,
+  side,
+  bundle,
+  options,
+}) {
+  const card = document.createElement("section");
+  card.className = "trade-side-card " + className;
+  const heading = document.createElement("div");
+  heading.className = "trade-side-title";
+  heading.append(textElement("strong", title), textElement("small", subtitle));
+  card.append(heading);
+
+  const rows = document.createElement("div");
+  rows.className = "trade-resource-list";
+  for (const resource of TRADE_RESOURCE_KEYS) {
+    const row = document.createElement("div");
+    row.className = "trade-resource-row";
+    const minus = findTradeAdjustment(options, side, resource, -1);
+    const plus = findTradeAdjustment(options, side, resource, 1);
+    row.append(
+      textElement("span", RESOURCE_LABELS[resource], "trade-resource-name"),
+      createTradeAdjustmentButton(
+        minus,
+        "−",
+        title + " " + RESOURCE_LABELS[resource] + "を1枚減らす",
+      ),
+      textElement(
+        "strong",
+        String(Number(bundle?.[resource]) || 0),
+        "trade-resource-count",
+      ),
+      createTradeAdjustmentButton(
+        plus,
+        "＋",
+        title + " " + RESOURCE_LABELS[resource] + "を1枚増やす",
+      ),
+    );
+    rows.append(row);
+  }
+  card.append(rows);
+  return card;
+}
+
+function findTradeAdjustment(options, side, resource, delta) {
+  return options.find(
+    (option) =>
+      option.command === "trade_adjust"
+      && option.args?.side === side
+      && option.args?.resource === resource
+      && Number(option.args?.delta) === delta,
+  );
+}
+
+function createTradeAdjustmentButton(option, label, ariaLabel) {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "trade-adjust-button";
+  button.textContent = label;
+  button.setAttribute("aria-label", ariaLabel);
+  button.disabled = !option || state.commandPending;
+  if (option) button.addEventListener("click", () => sendGameCommand(option));
+  return button;
+}
+
+function ownResourceSummary(gameState, viewerSeat) {
+  const player = Number.isInteger(viewerSeat) ? gameState.players?.[viewerSeat] : null;
+  const total = Number(player?.resource_total);
+  return Number.isFinite(total)
+    ? "あなたの手札 " + total + "枚"
+    : "あなたの手札から支払います";
+}
+
+function currentTurnSeat(gameState) {
+  const phase = gameState?.phase || {};
+  const order = Array.isArray(phase.turn_order) ? phase.turn_order : [];
+  const indexed = order[phase.current_player_index];
+  if (Number.isInteger(indexed)) return indexed;
+  return Number.isInteger(phase.current_player_index)
+    ? phase.current_player_index
+    : null;
+}
+
+function domesticTradeActorSeat(gameState) {
+  const phase = gameState?.phase?.special_phase;
+  const trade = gameState?.domestic_trade || {};
+  if (phase === "domestic_trade_handoff" || phase === "domestic_trade_response") {
+    return Number.isInteger(trade.partner) ? trade.partner : null;
+  }
+  if (phase === "domestic_trade_edit" && trade.is_counter) {
+    return Number.isInteger(trade.partner) ? trade.partner : null;
+  }
+  return currentTurnSeat(gameState);
+}
+
+function domesticTradePresentation(gameState, viewerSeat) {
+  const trade = gameState?.domestic_trade || {};
+  const turnSeat = currentTurnSeat(gameState);
+  const viewerIsTurnPlayer =
+    Number.isInteger(viewerSeat) && viewerSeat === turnSeat;
+  const outgoingSide = viewerIsTurnPlayer ? "give" : "receive";
+  const incomingSide = viewerIsTurnPlayer ? "receive" : "give";
+  const counterpartySeat = viewerIsTurnPlayer ? trade.partner : turnSeat;
+  const counterpartyName = Number.isInteger(counterpartySeat)
+    ? gameState.players?.[counterpartySeat]?.name || "相手"
+    : trade.is_broadcast
+      ? "全員"
+      : "相手";
+  const proposerSeat = trade.is_counter ? trade.partner : turnSeat;
+  return {
+    turnSeat,
+    partnerSeat: Number.isInteger(trade.partner) ? trade.partner : null,
+    proposerSeat: Number.isInteger(proposerSeat) ? proposerSeat : null,
+    proposerName: Number.isInteger(proposerSeat)
+      ? gameState.players?.[proposerSeat]?.name || "プレイヤー"
+      : "プレイヤー",
+    counterpartySeat,
+    counterpartyName,
+    outgoingSide,
+    incomingSide,
+    outgoing: trade[outgoingSide] || {},
+    incoming: trade[incomingSide] || {},
+    isCounter: Boolean(trade.is_counter),
+    isBroadcast: Boolean(trade.is_broadcast),
+    broadcastIndex: Number.isInteger(trade.broadcast_index)
+      ? trade.broadcast_index
+      : -1,
+  };
+}
+
+function formatTradeBundle(bundle) {
+  const parts = TRADE_RESOURCE_KEYS.flatMap((resource) => {
+    const count = Number(bundle?.[resource]);
+    return Number.isInteger(count) && count > 0
+      ? [RESOURCE_LABELS[resource] + " " + count]
+      : [];
+  });
+  return parts.length ? parts.join("・") : "なし";
+}
+
+function canonicalTradeBundle(bundle) {
+  return TRADE_RESOURCE_KEYS
+    .map((resource) => resource + ":" + Math.max(0, Number(bundle?.[resource]) || 0))
+    .join(",");
+}
+
+function tradeOfferSignature(gameState) {
+  const trade = gameState?.domestic_trade || {};
+  return [
+    currentTurnSeat(gameState),
+    trade.partner,
+    trade.is_counter ? "counter" : "offer",
+    trade.is_broadcast ? "broadcast" : "direct",
+    Number.isInteger(trade.broadcast_index) ? trade.broadcast_index : -1,
+    canonicalTradeBundle(trade.give),
+    canonicalTradeBundle(trade.receive),
+  ].join("|");
+}
+
+function renderIncomingTradePrompt(gameState, options, ownSeat) {
+  const phase = gameState?.phase?.special_phase;
+  const expectedCommands = {
+    domestic_trade_handoff: "trade_reveal",
+    domestic_trade_response: "trade_reject",
+    domestic_trade_counter_handoff: "trade_reveal",
+    domestic_trade_counter_response: "trade_reject",
+  };
+  const requiredCommand = expectedCommands[phase];
+  const isLive =
+    state.replayIndex === null
+    && state.snapshot?.revision === state.liveSnapshot?.revision;
+  const isViewer =
+    Number.isInteger(ownSeat)
+    && state.snapshot?.viewer_player_index === ownSeat;
+  const isActor = domesticTradeActorSeat(gameState) === ownSeat;
+  const hasAuthority = options.some(
+    (option) => option.command === requiredCommand,
+  );
+  if (!isLive || !isViewer) {
+    hideTradePrompt();
+    return;
+  }
+  if (!requiredCommand || !isActor || !hasAuthority) {
+    if (state.tradePromptSignature) {
+      state.tradePromptDismissed.delete(state.tradePromptSignature);
+      state.tradePromptNotified.delete(state.tradePromptSignature);
+    }
+    state.tradePromptSignature = null;
+    hideTradePrompt();
+    return;
+  }
+
+  const signature = tradeOfferSignature(gameState);
+  if (
+    state.tradePromptSignature
+    && state.tradePromptSignature !== signature
+  ) {
+    state.tradePromptDismissed.clear();
+    state.tradePromptNotified.clear();
+  }
+  state.tradePromptSignature = signature;
+  const firstNotice = !state.tradePromptNotified.has(signature);
+  if (firstNotice) {
+    rememberTradePrompt(state.tradePromptNotified, signature);
+    const audio = window.CatanAudio;
+    if (typeof audio?.playTradeInvite === "function") audio.playTradeInvite();
+  }
+
+  const presentation = domesticTradePresentation(gameState, ownSeat);
+  const isHandoff = phase.endsWith("_handoff");
+  elements["trade-prompt-kicker"].textContent = presentation.isCounter
+    ? "COUNTER OFFER"
+    : presentation.isBroadcast
+      ? "OPEN TRADE REQUEST"
+      : "TRADE REQUEST";
+  elements["trade-prompt-title"].textContent = presentation.isCounter
+    ? presentation.proposerName + "から条件変更"
+    : presentation.proposerName + "から交易の申し込み";
+  elements["trade-prompt-description"].textContent = isHandoff
+    ? "あなた宛ての提案です。「提案を見る」で条件と回答操作を表示します。"
+    : "交換する向きを確認して、承諾・拒否・条件変更を選んでください。";
+  renderTradePromptTerms(presentation, isHandoff);
+  renderTradePromptActions(options, isHandoff);
+
+  const rulesOpen = !elements["rules-drawer"]?.hidden;
+  if (!state.tradePromptDismissed.has(signature) && !rulesOpen) {
+    showTradePrompt(firstNotice);
+  } else {
+    hideTradePrompt();
+  }
+}
+
+function rememberTradePrompt(collection, signature) {
+  collection.add(signature);
+  while (collection.size > 40) {
+    collection.delete(collection.values().next().value);
+  }
+}
+
+function renderTradePromptTerms(presentation, hiddenForHandoff) {
+  const terms = elements["trade-prompt-terms"];
+  terms.replaceChildren();
+  if (hiddenForHandoff) {
+    const notice = document.createElement("div");
+    notice.className = "trade-term-card incoming trade-terms-sealed";
+    notice.append(
+      textElement("span", "PRIVATE HANDOFF"),
+      textElement("strong", "条件は確認操作のあとに表示されます"),
+    );
+    terms.append(notice);
+    return;
+  }
+  terms.append(
+    buildTradeTermCard(
+      "outgoing",
+      "あなたが渡す",
+      formatTradeBundle(presentation.outgoing),
+    ),
+    buildTradeTermCard(
+      "incoming",
+      "あなたが受け取る",
+      formatTradeBundle(presentation.incoming),
+    ),
+  );
+}
+
+function buildTradeTermCard(className, label, value) {
+  const card = document.createElement("article");
+  card.className = "trade-term-card " + className;
+  card.append(textElement("span", label), textElement("strong", value));
+  return card;
+}
+
+function renderTradePromptActions(options, isHandoff) {
+  const container = elements["trade-prompt-actions"];
+  container.replaceChildren();
+  const allowed = isHandoff
+    ? ["trade_reveal"]
+    : ["trade_accept", "trade_counter", "trade_reject"];
+  const labels = {
+    trade_reveal: "提案を見る",
+    trade_accept: "この条件を承諾",
+    trade_counter: "条件を変更する",
+    trade_reject: "今回は拒否",
+  };
+  for (const command of allowed) {
+    const option = options.find((candidate) => candidate.command === command);
+    if (!option) continue;
+    const button = createActionButton(option, labels[command]);
+    button.addEventListener("click", () => {
+      setTradePromptButtonsDisabled(true);
+      if (command !== "trade_reveal") dismissTradePrompt();
+    });
+    container.append(button);
+  }
+}
+
+function setTradePromptButtonsDisabled(disabled) {
+  const buttons = elements["trade-prompt-actions"]?.querySelectorAll?.("button") || [];
+  for (const button of buttons) button.disabled = disabled;
+}
+
+function showTradePrompt(shouldFocus = false) {
+  const prompt = elements["trade-prompt"];
+  if (!prompt) return;
+  const wasHidden = prompt.hidden;
+  if (wasHidden) {
+    tradePromptReturnFocus = document.activeElement || null;
+  }
+  prompt.hidden = false;
+  syncModalBodyState();
+  if (shouldFocus || wasHidden) {
+    window.requestAnimationFrame(() => {
+      prompt.querySelector?.(".trade-prompt-card")?.focus();
+    });
+  }
+}
+
+function hideTradePrompt({ restoreFocus = true } = {}) {
+  const prompt = elements["trade-prompt"];
+  const wasOpen = Boolean(prompt && !prompt.hidden);
+  if (prompt) prompt.hidden = true;
+  syncModalBodyState();
+  if (wasOpen && restoreFocus) tradePromptReturnFocus?.focus?.();
+  if (wasOpen) tradePromptReturnFocus = null;
+}
+
+function dismissTradePrompt() {
+  if (state.tradePromptSignature) {
+    rememberTradePrompt(
+      state.tradePromptDismissed,
+      state.tradePromptSignature,
+    );
+  }
+  hideTradePrompt();
+}
+
+function syncAudioScene(view) {
+  const audio = window.CatanAudio;
+  if (typeof audio?.setScene !== "function") return;
+  let scene = view;
+  const specialPhase = state.snapshot?.state?.phase?.special_phase;
+  if (
+    view === "game"
+    && typeof specialPhase === "string"
+    && (specialPhase.startsWith("domestic_trade_")
+      || specialPhase.startsWith("bank_trade_"))
+  ) {
+    scene = "trade";
+  }
+  audio.setScene(scene);
 }
 
 async function sendGameCommand(option) {
@@ -2557,7 +3032,6 @@ function activePlayerIndex(gameState) {
   const phase = gameState.phase || {};
   const initial = gameState.initial || {};
   const special = gameState.special || {};
-  const trade = gameState.domestic_trade || {};
   if (phase.special_phase === "discard" && Number.isInteger(special.discard_player)) {
     return special.discard_player;
   }
@@ -2568,8 +3042,7 @@ function activePlayerIndex(gameState) {
     typeof phase.special_phase === "string" &&
     phase.special_phase.startsWith("domestic_trade_")
   ) {
-    if (Number.isInteger(trade.broadcast_viewer)) return trade.broadcast_viewer;
-    if (Number.isInteger(trade.editor)) return trade.editor;
+    return domesticTradeActorSeat(gameState);
   }
   if (phase.name === "initial") {
     const initialOrder = initial.dice_phase
@@ -2716,6 +3189,152 @@ function svgText(x, y, text, className) {
   return element;
 }
 
+let rulesReturnFocus = null;
+let tradePromptReturnFocus = null;
+
+function syncModalBodyState() {
+  const open = Boolean(
+    (elements["rules-drawer"] && !elements["rules-drawer"].hidden)
+      || (elements["trade-prompt"] && !elements["trade-prompt"].hidden),
+  );
+  document.body?.classList?.toggle("modal-open", open);
+  for (const selector of ["main", ".topbar"]) {
+    const background = document.querySelector?.(selector);
+    if (!background) continue;
+    if (open) {
+      background.setAttribute("inert", "");
+      background.setAttribute("aria-hidden", "true");
+    } else {
+      background.removeAttribute("inert");
+      background.removeAttribute("aria-hidden");
+    }
+  }
+}
+
+function openRulesDrawer() {
+  const drawer = elements["rules-drawer"];
+  if (!drawer || !drawer.hidden) return;
+  rulesReturnFocus = document.activeElement || elements["rules-toggle"];
+  hideTradePrompt();
+  updateRulesVariantNote();
+  highlightRelevantRuleCosts();
+  drawer.hidden = false;
+  elements["rules-toggle"]?.setAttribute("aria-expanded", "true");
+  elements["rules-toggle"]?.setAttribute("aria-label", "ルール・建設コストを閉じる");
+  syncModalBodyState();
+  window.requestAnimationFrame(() => {
+    drawer.querySelector?.(".rules-sheet")?.focus();
+  });
+}
+
+function closeRulesDrawer({ restoreFocus = true } = {}) {
+  const drawer = elements["rules-drawer"];
+  if (!drawer || drawer.hidden) return;
+  drawer.hidden = true;
+  elements["rules-toggle"]?.setAttribute("aria-expanded", "false");
+  elements["rules-toggle"]?.setAttribute("aria-label", "ルール・建設コストを表示");
+  syncModalBodyState();
+  if (restoreFocus) rulesReturnFocus?.focus?.();
+  rulesReturnFocus = null;
+  if (state.snapshot?.state) {
+    renderIncomingTradePrompt(
+      state.snapshot.state,
+      state.snapshot.command_options || [],
+      state.welcome?.seat_index,
+    );
+  }
+}
+
+function updateRulesVariantNote() {
+  const note = elements["rules-variant-note"];
+  if (!note) return;
+  const rulesDocument = state.snapshot?.state?.rules || {};
+  const rules = rulesDocument.house_rules
+    || state.lobby?.settings?.house_rules
+    || {};
+  const variant = state.snapshot?.state?.variant_state?.kind
+    || rulesDocument.variant?.kind
+    || state.lobby?.settings?.variant?.kind
+    || "standard";
+  const exceptions = [];
+  if (state.lobby?.settings?.player_count === 2) exceptions.push("2人簡易構成");
+  if (rules.bank_trade_3_to_1) exceptions.push("銀行交易 3:1");
+  if (rules.skip_discard_on_seven) exceptions.push("7の半分捨て札なし");
+  if (Array.isArray(rules.disabled_development_cards)
+      && rules.disabled_development_cards.length) {
+    exceptions.push("一部の発展カードを除外");
+  }
+  if (variant === "forecast_events") exceptions.push("予告イベントモード");
+  if (variant === "frontier") exceptions.push("フロンティア探索モード");
+  note.replaceChildren(
+    textElement("strong", exceptions.length ? "適用中の例外" : "標準ルール"),
+    textElement(
+      "span",
+      exceptions.length
+        ? exceptions.join(" / ") + "。早見表との差分は権威サーバーの設定を優先します。"
+        : "公式の基本ルールに沿った建設・交易条件を適用中です。",
+    ),
+  );
+}
+
+function highlightRelevantRuleCosts() {
+  const cards = document.querySelectorAll?.(".cost-card") || [];
+  const options = state.snapshot?.command_options || [];
+  const affordable = new Set(
+    options.flatMap((option) => {
+      if (option.command === "build" && option.args?.piece) {
+        return [option.args.piece];
+      }
+      if (option.command === "buy_development") return ["development"];
+      return [];
+    }),
+  );
+  for (const card of cards) {
+    card.classList.toggle("context-match", affordable.has(card.dataset.piece));
+  }
+}
+
+function trapModalFocus(event, modal) {
+  if (event.key !== "Tab") return;
+  const focusable = Array.from(
+    modal.querySelectorAll?.(
+      'button:not(:disabled), input:not(:disabled), select:not(:disabled), [tabindex]:not([tabindex="-1"])',
+    ) || [],
+  ).filter((element) => !element.hidden);
+  if (!focusable.length) {
+    event.preventDefault();
+    modal.querySelector?.('[tabindex="-1"]')?.focus();
+    return;
+  }
+  const first = focusable[0];
+  const last = focusable[focusable.length - 1];
+  if (event.shiftKey && document.activeElement === first) {
+    event.preventDefault();
+    last.focus();
+  } else if (!event.shiftKey && document.activeElement === last) {
+    event.preventDefault();
+    first.focus();
+  }
+}
+
+function handleModalKeydown(event) {
+  const tradeOpen = elements["trade-prompt"] && !elements["trade-prompt"].hidden;
+  const rulesOpen = elements["rules-drawer"] && !elements["rules-drawer"].hidden;
+  const modal = tradeOpen
+    ? elements["trade-prompt"]
+    : rulesOpen
+      ? elements["rules-drawer"]
+      : null;
+  if (!modal) return;
+  if (event.key === "Escape") {
+    event.preventDefault();
+    if (tradeOpen) dismissTradePrompt();
+    else closeRulesDrawer();
+    return;
+  }
+  trapModalFocus(event, modal);
+}
+
 elements["create-form"].addEventListener("submit", async (event) => {
   event.preventDefault();
   const form = new FormData(event.currentTarget);
@@ -2754,6 +3373,22 @@ elements["join-form"].addEventListener("submit", async (event) => {
     showToast(error.message, true);
   }
 });
+
+elements["rules-toggle"].addEventListener("click", () => {
+  if (elements["rules-drawer"].hidden) openRulesDrawer();
+  else closeRulesDrawer();
+});
+elements["rules-close"].addEventListener("click", () => closeRulesDrawer());
+elements["rules-drawer"].addEventListener("click", (event) => {
+  if (event.target === event.currentTarget) closeRulesDrawer();
+});
+elements["trade-prompt-close"].addEventListener("click", dismissTradePrompt);
+elements["trade-prompt"].addEventListener("click", (event) => {
+  if (event.target === event.currentTarget) dismissTradePrompt();
+});
+if (typeof document.addEventListener === "function") {
+  document.addEventListener("keydown", handleModalKeydown);
+}
 
 elements["random-seed"].addEventListener("click", () => {
   const input = elements["create-form"].elements.board_seed;

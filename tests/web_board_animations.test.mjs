@@ -110,6 +110,11 @@ function loadAnimationFunctions() {
     variantLabel,
     forecastEventPresentation,
     frontierPresentation,
+    currentTurnSeat,
+    domesticTradeActorSeat,
+    domesticTradePresentation,
+    tradeOfferSignature,
+    formatTradeBundle,
     audioCalls: globalThis.__audioCalls,
   };`, sandbox, { filename: "web/app.js" });
   return sandbox.__animationTest;
@@ -352,6 +357,78 @@ test("initial-phase heading follows dice and placement actors", () => {
   assert.match(animation.phaseTitle(placementState, placementActor).title, /Host/);
 });
 
+test("domestic trade presentation always uses the viewer's give and receive direction", () => {
+  const gameState = {
+    players: [{ name: "Host" }, { name: "Guest" }],
+    phase: {
+      name: "main",
+      special_phase: "domestic_trade_response",
+      turn_order: [0, 1],
+      current_player_index: 0,
+    },
+    domestic_trade: {
+      partner: 1,
+      editor: 0,
+      give: { WOOD: 2, SHEEP: 0, WHEAT: 0, BRICK: 0, ORE: 0 },
+      receive: { WOOD: 0, SHEEP: 1, WHEAT: 0, BRICK: 0, ORE: 0 },
+      is_counter: false,
+      is_broadcast: false,
+      broadcast_index: -1,
+    },
+  };
+
+  const proposer = animation.domesticTradePresentation(gameState, 0);
+  assert.equal(proposer.outgoingSide, "give");
+  assert.equal(proposer.incomingSide, "receive");
+  assert.equal(proposer.counterpartyName, "Guest");
+  assert.equal(animation.formatTradeBundle(proposer.outgoing), "木 2");
+
+  const responder = animation.domesticTradePresentation(gameState, 1);
+  assert.equal(responder.outgoingSide, "receive");
+  assert.equal(responder.incomingSide, "give");
+  assert.equal(responder.counterpartyName, "Host");
+  assert.equal(animation.formatTradeBundle(responder.outgoing), "羊 1");
+  assert.equal(animation.domesticTradeActorSeat(gameState), 1);
+
+  gameState.domestic_trade.is_counter = true;
+  gameState.domestic_trade.editor = 1;
+  gameState.phase.special_phase = "domestic_trade_edit";
+  assert.equal(animation.domesticTradeActorSeat(gameState), 1);
+  assert.equal(
+    animation.domesticTradePresentation(gameState, 1).outgoingSide,
+    "receive",
+  );
+  gameState.phase.special_phase = "domestic_trade_counter_response";
+  assert.equal(animation.domesticTradeActorSeat(gameState), 0);
+});
+
+test("trade offer identity ignores handoff phase but changes for counter or next responder", () => {
+  const gameState = {
+    phase: {
+      special_phase: "domestic_trade_handoff",
+      turn_order: [0, 1, 2],
+      current_player_index: 0,
+    },
+    domestic_trade: {
+      partner: 1,
+      give: { WOOD: 1 },
+      receive: { ORE: 1 },
+      is_counter: false,
+      is_broadcast: true,
+      broadcast_index: 0,
+    },
+  };
+  const handoff = animation.tradeOfferSignature(gameState);
+  gameState.phase.special_phase = "domestic_trade_response";
+  assert.equal(animation.tradeOfferSignature(gameState), handoff);
+  gameState.domestic_trade.partner = 2;
+  gameState.domestic_trade.broadcast_index = 1;
+  assert.notEqual(animation.tradeOfferSignature(gameState), handoff);
+  const nextResponder = animation.tradeOfferSignature(gameState);
+  gameState.domestic_trade.is_counter = true;
+  assert.notEqual(animation.tradeOfferSignature(gameState), nextResponder);
+});
+
 test("room creation sends canonical standard and forecast variant documents", () => {
   assert.deepEqual(
     JSON.parse(JSON.stringify(animation.variantConfigDocument("standard"))),
@@ -441,6 +518,16 @@ test("frontier mode includes fog status and generated terrain asset", () => {
   assert.match(indexSource, /id="frontier-status-card" hidden/);
   assert.match(cssSource, /\.frontier-status-card\s*\{/);
   assert.match(appSource, /UNKNOWN:\s*"\/assets\/board\/frontier-fog\.webp"/);
+});
+
+test("rules, trade prompt, two-column editor, and responsive audio controls are present", () => {
+  assert.match(indexSource, /id="rules-toggle"/);
+  assert.match(indexSource, /id="rules-drawer"[^>]*role="dialog"/);
+  assert.match(indexSource, /id="trade-prompt"[^>]*role="dialog"/);
+  assert.match(indexSource, /id="audio-volume"[^>]*type="range"/);
+  assert.match(cssSource, /\.trade-editor-grid\s*\{[\s\S]*grid-template-columns:\s*repeat\(auto-fit/);
+  assert.match(cssSource, /@media \(hover: none\), \(pointer: coarse\)[\s\S]*\.trade-adjust-button/);
+  assert.match(appSource, /state\.replayIndex === null[\s\S]*viewer_player_index === ownSeat/);
 });
 
 test("animation CSS includes bounce, halo, dice landing, and reduced-motion overrides", () => {
