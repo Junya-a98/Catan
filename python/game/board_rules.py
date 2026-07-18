@@ -23,11 +23,15 @@ class BoardHighlightState:
 
 
 class BoardRules:
-    def __init__(self, board):
+    def __init__(self, board, *, road_is_usable=None):
         self.board = board
+        self.road_is_usable = road_is_usable or (lambda _road: True)
 
     def set_board(self, board):
         self.board = board
+
+    def set_road_is_usable(self, predicate):
+        self.road_is_usable = predicate or (lambda _road: True)
 
     def find_closest_node(self, mx, my, candidates=None):
         nodes = candidates if candidates is not None else self.board.nodes
@@ -81,7 +85,12 @@ class BoardRules:
         return any({road.node1, road.node2} == {node1, node2} for road in self.board.roads)
 
     def player_has_road_touching_node(self, player, node):
-        return any(road.owner == player and road.touches(node) for road in self.board.roads)
+        return any(
+            road.owner == player
+            and road.touches(node)
+            and self.road_is_usable(road)
+            for road in self.board.roads
+        )
 
     def is_spacing_rule_satisfied(self, node):
         if node.building is not None:

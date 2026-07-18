@@ -260,6 +260,12 @@ class VariantState:
             )
         if self.kind == FORECAST_EVENTS_KIND:
             try:
+                if not self._projection_only:
+                    validate_forecast_documents(
+                        self.public,
+                        self.private,
+                        options=config.options,
+                    )
                 validate_forecast_schedule(self.public, config.options)
             except ForecastEventError as exc:
                 raise VariantStateError(
@@ -324,6 +330,24 @@ class VariantState:
             return forecast_event_id(self.public)
         except ForecastEventError as exc:  # pragma: no cover - constructor validates.
             raise VariantStateError("forecast stateが不正です。") from exc
+
+    def next_forecast_parameters(self) -> Mapping[str, Any]:
+        if self.kind != FORECAST_EVENTS_KIND:
+            return MappingProxyType({})
+        parameters = self.public["forecast"].get("parameters", {})
+        return parameters
+
+    def active_forecast_effect(self, event_id: str) -> Mapping[str, Any] | None:
+        if self.kind != FORECAST_EVENTS_KIND:
+            return None
+        return next(
+            (
+                effect
+                for effect in self.public["active_effects"]
+                if effect["event_id"] == event_id
+            ),
+            None,
+        )
 
     def is_frontier_tile_revealed(self, axial: tuple[int, int]) -> bool:
         if self.kind != FRONTIER_KIND:

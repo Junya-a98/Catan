@@ -215,6 +215,11 @@
           <button class="ghost-button" id="game-leave-button" type="button">対局から退出</button>
         </div>
 
+        <section class="forecast-compact-strip" id="forecast-compact-strip" aria-label="イベント予告" hidden>
+          <strong id="forecast-compact-title">イベントを確認中</strong>
+          <span id="forecast-compact-active">発動中の効果なし</span>
+        </section>
+
         <div class="game-grid">
           <section class="board-shell" id="board-shell" aria-label="カタン盤面" tabindex="-1">
             <svg id="board-svg" role="img" aria-labelledby="board-title">
@@ -245,16 +250,17 @@
               <div class="web-player-list" id="player-list"></div>
             </section>
 
-            <section class="panel event-panel" aria-live="polite">
-              <div class="forecast-event-card" id="forecast-event-card" hidden>
+            <section class="panel event-panel">
+              <section class="forecast-event-card" id="forecast-event-card" aria-labelledby="forecast-event-title" hidden>
                 <div class="forecast-event-heading">
                   <span>EVENT FORECAST</span>
                   <strong id="forecast-event-countdown">あと—手番</strong>
                 </div>
                 <h2 id="forecast-event-title">イベント予告</h2>
                 <p id="forecast-event-detail">次のイベントを確認しています。</p>
-                <div class="forecast-active-list" id="forecast-active-list"></div>
-              </div>
+                <ul class="forecast-active-list" id="forecast-active-list"></ul>
+              </section>
+              <p class="visually-hidden" id="forecast-live-status" role="status" aria-live="polite" aria-atomic="true"></p>
               <div class="frontier-status-card" id="frontier-status-card" hidden>
                 <div class="frontier-status-heading">
                   <span>FRONTIER MAP</span>

@@ -262,6 +262,16 @@ def build_board_manifest(game):
         "is_frontier_harbor_revealed",
         lambda _harbor: True,
     )
+    harbor_is_blocked = getattr(
+        game,
+        "is_forecast_harbor_blocked",
+        lambda _harbor: False,
+    )
+    edge_is_blocked = getattr(
+        game,
+        "is_forecast_edge_blocked",
+        lambda _edge: False,
+    )
     public_harbors = {
         harbor for _, harbor in harbor_edges if harbor_is_revealed(harbor)
     }
@@ -363,6 +373,7 @@ def build_board_manifest(game):
                 "node_ids": sorted((node_ids[node1], node_ids[node2])),
                 "adjacent_tile_ids": adjacent_tile_ids,
                 "perimeter": edge_key in perimeter_edges,
+                "forecast_blocked": bool(edge_is_blocked((node1, node2))),
                 "road": (
                     None
                     if road is None
@@ -395,6 +406,7 @@ def build_board_manifest(game):
                     else None
                 ),
                 "label": str(harbor.label),
+                "forecast_blocked": bool(harbor_is_blocked(harbor)),
             }
         )
 

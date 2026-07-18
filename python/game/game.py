@@ -1,5 +1,6 @@
 from collections.abc import Mapping
 from dataclasses import asdict, replace
+import math
 import random
 import secrets
 
@@ -53,7 +54,12 @@ from game.development_cards import (
 from game.dice import roll_two_dice
 from game.feedback import FeedbackManager
 from game.forecast_events import (
+    BANDIT_RAID_EVENT_ID,
+    CONSTRUCTION_BOOM_EVENT_ID,
+    EARTHQUAKE_EVENT_ID,
     FORECAST_EVENTS_KIND,
+    HARBOR_BLOCKADE_EVENT_ID,
+    MERCHANT_FESTIVAL_EVENT_ID,
     SHEEP_DROUGHT_EVENT_ID,
     WHEAT_HARVEST_EVENT_ID,
     event_definition,
@@ -228,7 +234,10 @@ class CatanGame:
         if self.variant_config.kind == FRONTIER_KIND and self.board_mode == "custom":
             raise ValueError("frontier variant is available only on generated boards")
         self.board = self.create_board_from_settings()
-        self.board_rules = BoardRules(self.board)
+        self.board_rules = BoardRules(
+            self.board,
+            road_is_usable=self.is_road_usable,
+        )
         self.variant_state = self.create_initial_variant_state()
         self.running = True
         self.audio = _SilentAudio() if self.headless else GameAudio()
@@ -1211,10 +1220,14 @@ class CatanGame:
     def get_board_rules(self):
         board_rules = getattr(self, "board_rules", None)
         if board_rules is None:
-            self.board_rules = BoardRules(self.board)
+            self.board_rules = BoardRules(
+                self.board,
+                road_is_usable=self.is_road_usable,
+            )
             return self.board_rules
         if board_rules.board is not self.board:
             board_rules.set_board(self.board)
+        board_rules.set_road_is_usable(self.is_road_usable)
         return board_rules
 
     def get_pre_game_board_summary(self):
@@ -1937,7 +1950,10 @@ class CatanGame:
         self.reset_special_phase_state()
 
     def is_forecast_variant(self):
-        return self.variant_config.kind == FORECAST_EVENTS_KIND
+        return (
+            getattr(getattr(self, "variant_config", None), "kind", None)
+            == FORECAST_EVENTS_KIND
+        )
 
     def is_frontier_variant(self):
         return self.variant_config.kind == FRONTIER_KIND
@@ -1960,7 +1976,10 @@ class CatanGame:
 
     def get_public_node_harbors(self, node):
         return tuple(
-            harbor for harbor in node.harbors if self.is_frontier_harbor_revealed(harbor)
+            harbor
+            for harbor in node.harbors
+            if self.is_frontier_harbor_revealed(harbor)
+            and not self.is_forecast_harbor_blocked(harbor)
         )
 
     def get_frontier_edge_discovery_tiles(self, edge):
@@ -2025,6 +2044,213 @@ class CatanGame:
             return None
         return self.variant_state.next_forecast_event_id()
 
+    def get_next_forecast_parameters(self):
+        if not self.is_forecast_variant():
+            return {}
+        return dict(self.variant_state.next_forecast_parameters())
+
+    def get_next_forecast_turns_remaining(self):
+        if not self.is_forecast_variant():
+            return None
+        public = self.variant_state.public
+        return max(
+            0,
+            public["forecast"]["resolve_turn"] - public["completed_turns"],
+        )
+
+    def get_active_forecast_effect(self, event_id):
+        if not self.is_forecast_variant():
+            return None
+        return self.variant_state.active_forecast_effect(event_id)
+
+    def get_forecast_event_parameters(self, event_id, *, active=False):
+        if active:
+            effect = self.get_active_forecast_effect(event_id)
+            return {} if effect is None else dict(effect.get("parameters", {}))
+        if self.get_next_forecast_event_id() != event_id:
+            return {}
+        return self.get_next_forecast_parameters()
+
+    @staticmethod
+    def forecast_sector_label(sector):
+        return {
+            0: "東側",
+            1: "南東側",
+            2: "南西側",
+            3: "西側",
+            4: "北西側",
+            5: "北東側",
+        }.get(sector, "不明な方角")
+
+    def describe_forecast_parameters(self, event_id, parameters):
+        if event_id == HARBOR_BLOCKADE_EVENT_ID:
+            harbor_id = parameters.get("harbor_id")
+            if isinstance(harbor_id, str) and harbor_id.startswith("harbor-"):
+                return f"対象: 交換所 #{int(harbor_id.split('-')[1]) + 1}"
+        if event_id == BANDIT_RAID_EVENT_ID:
+            target_number = parameters.get("target_number")
+            if isinstance(target_number, int):
+                return f"対象数字: {target_number}"
+        if event_id == EARTHQUAKE_EVENT_ID:
+            return f"対象: {self.forecast_sector_label(parameters.get('sector'))}"
+        return ""
+
+    def get_forecast_harbor(self, harbor_id):
+        if not isinstance(harbor_id, str):
+            return None
+        # Keep this mapping identical to semantic Web/LAN target IDs.
+        from game.network_protocol import build_board_reference_index
+
+        return build_board_reference_index(self)["harbor"].get(harbor_id)
+
+    def is_forecast_harbor_blocked(self, harbor):
+        effect = self.get_active_forecast_effect(HARBOR_BLOCKADE_EVENT_ID)
+        if effect is None:
+            return False
+        harbor_id = effect.get("parameters", {}).get("harbor_id")
+        return self.get_forecast_harbor(harbor_id) is harbor
+
+    def is_forecast_harbor_announced(self, harbor):
+        parameters = self.get_forecast_event_parameters(HARBOR_BLOCKADE_EVENT_ID)
+        harbor_id = parameters.get("harbor_id")
+        return self.get_forecast_harbor(harbor_id) is harbor
+
+    def get_forecast_edge_sector(self, edge):
+        node1, node2 = edge
+        center_x = sum(tile.x for tile in self.board.tiles) / len(self.board.tiles)
+        center_y = sum(tile.y for tile in self.board.tiles) / len(self.board.tiles)
+        midpoint_x = (node1.x + node2.x) / 2
+        midpoint_y = (node1.y + node2.y) / 2
+        angle = math.atan2(midpoint_y - center_y, midpoint_x - center_x)
+        return int(((angle + math.pi / 6) % (2 * math.pi)) // (math.pi / 3))
+
+    def is_forecast_edge_blocked(self, edge):
+        effect = self.get_active_forecast_effect(EARTHQUAKE_EVENT_ID)
+        if effect is None:
+            return False
+        sector = effect.get("parameters", {}).get("sector")
+        return self.get_forecast_edge_sector(edge) == sector
+
+    def is_forecast_edge_announced(self, edge):
+        parameters = self.get_forecast_event_parameters(EARTHQUAKE_EVENT_ID)
+        if not parameters:
+            return False
+        return self.get_forecast_edge_sector(edge) == parameters.get("sector")
+
+    def is_road_usable(self, road):
+        return not self.is_forecast_edge_blocked((road.node1, road.node2))
+
+    def get_effective_road_cost(self, player):
+        normal_cost = dict(BUILD_COSTS["road"])
+        if not self.is_forecast_event_active(CONSTRUCTION_BOOM_EVENT_ID):
+            return normal_cost, None
+
+        wood = player.resources.get(ResourceType.WOOD, 0)
+        brick = player.resources.get(ResourceType.BRICK, 0)
+        if wood <= brick:
+            waived = ResourceType.WOOD
+            cost = {ResourceType.BRICK: 1}
+        else:
+            waived = ResourceType.BRICK
+            cost = {ResourceType.WOOD: 1}
+        return cost, waived
+
+    def can_afford_road(self, player):
+        if player is None:
+            return False
+        cost, _waived = self.get_effective_road_cost(player)
+        return player.can_afford(cost)
+
+    def consume_construction_boom(self):
+        self.variant_state, consumed = self.variant_state.consume_forecast_effect(
+            CONSTRUCTION_BOOM_EVENT_ID
+        )
+        return consumed
+
+    def apply_merchant_festival_bonus(self, players):
+        if not self.is_forecast_event_active(MERCHANT_FESTIVAL_EVENT_ID):
+            return {}
+        players = tuple(players)
+        available_cards = [
+            resource_type
+            for resource_type in RESOURCE_TYPES
+            for _ in range(self.bank.available(resource_type))
+        ]
+        if len(available_cards) < len(players):
+            self.add_log("商人祭ボーナスは銀行在庫不足のため配布されませんでした。")
+            return {}
+
+        grants = {}
+        for player in players:
+            resource_type = random.choice(available_cards)
+            available_cards.remove(resource_type)
+            if self.give_resource_from_bank(player, resource_type, 1) != 1:
+                raise RuntimeError("商人祭ボーナスの銀行在庫が一致しません。")
+            grants[player] = resource_type
+            self.record_public_gain(player, {resource_type: 1}, "商人祭")
+        detail = " / ".join(
+            f"{player.name}: {RESOURCE_LABELS[resource_type]} +1"
+            for player, resource_type in grants.items()
+        )
+        self.add_log(f"商人祭ボーナス — {detail}")
+        self.record_event(
+            "商人祭ボーナス",
+            detail,
+            level="success",
+            include_in_turn=True,
+        )
+        return grants
+
+    def resolve_bandit_raid(self):
+        effect = self.get_active_forecast_effect(BANDIT_RAID_EVENT_ID)
+        if effect is None:
+            return None
+        target_number = effect.get("parameters", {}).get("target_number")
+        candidates = [
+            tile
+            for tile in self.board.tiles
+            if tile.number == target_number and self.is_frontier_tile_revealed(tile)
+        ]
+        if not candidates:
+            detail = f"対象数字{target_number}のタイルがなく、盗賊は移動しませんでした。"
+            target = None
+        else:
+            alternatives = [
+                tile for tile in candidates if tile is not self.board.robber_tile
+            ]
+            if alternatives:
+                candidates = alternatives
+
+            def production_score(tile):
+                return (
+                    sum(
+                        get_token_pip_count(tile.number)
+                        * node.building.resource_multiplier
+                        for node in tile.corners
+                        if node.building is not None
+                    ),
+                    -int(tile.axial[1]),
+                    -int(tile.axial[0]),
+                )
+
+            target = max(candidates, key=production_score)
+            self.board.move_robber_to(target)
+            detail = (
+                f"数字{target_number}のタイルへ移動。捨て札・略奪はありません。"
+            )
+            self.play_sound("robber")
+        self.variant_state, _consumed = self.variant_state.consume_forecast_effect(
+            BANDIT_RAID_EVENT_ID
+        )
+        self.add_log(f"山賊襲来 — {detail}")
+        self.record_event(
+            "山賊襲来を解決",
+            detail,
+            level="warning",
+            include_in_turn=False,
+        )
+        return target
+
     def announce_initial_forecast_event(self):
         if not self.is_forecast_variant():
             return
@@ -2036,7 +2262,13 @@ class CatanGame:
         remaining = (
             public["forecast"]["resolve_turn"] - public["completed_turns"]
         )
+        parameter_detail = self.describe_forecast_parameters(
+            event_id,
+            public["forecast"].get("parameters", {}),
+        )
         detail = f"あと{remaining}手番で発動: {definition.description}"
+        if parameter_detail:
+            detail = f"{parameter_detail} / {detail}"
         self.add_log(f"イベント予告 — {definition.title}: {detail}")
         self.record_event(
             f"イベント予告: {definition.title}",
@@ -2055,6 +2287,14 @@ class CatanGame:
         for event_id in update.expired_event_ids:
             definition = event_definition(event_id)
             self.add_log(f"イベント終了 — {definition.title}")
+            self.record_event(
+                f"イベント終了: {definition.title}",
+                "一時効果が終了しました。",
+                level="info",
+                include_in_turn=False,
+            )
+            if event_id == EARTHQUAKE_EVENT_ID:
+                self.update_longest_road()
         if update.activated_event_id is None:
             return
         activated = event_definition(update.activated_event_id)
@@ -2065,11 +2305,29 @@ class CatanGame:
             if update.refreshed_event_id is not None
             else ""
         )
+        active_parameters = self.get_forecast_event_parameters(
+            update.activated_event_id,
+            active=True,
+        )
+        announced_parameters = self.get_next_forecast_parameters()
+        active_parameter_detail = self.describe_forecast_parameters(
+            update.activated_event_id,
+            active_parameters,
+        )
+        announced_parameter_detail = self.describe_forecast_parameters(
+            update.announced_event_id,
+            announced_parameters,
+        )
+        detail = activated.description
+        if active_parameter_detail:
+            detail = f"{active_parameter_detail} / {detail}"
         detail = (
-            f"{activated.description} / {refresh_note}次回予告: {announced.title}"
+            f"{detail} / {refresh_note}次回予告: {announced.title}"
             f"（あと{interval}手番）"
         )
-        self.add_log(f"イベント発動 — {activated.title}: {activated.description}")
+        if announced_parameter_detail:
+            detail += f" / {announced_parameter_detail}"
+        self.add_log(f"イベント発動 — {activated.title}: {detail}")
         self.add_log(
             f"次回イベント予告 — {announced.title}: あと{interval}手番"
         )
@@ -2079,6 +2337,10 @@ class CatanGame:
             level="warning",
             include_in_turn=False,
         )
+        if update.activated_event_id == EARTHQUAKE_EVENT_ID:
+            self.update_longest_road()
+        elif update.activated_event_id == BANDIT_RAID_EVENT_ID:
+            self.resolve_bandit_raid()
 
     def reset_initial_setup_state(self):
         self.initial_dice_phase = True
@@ -2347,12 +2609,17 @@ class CatanGame:
     def get_build_affordability(self, player):
         if player is None:
             return []
+        road_cost, road_discount = self.get_effective_road_cost(player)
         road_preview = self.get_build_preview(
             "街道",
             player,
-            BUILD_COSTS["road"],
+            road_cost,
             player.roads_remaining > 0,
         )
+        if road_discount is not None and road_preview["available"]:
+            road_preview["detail"] = (
+                f"建設可（建設ブーム: {RESOURCE_LABELS[road_discount]}免除）"
+            )
         settlement_preview = self.get_build_preview(
             "開拓地",
             player,
@@ -2426,9 +2693,17 @@ class CatanGame:
 
     def get_buildable_road_edges(self, player, require_affordability=True):
         candidates = self.get_board_rules().get_buildable_road_edges(
-            player, require_affordability=require_affordability
+            player,
+            require_affordability=False,
         )
-        return [edge for edge in candidates if self.frontier_edge_is_reachable(edge)]
+        if require_affordability and not self.can_afford_road(player):
+            return []
+        return [
+            edge
+            for edge in candidates
+            if self.frontier_edge_is_reachable(edge)
+            and not self.is_forecast_edge_blocked(edge)
+        ]
 
     def get_buildable_settlement_nodes(self, player):
         return [
@@ -2704,8 +2979,9 @@ class CatanGame:
             return []
 
         if self.action_mode == "road":
+            road_cost, _waived = self.get_effective_road_cost(player)
             preview = self.get_build_preview(
-                "街道", player, BUILD_COSTS["road"], player.roads_remaining > 0
+                "街道", player, road_cost, player.roads_remaining > 0
             )
             candidates = self.get_buildable_road_edges(player)
             return build_action_mode_guidance("road", preview, len(candidates))
@@ -4063,7 +4339,7 @@ class CatanGame:
                 else self.domestic_trade_give
             )
             branches.append((selected_resource, incoming, outgoing))
-        return self.ai.choose_domestic_trade_branch(player, branches)
+        return self.ai.choose_domestic_trade_branch(player, branches, game=self)
 
     def advance_domestic_trade_broadcast(self):
         if not self.domestic_trade_is_broadcast:
@@ -4214,6 +4490,7 @@ class CatanGame:
                         active_player,
                         incoming=self.domestic_trade_receive,
                         outgoing=self.domestic_trade_give,
+                        game=self,
                     )
                     if (
                         active_decision == "accept"
@@ -4316,6 +4593,7 @@ class CatanGame:
             self.get_match_metric_player_id(active_player),
             self.get_match_metric_player_id(partner),
         )
+        self.apply_merchant_festival_bonus((active_player, partner))
         self.finish_domestic_trade(previous_viewer=previous_viewer)
         return True
 
@@ -4657,6 +4935,8 @@ class CatanGame:
         return self.get_board_rules().can_use_node_for_road_connection(player, node)
 
     def can_place_road(self, player, node1, node2):
+        if self.is_forecast_edge_blocked((node1, node2)):
+            return False, "地震で通行不能な区画には街道を建設できません。"
         allowed, message = self.get_board_rules().can_place_road(player, node1, node2)
         if allowed and not self.frontier_edge_is_reachable((node1, node2)):
             return False, "街道は公開済みタイルの境界から探索を進めてください。"
@@ -5536,10 +5816,11 @@ class CatanGame:
 
         guidance = []
         if action_mode == "road":
+            road_cost, _waived = self.get_effective_road_cost(player)
             guidance = build_action_mode_guidance(
                 "road",
                 self.get_build_preview(
-                    "街道", player, BUILD_COSTS["road"], player.roads_remaining > 0
+                    "街道", player, road_cost, player.roads_remaining > 0
                 ),
                 len(self.get_buildable_road_edges(player)),
             )
@@ -5607,10 +5888,14 @@ class CatanGame:
         self.schedule_ai_action()
         self.turn_summary_entries = []
         next_player = self.get_current_player()
+        # Forecast transitions belong to the boundary before the next turn.
+        # Apply them before checking that player's score: an earthquake can
+        # suspend or restore Longest Road and therefore change the public VP
+        # total at exactly this boundary.
+        self.advance_forecast_event_turn()
         self.check_for_winner(next_player)
         if self.phase == "finished":
             return
-        self.advance_forecast_event_turn()
         self.add_log(f"{next_player.name} の手番です。")
         self.add_log(
             "スペースでダイス、発展カードは K/B/Y/M、銀行交易は T、交渉は P です。"
@@ -5709,8 +5994,14 @@ class CatanGame:
         if current_player.roads_remaining <= 0:
             self.notify_invalid("街道コマが残っていません。")
             return
-        if not current_player.can_afford(BUILD_COSTS["road"]):
-            self.notify_invalid("資源不足: 街道には木1枚と土1枚が必要です。")
+        road_cost, waived_resource = self.get_effective_road_cost(current_player)
+        if not current_player.can_afford(road_cost):
+            requirement = (
+                "木1枚または土1枚が必要です。"
+                if waived_resource is not None
+                else "木1枚と土1枚が必要です。"
+            )
+            self.notify_invalid(f"資源不足: 街道には{requirement}")
             return
 
         mx, my = pos
@@ -5725,7 +6016,7 @@ class CatanGame:
             self.notify_invalid(message)
             return
 
-        self.pay_resource_cost(current_player, BUILD_COSTS["road"])
+        self.pay_resource_cost(current_player, road_cost)
         current_player.roads_remaining -= 1
         new_road = Road(current_player, node1, node2)
         self.board.roads.append(new_road)
@@ -5735,10 +6026,22 @@ class CatanGame:
         self.action_mode = None
         self.feedback.clear()
         self.play_sound("road")
-        self.add_log(f"{current_player.name} が街道を建設しました。")
+        discount_text = ""
+        if waived_resource is not None and self.consume_construction_boom():
+            discount_text = f"（建設ブーム: {RESOURCE_LABELS[waived_resource]}免除）"
+            self.add_log(
+                f"建設ブーム適用 — {current_player.name} は"
+                f" {RESOURCE_LABELS[waived_resource]}を支払わずに建設しました。"
+            )
+        self.add_log(f"{current_player.name} が街道を建設しました。{discount_text}")
+        paid_text = " / ".join(
+            f"{RESOURCE_LABELS[resource_type]} -{amount}"
+            for resource_type, amount in road_cost.items()
+            if amount > 0
+        )
         self.record_event(
             f"{current_player.name}が街道を建設",
-            "木 -1 / 土 -1",
+            f"{paid_text}{' / 建設ブーム適用' if discount_text else ''}",
             level="success",
             actor=current_player,
         )
@@ -5775,7 +6078,11 @@ class CatanGame:
             self.build_road(pos)
 
     def get_player_longest_road_length(self, player):
-        player_roads = [road for road in self.board.roads if road.owner == player]
+        player_roads = [
+            road
+            for road in self.board.roads
+            if road.owner == player and self.is_road_usable(road)
+        ]
         if not player_roads:
             return 0
 

@@ -14,6 +14,11 @@ from game.ai_personality import (
     normalize_ai_personality_mode,
 )
 from game.game import CatanGame
+from game.forecast_events import (
+    BANDIT_RAID_EVENT_ID,
+    CONSTRUCTION_BOOM_EVENT_ID,
+    MERCHANT_FESTIVAL_EVENT_ID,
+)
 from game.persistence import restore_game, serialize_game
 from game.player import Player
 from game.resources import ResourceType
@@ -140,6 +145,130 @@ def test_disruptor_buys_development_before_an_available_road(monkeypatch):
     disruptor_game = _DevelopmentChoiceGame(disruptor)
     assert ai.step(disruptor_game) is True
     assert disruptor_game.action == "development"
+
+
+def test_construction_boom_makes_ai_use_the_shared_discounted_road_action(
+    monkeypatch,
+):
+    ai = SimpleAI()
+    monkeypatch.setattr(ai, "_edge_score", lambda *_args: 60)
+    player = _player(personality=DISRUPTOR)
+    game = _DevelopmentChoiceGame(player)
+    game.is_forecast_event_active = (
+        lambda event_id: event_id == CONSTRUCTION_BOOM_EVENT_ID
+    )
+
+    assert ai.step(game) is True
+    assert game.action == "road"
+
+
+def test_merchant_festival_lowers_ai_acceptance_threshold_for_legal_trade():
+    ai = SimpleAI()
+    responder = _player("応答者")
+    responder.resources.update(
+        {
+            ResourceType.WOOD: 0,
+            ResourceType.SHEEP: 1,
+            ResourceType.WHEAT: 1,
+            ResourceType.BRICK: 1,
+            ResourceType.ORE: 2,
+        }
+    )
+    incoming = {ResourceType.WOOD: 1}
+    outgoing = {ResourceType.ORE: 2}
+    festival_game = SimpleNamespace(
+        is_forecast_event_active=(
+            lambda event_id: event_id == MERCHANT_FESTIVAL_EVENT_ID
+        )
+    )
+
+    assert ai.evaluate_domestic_trade(
+        responder,
+        incoming=incoming,
+        outgoing=outgoing,
+    ) == "counter"
+    assert ai.evaluate_domestic_trade(
+        responder,
+        incoming=incoming,
+        outgoing=outgoing,
+        game=festival_game,
+    ) == "accept"
+
+
+def test_ai_avoids_announced_earthquake_edges_and_bandit_raid_numbers(
+    monkeypatch,
+):
+    ai = SimpleAI()
+    player = _player()
+    open_edge = (
+        SimpleNamespace(building=None),
+        SimpleNamespace(building=None),
+    )
+    quake_edge = (
+        SimpleNamespace(building=None),
+        SimpleNamespace(building=None),
+    )
+    edge_game = SimpleNamespace(
+        is_spacing_rule_satisfied=lambda _node: False,
+        get_adjacent_nodes=lambda _node: [],
+        get_player_longest_road_length=lambda _player: 0,
+        get_frontier_edge_discovery_count=lambda _edge: 0,
+        is_forecast_edge_announced=lambda edge: edge is quake_edge,
+    )
+    monkeypatch.setattr(ai, "_node_score", lambda *_args: 10)
+
+    assert ai._edge_score(edge_game, open_edge, player) > ai._edge_score(
+        edge_game,
+        quake_edge,
+        player,
+    )
+
+    safe_tile = SimpleNamespace(number=6, corners=[])
+    raid_tile = SimpleNamespace(number=8, corners=[])
+    raid_game = SimpleNamespace(
+        players=[player],
+        get_player_public_victory_points=lambda _player: 0,
+        get_forecast_event_parameters=(
+            lambda event_id: {"target_number": 8}
+            if event_id == BANDIT_RAID_EVENT_ID
+            else {}
+        ),
+    )
+    assert ai._robber_score(raid_game, safe_tile, player) > ai._robber_score(
+        raid_game,
+        raid_tile,
+        player,
+    )
+
+
+def test_ai_does_not_value_a_harbor_that_is_announced_for_blockade(monkeypatch):
+    ai = SimpleAI()
+    player = _player()
+    node = SimpleNamespace()
+    tile = SimpleNamespace(resource_type=ResourceType.WOOD, number=6)
+    harbor = SimpleNamespace(resource_type=None)
+    announced = {"value": False}
+    game = SimpleNamespace(
+        get_public_node_tiles=lambda _node: [tile],
+        get_public_node_harbors=lambda _node: [harbor],
+        is_forecast_harbor_announced=lambda _harbor: announced["value"],
+    )
+    monkeypatch.setattr(
+        ai,
+        "_resource_need_weights",
+        lambda _game, _player: {resource_type: 1.0 for resource_type in ResourceType},
+    )
+    monkeypatch.setattr(
+        ai,
+        "_player_production_scores",
+        lambda _game, _player: {resource_type: 0 for resource_type in ResourceType},
+    )
+
+    open_score = ai._node_score(game, node, player)
+    announced["value"] = True
+    blocked_score = ai._node_score(game, node, player)
+
+    assert open_score > blocked_score
 
 
 def test_trader_proposes_earlier_and_accepts_a_wider_but_legal_offer():

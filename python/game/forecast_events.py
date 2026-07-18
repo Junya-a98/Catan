@@ -18,9 +18,15 @@ from typing import Any
 
 
 FORECAST_EVENTS_KIND = "forecast_events"
-FORECAST_CATALOG_ID = "core_v1"
+LEGACY_FORECAST_CATALOG_ID = "core_v1"
+FORECAST_CATALOG_ID = "core_v2"
 WHEAT_HARVEST_EVENT_ID = "wheat_harvest_v1"
 SHEEP_DROUGHT_EVENT_ID = "sheep_drought_v1"
+HARBOR_BLOCKADE_EVENT_ID = "harbor_blockade_v1"
+CONSTRUCTION_BOOM_EVENT_ID = "construction_boom_v1"
+MERCHANT_FESTIVAL_EVENT_ID = "merchant_festival_v1"
+BANDIT_RAID_EVENT_ID = "bandit_raid_v1"
+EARTHQUAKE_EVENT_ID = "earthquake_v1"
 
 DEFAULT_FORECAST_OPTIONS = MappingProxyType(
     {
@@ -33,12 +39,14 @@ _OPTION_KEYS = frozenset(DEFAULT_FORECAST_OPTIONS)
 _PUBLIC_KEYS = frozenset(
     {"completed_turns", "forecast", "active_effects", "resolved_count"}
 )
-_FORECAST_KEYS = frozenset(
+_LEGACY_FORECAST_KEYS = frozenset(
     {"event_id", "announced_turn", "resolve_turn"}
 )
-_ACTIVE_KEYS = frozenset(
+_FORECAST_KEYS = _LEGACY_FORECAST_KEYS | {"parameters"}
+_LEGACY_ACTIVE_KEYS = frozenset(
     {"event_id", "started_turn", "expires_turn"}
 )
+_ACTIVE_KEYS = _LEGACY_ACTIVE_KEYS | {"parameters"}
 _PRIVATE_KEYS = frozenset(
     {"deck_seed", "deck_cycle", "draw_pile", "discard_pile"}
 )
@@ -90,17 +98,84 @@ EVENT_CATALOG = MappingProxyType(
             active_description="羊タイルの生産停止",
             duration="one_round",
         ),
+        HARBOR_BLOCKADE_EVENT_ID: ForecastEventDefinition(
+            event_id=HARBOR_BLOCKADE_EVENT_ID,
+            title="港湾封鎖",
+            description=(
+                "予告された交換所が発動から2手番の間使用できません。"
+                "港を使わない銀行交易は通常どおり行えます。"
+            ),
+            active_description="指定された交換所を使用不可",
+            duration="two_turns",
+        ),
+        CONSTRUCTION_BOOM_EVENT_ID: ForecastEventDefinition(
+            event_id=CONSTRUCTION_BOOM_EVENT_ID,
+            title="建設ブーム",
+            description=(
+                "次に有料で建設される街道1本は、木または土のどちらか"
+                "1枚を支払わずに建設できます。"
+            ),
+            active_description="次の有料街道を木または土1枚割引",
+            duration="until_triggered",
+        ),
+        MERCHANT_FESTIVAL_EVENT_ID: ForecastEventDefinition(
+            event_id=MERCHANT_FESTIVAL_EVENT_ID,
+            title="商人祭",
+            description=(
+                "発動から全員が1手番を終えるまで、国内交易が成立した双方へ"
+                "銀行から在庫のあるランダム資源を1枚支給します。"
+            ),
+            active_description="国内交易成立時に双方へ資源1枚",
+            duration="one_round",
+        ),
+        BANDIT_RAID_EVENT_ID: ForecastEventDefinition(
+            event_id=BANDIT_RAID_EVENT_ID,
+            title="山賊襲来",
+            description=(
+                "発動時、盗賊が予告された数字のうち生産力が最も高い"
+                "タイルへ移動します。捨て札と略奪は発生しません。"
+            ),
+            active_description="予告数字の高生産タイルへ盗賊が移動",
+            duration="instant",
+        ),
+        EARTHQUAKE_EVENT_ID: ForecastEventDefinition(
+            event_id=EARTHQUAKE_EVENT_ID,
+            title="地震",
+            description=(
+                "発動から全員が1手番を終えるまで、予告された方角にある"
+                "街道は接続と最長交易路の計算に使えません。コマは失いません。"
+            ),
+            active_description="指定方角の街道を一時的に通行不能",
+            duration="one_round",
+        ),
     }
 )
 
-# A small shuffle bag keeps both events equally frequent.  The order is
-# generated from the authority-only seed and never included in public state.
-_CORE_DECK = (
+# ``core_v1`` is immutable because existing saves validate its exact bag.
+_CORE_V1_DECK = (
     WHEAT_HARVEST_EVENT_ID,
     SHEEP_DROUGHT_EVENT_ID,
     WHEAT_HARVEST_EVENT_ID,
     SHEEP_DROUGHT_EVENT_ID,
 )
+_CORE_V2_DECK = (
+    WHEAT_HARVEST_EVENT_ID,
+    SHEEP_DROUGHT_EVENT_ID,
+    HARBOR_BLOCKADE_EVENT_ID,
+    CONSTRUCTION_BOOM_EVENT_ID,
+    MERCHANT_FESTIVAL_EVENT_ID,
+    BANDIT_RAID_EVENT_ID,
+    EARTHQUAKE_EVENT_ID,
+)
+_CATALOG_DECKS = MappingProxyType(
+    {
+        LEGACY_FORECAST_CATALOG_ID: _CORE_V1_DECK,
+        FORECAST_CATALOG_ID: _CORE_V2_DECK,
+    }
+)
+_BANDIT_TARGET_NUMBERS = (5, 6, 8, 9)
+_EARTHQUAKE_SECTOR_COUNT = 6
+_HARBOR_COUNT = 9
 
 
 def canonical_forecast_options(options: Mapping[str, Any]) -> dict[str, Any]:
@@ -108,7 +183,8 @@ def canonical_forecast_options(options: Mapping[str, Any]) -> dict[str, Any]:
 
     if not isinstance(options, Mapping) or set(options) != _OPTION_KEYS:
         raise ForecastEventError("forecast_events options の項目が不正です。")
-    if options.get("catalog") != FORECAST_CATALOG_ID:
+    catalog = options.get("catalog")
+    if catalog not in _CATALOG_DECKS:
         raise ForecastEventError("未対応のforecast event catalogです。")
     lead = _integer(
         options.get("forecast_lead_turns"),
@@ -125,7 +201,7 @@ def canonical_forecast_options(options: Mapping[str, Any]) -> dict[str, Any]:
     if lead >= interval:
         raise ForecastEventError("予告手番数はイベント間隔より短くしてください。")
     return {
-        "catalog": FORECAST_CATALOG_ID,
+        "catalog": catalog,
         "forecast_lead_turns": lead,
         "event_interval_turns": interval,
     }
@@ -149,15 +225,23 @@ def create_initial_forecast_documents(
             b"catan:forecast-events:core-v1\0" + random_state
         ).hexdigest()
     _validate_seed(deck_seed)
-    draw_pile = list(_deck_for_cycle(deck_seed, 0))
+    catalog = canonical["catalog"]
+    draw_pile = list(_deck_for_cycle(deck_seed, 0, catalog))
     event_id = draw_pile.pop(0)
+    forecast = {
+        "event_id": event_id,
+        "announced_turn": 0,
+        "resolve_turn": canonical["forecast_lead_turns"],
+    }
+    if catalog != LEGACY_FORECAST_CATALOG_ID:
+        forecast["parameters"] = _event_parameters(
+            event_id,
+            deck_seed,
+            resolved_count=0,
+        )
     public = {
         "completed_turns": 0,
-        "forecast": {
-            "event_id": event_id,
-            "announced_turn": 0,
-            "resolve_turn": canonical["forecast_lead_turns"],
-        },
+        "forecast": forecast,
         "active_effects": [],
         "resolved_count": 0,
     }
@@ -167,7 +251,7 @@ def create_initial_forecast_documents(
         "draw_pile": draw_pile,
         "discard_pile": [],
     }
-    validate_forecast_documents(public, private)
+    validate_forecast_documents(public, private, options=canonical)
     validate_forecast_schedule(public, canonical)
     return public, private
 
@@ -188,9 +272,18 @@ def validate_forecast_public(public: Mapping[str, Any]) -> None:
         minimum=0,
     )
     forecast = public.get("forecast")
-    if not isinstance(forecast, Mapping) or set(forecast) != _FORECAST_KEYS:
+    if not isinstance(forecast, Mapping):
         raise ForecastEventError("forecast state が不正です。")
-    event_id = _event_id(forecast.get("event_id"))
+    forecast_keys = set(forecast)
+    if forecast_keys == _LEGACY_FORECAST_KEYS:
+        catalog = LEGACY_FORECAST_CATALOG_ID
+    elif forecast_keys == _FORECAST_KEYS:
+        catalog = FORECAST_CATALOG_ID
+    else:
+        raise ForecastEventError("forecast state が不正です。")
+    event_id = _event_id(forecast.get("event_id"), catalog=catalog)
+    if catalog == FORECAST_CATALOG_ID:
+        _validate_event_parameters(event_id, forecast.get("parameters"))
     announced = _integer(
         forecast.get("announced_turn"),
         "announced_turn",
@@ -205,13 +298,21 @@ def validate_forecast_public(public: Mapping[str, Any]) -> None:
         raise ForecastEventError("イベント予告の手番関係が不正です。")
 
     active = public.get("active_effects")
-    if not _is_sequence(active) or len(active) > len(EVENT_CATALOG):
+    allowed_event_ids = set(_CATALOG_DECKS[catalog])
+    if not _is_sequence(active) or len(active) > len(allowed_event_ids):
         raise ForecastEventError("active_effects が不正です。")
     active_ids = []
     for item in active:
-        if not isinstance(item, Mapping) or set(item) != _ACTIVE_KEYS:
+        expected_active_keys = (
+            _LEGACY_ACTIVE_KEYS
+            if catalog == LEGACY_FORECAST_CATALOG_ID
+            else _ACTIVE_KEYS
+        )
+        if not isinstance(item, Mapping) or set(item) != expected_active_keys:
             raise ForecastEventError("active effect の項目が不正です。")
-        active_id = _event_id(item.get("event_id"))
+        active_id = _event_id(item.get("event_id"), catalog=catalog)
+        if catalog == FORECAST_CATALOG_ID:
+            _validate_event_parameters(active_id, item.get("parameters"))
         started = _integer(
             item.get("started_turn"),
             "started_turn",
@@ -221,9 +322,9 @@ def validate_forecast_public(public: Mapping[str, Any]) -> None:
             raise ForecastEventError("active effect の開始手番が不正です。")
         expires = item.get("expires_turn")
         definition = EVENT_CATALOG[active_id]
-        if definition.duration == "until_triggered":
+        if definition.duration in ("until_triggered", "instant"):
             if expires is not None:
-                raise ForecastEventError("豊作の期限指定が不正です。")
+                raise ForecastEventError("event effectの期限指定が不正です。")
         else:
             expires = _integer(expires, "expires_turn", minimum=1)
             if expires <= completed:
@@ -235,18 +336,26 @@ def validate_forecast_public(public: Mapping[str, Any]) -> None:
         raise ForecastEventError("resolved_count がactive effect数より小さいです。")
     # Touch the forecast ID after all structural checks so unknown IDs always
     # produce the same bounded domain error.
-    _event_id(event_id)
+    _event_id(event_id, catalog=catalog)
 
 
 def validate_forecast_documents(
     public: Mapping[str, Any],
     private: Mapping[str, Any],
+    *,
+    options: Mapping[str, Any] | None = None,
 ) -> None:
     """Validate a full authority state and its private shuffle bag."""
 
     validate_forecast_public(public)
     if not isinstance(private, Mapping) or set(private) != _PRIVATE_KEYS:
         raise ForecastEventError("forecast private state の項目が不正です。")
+    catalog = _public_catalog(public)
+    if options is not None:
+        canonical = canonical_forecast_options(options)
+        if canonical["catalog"] != catalog:
+            raise ForecastEventError("forecast catalogが設定と一致しません。")
+    deck = _CATALOG_DECKS[catalog]
     seed = private.get("deck_seed")
     _validate_seed(seed)
     cycle = _integer(private.get("deck_cycle"), "deck_cycle", minimum=0)
@@ -254,17 +363,17 @@ def validate_forecast_documents(
     discard_pile = private.get("discard_pile")
     if not _is_sequence(draw_pile) or not _is_sequence(discard_pile):
         raise ForecastEventError("forecast event deck が不正です。")
-    if len(draw_pile) + len(discard_pile) != len(_CORE_DECK) - 1:
+    if len(draw_pile) + len(discard_pile) != len(deck) - 1:
         raise ForecastEventError("forecast event deck の枚数が不正です。")
     for event_id in (*draw_pile, *discard_pile):
-        _event_id(event_id)
+        _event_id(event_id, catalog=catalog)
     forecast_id = public["forecast"]["event_id"]
-    if Counter((*draw_pile, *discard_pile, forecast_id)) != Counter(_CORE_DECK):
+    if Counter((*draw_pile, *discard_pile, forecast_id)) != Counter(deck):
         raise ForecastEventError("forecast event deck の構成が不正です。")
     actual_order = tuple((*discard_pile, forecast_id, *draw_pile))
-    if actual_order != _deck_for_cycle(seed, cycle):
+    if actual_order != _deck_for_cycle(seed, cycle, catalog):
         raise ForecastEventError("forecast event deck の順序が不正です。")
-    expected_resolved = cycle * len(_CORE_DECK) + len(discard_pile)
+    expected_resolved = cycle * len(deck) + len(discard_pile)
     if public["resolved_count"] != expected_resolved:
         raise ForecastEventError("forecast event deck の進行位置が不正です。")
 
@@ -277,6 +386,8 @@ def validate_forecast_schedule(
 
     validate_forecast_public(public)
     canonical = canonical_forecast_options(options)
+    if _public_catalog(public) != canonical["catalog"]:
+        raise ForecastEventError("forecast catalogが設定と一致しません。")
     resolved_count = public["resolved_count"]
     lead = canonical["forecast_lead_turns"]
     interval = canonical["event_interval_turns"]
@@ -309,14 +420,15 @@ def advance_forecast_documents(
     """Advance one completed main turn and resolve due event transitions."""
 
     canonical = canonical_forecast_options(options)
-    validate_forecast_documents(public, private)
+    catalog = canonical["catalog"]
+    validate_forecast_documents(public, private, options=canonical)
     validate_forecast_schedule(public, canonical)
     player_count = _integer(player_count, "player_count", minimum=2, maximum=4)
     next_public = {
         "completed_turns": public["completed_turns"],
-        "forecast": dict(public["forecast"]),
+        "forecast": _copy_forecast(public["forecast"]),
         "active_effects": [
-            dict(effect) for effect in public["active_effects"]
+            _copy_effect(effect) for effect in public["active_effects"]
         ],
         "resolved_count": public["resolved_count"],
     }
@@ -355,37 +467,49 @@ def advance_forecast_documents(
             for effect in next_public["active_effects"]
             if effect["event_id"] != activated
         ]
-        expires_turn = (
-            None
-            if EVENT_CATALOG[activated].duration == "until_triggered"
-            else completed + player_count
-        )
-        next_public["active_effects"].append(
-            {
-                "event_id": activated,
-                "started_turn": completed,
-                "expires_turn": expires_turn,
-            }
-        )
+        duration = EVENT_CATALOG[activated].duration
+        if duration in ("until_triggered", "instant"):
+            expires_turn = None
+        elif duration == "two_turns":
+            expires_turn = completed + 2
+        else:
+            expires_turn = completed + player_count
+        effect = {
+            "event_id": activated,
+            "started_turn": completed,
+            "expires_turn": expires_turn,
+        }
+        if catalog != LEGACY_FORECAST_CATALOG_ID:
+            effect["parameters"] = dict(forecast["parameters"])
+        next_public["active_effects"].append(effect)
         next_public["resolved_count"] += 1
         next_private["discard_pile"].append(activated)
+        deck = _CATALOG_DECKS[catalog]
         if not next_private["draw_pile"]:
             next_private["deck_cycle"] += 1
             next_private["draw_pile"] = list(
                 _deck_for_cycle(
                     next_private["deck_seed"],
                     next_private["deck_cycle"],
+                    catalog,
                 )
             )
             next_private["discard_pile"] = []
         announced = next_private["draw_pile"].pop(0)
-        next_public["forecast"] = {
+        next_forecast = {
             "event_id": announced,
             "announced_turn": completed,
             "resolve_turn": completed + canonical["event_interval_turns"],
         }
+        if catalog != LEGACY_FORECAST_CATALOG_ID:
+            next_forecast["parameters"] = _event_parameters(
+                announced,
+                next_private["deck_seed"],
+                resolved_count=next_public["resolved_count"],
+            )
+        next_public["forecast"] = next_forecast
 
-    validate_forecast_documents(next_public, next_private)
+    validate_forecast_documents(next_public, next_private, options=canonical)
     validate_forecast_schedule(next_public, canonical)
     return (
         next_public,
@@ -413,9 +537,9 @@ def consume_active_effect(
     # to pickle those read-only wrappers.
     next_public = {
         "completed_turns": public["completed_turns"],
-        "forecast": dict(public["forecast"]),
+        "forecast": _copy_forecast(public["forecast"]),
         "active_effects": [
-            dict(effect)
+            _copy_effect(effect)
             for effect in public["active_effects"]
             if effect["event_id"] != event_id
         ],
@@ -443,22 +567,124 @@ def event_definition(event_id: str) -> ForecastEventDefinition:
 def _deck_for_cycle(
     seed: str,
     cycle: int,
+    catalog: str,
 ) -> tuple[str, ...]:
-    # core_v1 has two equally frequent effects.  Pick the secret starting
-    # effect from the seed, then alternate them.  This avoids duplicate events
-    # replacing an unresolved copy and also avoids repeats across cycle edges.
-    # The same four-card order is reused in later cycles; changing this policy
-    # requires a new catalog ID so existing saves remain reproducible.
+    """Return one immutable catalog bag in an authority-secret order."""
+
     _integer(cycle, "deck_cycle", minimum=0)
-    cards = list(enumerate(_CORE_DECK))
+    if catalog not in _CATALOG_DECKS:
+        raise ForecastEventError("未知のforecast catalogです。")
+    deck = _CATALOG_DECKS[catalog]
+    # Keep the exact v1 ordering algorithm so historical saves remain valid.
+    if catalog == LEGACY_FORECAST_CATALOG_ID:
+        cards = list(enumerate(deck))
+        cards.sort(
+            key=lambda item: hashlib.sha256(
+                f"{seed}:0:{item[0]}:{item[1]}".encode("ascii")
+            ).digest()
+        )
+        first = cards[0][1]
+        second = next(event_id for event_id in EVENT_CATALOG if event_id != first)
+        return first, second, first, second
+
+    # v2 contains every event once.  Reusing the same secret order for each
+    # cycle keeps frequencies even and guarantees no duplicate at a cycle
+    # boundary because all event IDs in the bag are unique.
+    cards = list(enumerate(deck))
     cards.sort(
         key=lambda item: hashlib.sha256(
-            f"{seed}:0:{item[0]}:{item[1]}".encode("ascii")
+            f"{seed}:{catalog}:{item[0]}:{item[1]}".encode("ascii")
         ).digest()
     )
-    first = cards[0][1]
-    second = next(event_id for event_id in EVENT_CATALOG if event_id != first)
-    return first, second, first, second
+    return tuple(event_id for _index, event_id in cards)
+
+
+def _public_catalog(public: Mapping[str, Any]) -> str:
+    forecast = public.get("forecast")
+    if not isinstance(forecast, Mapping):
+        raise ForecastEventError("forecast state が不正です。")
+    keys = set(forecast)
+    if keys == _LEGACY_FORECAST_KEYS:
+        return LEGACY_FORECAST_CATALOG_ID
+    if keys == _FORECAST_KEYS:
+        return FORECAST_CATALOG_ID
+    raise ForecastEventError("forecast state が不正です。")
+
+
+def _copy_forecast(forecast: Mapping[str, Any]) -> dict[str, Any]:
+    copied = dict(forecast)
+    if "parameters" in copied:
+        copied["parameters"] = dict(copied["parameters"])
+    return copied
+
+
+def _copy_effect(effect: Mapping[str, Any]) -> dict[str, Any]:
+    copied = dict(effect)
+    if "parameters" in copied:
+        copied["parameters"] = dict(copied["parameters"])
+    return copied
+
+
+def _event_parameters(
+    event_id: str,
+    seed: str,
+    *,
+    resolved_count: int,
+) -> dict[str, Any]:
+    _event_id(event_id, catalog=FORECAST_CATALOG_ID)
+    _validate_seed(seed)
+    resolved_count = _integer(
+        resolved_count,
+        "resolved_count",
+        minimum=0,
+    )
+    digest = hashlib.sha256(
+        f"{seed}:{resolved_count}:{event_id}:parameters".encode("ascii")
+    ).digest()
+    if event_id == HARBOR_BLOCKADE_EVENT_ID:
+        return {"harbor_id": f"harbor-{digest[0] % _HARBOR_COUNT}"}
+    if event_id == BANDIT_RAID_EVENT_ID:
+        return {
+            "target_number": _BANDIT_TARGET_NUMBERS[
+                digest[0] % len(_BANDIT_TARGET_NUMBERS)
+            ]
+        }
+    if event_id == EARTHQUAKE_EVENT_ID:
+        return {"sector": digest[0] % _EARTHQUAKE_SECTOR_COUNT}
+    return {}
+
+
+def _validate_event_parameters(event_id: str, parameters: Any) -> None:
+    if not isinstance(parameters, Mapping):
+        raise ForecastEventError("event parameters が不正です。")
+    keys = set(parameters)
+    if event_id == HARBOR_BLOCKADE_EVENT_ID:
+        if keys != {"harbor_id"}:
+            raise ForecastEventError("港湾封鎖の対象が不正です。")
+        harbor_id = parameters.get("harbor_id")
+        if not isinstance(harbor_id, str) or not re.fullmatch(
+            r"harbor-[0-8]",
+            harbor_id,
+        ):
+            raise ForecastEventError("港湾封鎖の対象が不正です。")
+        return
+    if event_id == BANDIT_RAID_EVENT_ID:
+        if (
+            keys != {"target_number"}
+            or parameters.get("target_number") not in _BANDIT_TARGET_NUMBERS
+        ):
+            raise ForecastEventError("山賊襲来の対象数字が不正です。")
+        return
+    if event_id == EARTHQUAKE_EVENT_ID:
+        if (
+            keys != {"sector"}
+            or type(parameters.get("sector")) is not int
+            or not 0 <= parameters["sector"] < _EARTHQUAKE_SECTOR_COUNT
+        ):
+            raise ForecastEventError("地震の対象方角が不正です。")
+        return
+    if keys:
+        raise ForecastEventError("このeventにparametersは指定できません。")
 
 
 def _validate_seed(value: Any) -> None:
@@ -466,8 +692,9 @@ def _validate_seed(value: Any) -> None:
         raise ForecastEventError("forecast deck seed が不正です。")
 
 
-def _event_id(value: Any) -> str:
-    if not isinstance(value, str) or value not in EVENT_CATALOG:
+def _event_id(value: Any, *, catalog: str | None = None) -> str:
+    allowed = EVENT_CATALOG if catalog is None else set(_CATALOG_DECKS[catalog])
+    if not isinstance(value, str) or value not in allowed:
         raise ForecastEventError("未知のforecast event IDです。")
     return value
 
@@ -489,13 +716,19 @@ def _is_sequence(value: Any) -> bool:
 
 
 __all__ = (
+    "BANDIT_RAID_EVENT_ID",
+    "CONSTRUCTION_BOOM_EVENT_ID",
     "DEFAULT_FORECAST_OPTIONS",
+    "EARTHQUAKE_EVENT_ID",
     "EVENT_CATALOG",
     "FORECAST_CATALOG_ID",
     "FORECAST_EVENTS_KIND",
     "ForecastEventDefinition",
     "ForecastEventError",
     "ForecastTurnUpdate",
+    "HARBOR_BLOCKADE_EVENT_ID",
+    "LEGACY_FORECAST_CATALOG_ID",
+    "MERCHANT_FESTIVAL_EVENT_ID",
     "SHEEP_DROUGHT_EVENT_ID",
     "WHEAT_HARVEST_EVENT_ID",
     "active_event_ids",

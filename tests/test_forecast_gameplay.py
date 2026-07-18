@@ -8,6 +8,7 @@ import pytest
 
 from game.building import Building
 from game.forecast_events import (
+    LEGACY_FORECAST_CATALOG_ID,
     SHEEP_DROUGHT_EVENT_ID,
     WHEAT_HARVEST_EVENT_ID,
 )
@@ -26,7 +27,9 @@ DETERMINISTIC_DECK_SEED = "1" * 64
 def forecast_game():
     game = CatanGame(
         board_seed=28071,
-        variant_config=VariantConfig.forecast_events(),
+        variant_config=VariantConfig.forecast_events(
+            catalog=LEGACY_FORECAST_CATALOG_ID
+        ),
         headless=True,
     )
     game.configure_players(3, reset_logs=False)
@@ -93,6 +96,30 @@ def test_initial_forecast_is_announced_and_activates_after_completed_turns(
     assert game.is_forecast_event_active(WHEAT_HARVEST_EVENT_ID)
     assert game.latest_event["title"] == "イベント発動: 豊作"
     assert game.get_next_forecast_event_id() == SHEEP_DROUGHT_EVENT_ID
+
+
+def test_forecast_turn_boundary_updates_awards_before_winner_check(
+    forecast_game,
+    monkeypatch,
+):
+    game = forecast_game
+    game.start_main_phase()
+    calls = []
+    monkeypatch.setattr(
+        game,
+        "advance_forecast_event_turn",
+        lambda: calls.append("forecast"),
+    )
+    monkeypatch.setattr(
+        game,
+        "check_for_winner",
+        lambda _player: calls.append("winner"),
+    )
+
+    game.dice_rolled = True
+    game.finish_current_turn()
+
+    assert calls == ["forecast", "winner"]
 
 
 def test_wheat_harvest_adds_bonus_only_after_official_base_production(

@@ -51,7 +51,7 @@ const BOARD_TERRAIN_ASSETS = {
 };
 const TOKEN_PIP_COUNTS = { 2: 1, 3: 2, 4: 3, 5: 4, 6: 5, 8: 5, 9: 4, 10: 3, 11: 2, 12: 1 };
 const DEFAULT_FORECAST_OPTIONS = {
-  catalog: "core_v1",
+  catalog: "core_v2",
   forecast_lead_turns: 2,
   event_interval_turns: 6,
 };
@@ -70,7 +70,33 @@ const FORECAST_EVENT_PRESENTATION = {
     description: "発動から全員が1手番を終えるまで、羊タイルは生産しません。",
     active: "大干ばつ: 羊の生産停止",
   },
+  harbor_blockade_v1: {
+    title: "港湾封鎖",
+    description: "予告された交換所が発動から2手番使用できなくなります。",
+    active: "港湾封鎖: 指定交換所を使用不可",
+  },
+  construction_boom_v1: {
+    title: "建設ブーム",
+    description: "次に有料で建設される街道1本は、木か土のどちらか1枚が不要です。",
+    active: "建設ブーム: 次の有料街道を1枚割引",
+  },
+  merchant_festival_v1: {
+    title: "商人祭",
+    description: "1ラウンドの間、国内交易が成立した双方へ銀行から資源を1枚支給します。",
+    active: "商人祭: 国内交易の双方へ資源1枚",
+  },
+  bandit_raid_v1: {
+    title: "山賊襲来",
+    description: "発動時、盗賊が予告数字の高生産タイルへ移動します。捨て札と略奪はありません。",
+    active: "山賊襲来を解決中",
+  },
+  earthquake_v1: {
+    title: "地震",
+    description: "1ラウンドの間、予告された方角の街道が接続と最長交易路に使えません。",
+    active: "地震: 指定方角の街道を通行不能",
+  },
 };
+const FORECAST_SECTOR_LABELS = ["東側", "南東側", "南西側", "西側", "北西側", "北東側"];
 
 const state = {
   welcome: null,
@@ -107,6 +133,7 @@ const state = {
   tradePromptDismissed: new Set(),
   tradePromptNotified: new Set(),
   developmentInventoryOpen: null,
+  forecastActiveSignature: null,
 };
 
 const elements = Object.fromEntries(
@@ -163,6 +190,10 @@ const elements = Object.fromEntries(
     "forecast-event-title",
     "forecast-event-detail",
     "forecast-active-list",
+    "forecast-compact-strip",
+    "forecast-compact-title",
+    "forecast-compact-active",
+    "forecast-live-status",
     "frontier-status-card",
     "frontier-status-count",
     "frontier-status-detail",
@@ -236,6 +267,28 @@ function frontierPresentation(variantState) {
   };
 }
 
+function forecastParameterLabel(eventId, parameters = {}) {
+  if (eventId === "harbor_blockade_v1" && /^harbor-[0-8]$/.test(parameters.harbor_id || "")) {
+    return `対象: 交換所 #${Number(parameters.harbor_id.split("-")[1]) + 1}`;
+  }
+  if (eventId === "bandit_raid_v1" && Number.isInteger(parameters.target_number)) {
+    return `対象数字: ${parameters.target_number}`;
+  }
+  if (eventId === "earthquake_v1" && Number.isInteger(parameters.sector)) {
+    return `対象: ${FORECAST_SECTOR_LABELS[parameters.sector] || "不明な方角"}`;
+  }
+  return "";
+}
+
+function forecastActiveTiming(effect, completed) {
+  if (Number.isInteger(effect?.expires_turn)) {
+    return `残り${Math.max(0, effect.expires_turn - completed)}手番`;
+  }
+  if (effect?.event_id === "construction_boom_v1") return "次の有料街道まで";
+  if (effect?.event_id === "wheat_harvest_v1") return "次の麦生産まで";
+  return "解決中";
+}
+
 function forecastEventPresentation(variantState) {
   if (variantState?.kind !== "forecast_events") return { visible: false };
   const publicState = variantState.public || {};
@@ -252,18 +305,30 @@ function forecastEventPresentation(variantState) {
     ? forecast.resolve_turn
     : completed;
   const remaining = Math.max(0, resolveTurn - completed);
+  const parameterLabel = forecastParameterLabel(forecast.event_id, forecast.parameters);
   const active = Array.isArray(publicState.active_effects)
     ? publicState.active_effects.map((effect) => {
       const definition = FORECAST_EVENT_PRESENTATION[effect?.event_id];
-      return definition?.active || "未対応イベント";
+      const parts = [definition?.active || "未対応イベント"];
+      const target = forecastParameterLabel(effect?.event_id, effect?.parameters);
+      if (target) parts.push(target);
+      parts.push(forecastActiveTiming(effect, completed));
+      return parts.join("・");
     })
     : [];
   return {
     visible: true,
     title: event.title,
-    description: event.description,
+    description: parameterLabel
+      ? `${parameterLabel}。${event.description}`
+      : event.description,
     countdown: remaining === 0 ? "発動処理中" : `あと${remaining}手番`,
     active,
+    compact: [
+      event.title,
+      remaining === 0 ? "発動処理中" : `あと${remaining}手番`,
+      parameterLabel,
+    ].filter(Boolean).join("・"),
   };
 }
 
@@ -870,6 +935,7 @@ function resetRoomState(renderNow = true) {
   state.tradePromptDismissed.clear();
   state.tradePromptNotified.clear();
   state.developmentInventoryOpen = null;
+  state.forecastActiveSignature = null;
   hideTradePrompt();
   clearPendingBoardAnimations();
   sessionStorage.removeItem("catan-reconnect");
@@ -1051,6 +1117,7 @@ function renderGame() {
   renderAICommentary(
     gameState.ai?.status,
     personalityMode,
+    Boolean(gameState.players?.[activeSeat]?.is_ai && phase.name !== "finished"),
   );
   const finished = state.liveSnapshot?.state?.phase?.name === "finished";
   elements["result-dashboard"].hidden = !finished;
@@ -1066,21 +1133,47 @@ function renderGame() {
 function renderForecastEvent(variantState) {
   const presentation = forecastEventPresentation(variantState);
   const card = elements["forecast-event-card"];
+  const compactStrip = elements["forecast-compact-strip"];
   card.hidden = !presentation.visible;
+  compactStrip.hidden = !presentation.visible;
   if (!presentation.visible) {
     elements["forecast-active-list"].replaceChildren();
+    state.forecastActiveSignature = null;
     return;
   }
   elements["forecast-event-countdown"].textContent = presentation.countdown;
   elements["forecast-event-title"].textContent = presentation.title;
   elements["forecast-event-detail"].textContent = presentation.description;
+  elements["forecast-compact-title"].textContent = presentation.compact;
+  elements["forecast-compact-active"].textContent = presentation.active.length
+    ? `発動中: ${presentation.active.join(" / ")}`
+    : "発動中の効果なし";
   const activeList = elements["forecast-active-list"];
   activeList.replaceChildren();
   const activeLabels = presentation.active.length
     ? presentation.active
     : ["現在発動中の効果なし"];
   for (const label of activeLabels) {
-    activeList.append(textElement("span", label, "forecast-active-chip"));
+    activeList.append(textElement("li", label, "forecast-active-chip"));
+  }
+
+  const publicState = variantState?.public || {};
+  const activeEffects = Array.isArray(publicState.active_effects)
+    ? publicState.active_effects
+    : [];
+  const signature = activeEffects
+    .map((effect) => `${effect.event_id}:${effect.started_turn}`)
+    .sort()
+    .join("|");
+  if (state.replayIndex === null) {
+    if (
+      state.forecastActiveSignature !== null
+      && signature !== state.forecastActiveSignature
+      && presentation.active.length
+    ) {
+      elements["forecast-live-status"].textContent = `イベント発動。${presentation.active.join("、")}`;
+    }
+    state.forecastActiveSignature = signature;
   }
 }
 
@@ -1093,13 +1186,14 @@ function renderFrontierStatus(variantState) {
   elements["frontier-status-detail"].textContent = presentation.detail;
 }
 
-function renderAICommentary(status, personalityMode) {
+function renderAICommentary(status, personalityMode, isActiveAI = true) {
   const visible = Boolean(status?.player_name && status?.title);
   elements["ai-commentary"].hidden = !visible;
   if (!visible) return;
   elements["ai-commentary-title"].textContent = aiCommentaryHeading(
     status,
     personalityMode,
+    isActiveAI,
   );
   elements["ai-commentary-detail"].textContent = status.detail || "次の一手を評価しています。";
 }
@@ -1751,6 +1845,7 @@ function renderBoard(
         edge.road.owner_player_index,
         edge.id,
         animationPlan,
+        Boolean(edge.forecast_blocked),
       );
     }
     if (state.targetOptions.has(edge.id)) {
@@ -2263,8 +2358,11 @@ function boardBoundsForPoints(points, rect, padding) {
 
 function drawBoardHarbor(layer, layout) {
   const { harbor, geometry, dock, rect, connectorLead, connectorEnd } = layout;
-  const group = svg("g", { "pointer-events": "none" });
-  appendSvgTitle(group, `交換所 ${harbor.label}`);
+  const group = svg("g", {
+    class: harbor.forecast_blocked ? "board-harbor forecast-harbor-blocked" : "board-harbor",
+    "pointer-events": "none",
+  });
+  appendSvgTitle(group, `交換所 ${harbor.label}${harbor.forecast_blocked ? "・港湾封鎖中" : ""}`);
   const shadowOffset = { x: geometry.axis.x + geometry.outward.x * 2, y: geometry.axis.y + geometry.outward.y * 2 };
   const shifted = (point, amount = 1) => ({
     x: point.x + shadowOffset.x * amount,
@@ -2321,6 +2419,16 @@ function drawBoardHarbor(layer, layout) {
   });
   label.textContent = harbor.label;
   group.append(label);
+  if (harbor.forecast_blocked) {
+    const blocked = svg("text", {
+      x: rect.x + rect.width / 2,
+      y: rect.y - 7,
+      class: "forecast-harbor-lock",
+      "text-anchor": "middle",
+    });
+    blocked.textContent = "🔒 封鎖";
+    group.append(blocked);
+  }
   layer.append(group);
 }
 
@@ -2332,6 +2440,7 @@ function drawRoadPiece(
   ownerIndex,
   targetId,
   animationPlan,
+  forecastBlocked = false,
 ) {
   const dx = nodeEnd.x - nodeStart.x;
   const dy = nodeEnd.y - nodeStart.y;
@@ -2351,11 +2460,18 @@ function drawRoadPiece(
   const grain = mixBoardColor(base, [44, 30, 21], 0.28);
   const animated = animationPlan.buildKeys.has(`road:${targetId}`);
   const group = svg("g", {
-    class: animated ? "board-piece build-enter build-enter-road" : "board-piece",
+    class: [
+      "board-piece",
+      animated ? "build-enter build-enter-road" : "",
+      forecastBlocked ? "forecast-road-blocked" : "",
+    ].filter(Boolean).join(" "),
     "data-piece-id": targetId,
     "pointer-events": "none",
   });
-  appendSvgTitle(group, `${players?.[ownerIndex]?.name || `Player ${ownerIndex + 1}`}の街道`);
+  appendSvgTitle(
+    group,
+    `${players?.[ownerIndex]?.name || `Player ${ownerIndex + 1}`}の街道${forecastBlocked ? "・地震で通行不能" : ""}`,
+  );
 
   const localPoint = (along, across, offset = { x: 0, y: 0 }) => ({
     x: start.x + axis.x * along + normal.x * across + offset.x,
@@ -2428,6 +2544,15 @@ function drawRoadPiece(
     for (const position of positions) {
       addLocalLine(length * position, -3, length * position, 3, light, 1.2);
     }
+  }
+  if (forecastBlocked) {
+    const middle = localPoint(length * 0.5, 0);
+    group.append(
+      svg("path", {
+        d: `M ${middle.x - 9} ${middle.y - 9} l 5 5 l -4 5 l 8 7 l -2 6`,
+        class: "forecast-road-crack",
+      }),
+    );
   }
   layer.append(group);
 }
@@ -3600,7 +3725,7 @@ function playerIdentityLabel(player, personalityMode) {
     : `${base}・AI`;
 }
 
-function aiCommentaryHeading(status, personalityMode) {
+function aiCommentaryHeading(status, personalityMode, isActiveAI = true) {
   const personality = publicAIPersonalityLabel(
     personalityMode,
     status?.personality,
@@ -3608,7 +3733,8 @@ function aiCommentaryHeading(status, personalityMode) {
   const speaker = personality
     ? `${status?.player_name || "AI"}（${personality}）`
     : status?.player_name || "AI";
-  return `${speaker}: ${status?.title || "判断中"}`;
+  const timing = isActiveAI ? "判断中" : "直前のAI判断";
+  return `${timing} — ${speaker}: ${status?.title || "判断中"}`;
 }
 
 function playerColor(players, index) {

@@ -7,6 +7,11 @@ from game.ai_personality import (
 )
 from game.development_cards import DevelopmentCardType
 from game.forecast_events import (
+    BANDIT_RAID_EVENT_ID,
+    CONSTRUCTION_BOOM_EVENT_ID,
+    EARTHQUAKE_EVENT_ID,
+    HARBOR_BLOCKADE_EVENT_ID,
+    MERCHANT_FESTIVAL_EVENT_ID,
     SHEEP_DROUGHT_EVENT_ID,
     WHEAT_HARVEST_EVENT_ID,
 )
@@ -63,6 +68,24 @@ class SimpleAI:
         if not game.development_card_used_this_turn and self._play_development_card(game, player):
             return True
 
+        if getattr(game, "is_forecast_event_active", lambda _event: False)(
+            CONSTRUCTION_BOOM_EVENT_ID
+        ):
+            boom_edges = game.get_buildable_road_edges(player)
+            if boom_edges:
+                edge = max(
+                    boom_edges,
+                    key=lambda candidate: self._edge_score(game, candidate, player),
+                )
+                self._set_status(
+                    game,
+                    player,
+                    "建設ブームを活用",
+                    "予告イベントの割引が失われる前に街道を建設します",
+                )
+                game.build_road(self._edge_midpoint(edge))
+                return True
+
         buildable_node_getters = {
             "city": game.get_buildable_city_nodes,
             "settlement": game.get_buildable_settlement_nodes,
@@ -108,7 +131,15 @@ class SimpleAI:
                     game,
                     player,
                     "国内交易を提案",
-                    "公開されている生産力と直近獲得から交渉相手を選びます",
+                    (
+                        "商人祭の双方ボーナスも含めて成立しやすい条件を選びます"
+                        if getattr(
+                            game,
+                            "is_forecast_event_active",
+                            lambda _event: False,
+                        )(MERCHANT_FESTIVAL_EVENT_ID)
+                        else "公開されている生産力と直近獲得から交渉相手を選びます"
+                    ),
                 )
                 game.propose_domestic_trade(partner, give, receive)
                 return True
@@ -170,7 +201,15 @@ class SimpleAI:
                     game,
                     player,
                     "国内交易を提案",
-                    "公開されている生産力と直近獲得から交渉相手を選びます",
+                    (
+                        "商人祭の双方ボーナスも含めて成立しやすい条件を選びます"
+                        if getattr(
+                            game,
+                            "is_forecast_event_active",
+                            lambda _event: False,
+                        )(MERCHANT_FESTIVAL_EVENT_ID)
+                        else "公開されている生産力と直近獲得から交渉相手を選びます"
+                    ),
                 )
                 game.propose_domestic_trade(partner, give, receive)
                 return True
@@ -315,7 +354,10 @@ class SimpleAI:
 
         if player.has_playable_development_card(DevelopmentCardType.YEAR_OF_PLENTY):
             for cost_name in profile.goal_order:
-                missing = self._missing_cards(player, BUILD_COSTS[cost_name])
+                missing = self._missing_cards(
+                    player,
+                    self._goal_cost(game, player, cost_name),
+                )
                 if 0 < sum(missing.values()) <= 2 and all(
                     game.bank.available(resource_type) >= amount
                     for resource_type, amount in missing.items()
@@ -377,7 +419,7 @@ class SimpleAI:
             goals = self._profile(player).goal_order
         rates = game.get_trade_rates(player)
         for cost_name in goals:
-            cost = BUILD_COSTS[cost_name]
+            cost = self._goal_cost(game, player, cost_name)
             missing = self._missing_cards(player, cost)
             if sum(missing.values()) > 2:
                 continue
@@ -406,7 +448,7 @@ class SimpleAI:
         if goals is None:
             goals = profile.goal_order
         for cost_name in goals:
-            cost = BUILD_COSTS[cost_name]
+            cost = self._goal_cost(game, player, cost_name)
             missing = self._missing_cards(player, cost)
             if not missing:
                 continue
@@ -473,7 +515,7 @@ class SimpleAI:
             partner.total_resource_count(),
         )
 
-    def evaluate_domestic_trade(self, player, *, incoming, outgoing):
+    def evaluate_domestic_trade(self, player, *, incoming, outgoing, game=None):
         profile = self._profile(player)
         if not incoming or not outgoing:
             return "reject"
@@ -503,11 +545,17 @@ class SimpleAI:
 
         priority_goals = profile.goal_order[:2]
         before_distances = {
-            goal: self._resource_distance(before_resources, BUILD_COSTS[goal])
+            goal: self._resource_distance(
+                before_resources,
+                self._goal_cost(game, player, goal),
+            )
             for goal in priority_goals
         }
         after_distances = {
-            goal: self._resource_distance(after_resources, BUILD_COSTS[goal])
+            goal: self._resource_distance(
+                after_resources,
+                self._goal_cost(game, player, goal),
+            )
             for goal in priority_goals
         }
         incoming_value = sum(
@@ -528,17 +576,25 @@ class SimpleAI:
             before_distances[goal] > 0 and after_distances[goal] == 0
             for goal in priority_goals
         )
+        festival_ratio = (
+            0.82
+            if game is not None
+            and game.is_forecast_event_active(MERCHANT_FESTIVAL_EVENT_ID)
+            else 1.0
+        )
         if (
             completes_priority_goal
-            and incoming_value >= outgoing_value * profile.trade_complete_ratio
+            and incoming_value
+            >= outgoing_value * profile.trade_complete_ratio * festival_ratio
         ):
             return "accept"
         if (
             improves_priority_goal
-            and incoming_value >= outgoing_value * profile.trade_improve_ratio
+            and incoming_value
+            >= outgoing_value * profile.trade_improve_ratio * festival_ratio
         ):
             return "accept"
-        if incoming_value >= outgoing_value * profile.trade_fair_ratio:
+        if incoming_value >= outgoing_value * profile.trade_fair_ratio * festival_ratio:
             return "accept"
         if (
             improves_priority_goal
@@ -547,7 +603,7 @@ class SimpleAI:
             return "counter"
         return "reject"
 
-    def choose_domestic_trade_branch(self, player, branches):
+    def choose_domestic_trade_branch(self, player, branches, *, game=None):
         """Choose one exact branch without treating OR alternatives as additive.
 
         ``branches`` contains ``(key, incoming, outgoing)`` tuples from the
@@ -572,6 +628,17 @@ class SimpleAI:
                 self._trade_resource_value(player, resource_type) * amount
                 for resource_type, amount in outgoing.items()
             )
+            if (
+                game is not None
+                and getattr(
+                    game,
+                    "is_forecast_event_active",
+                    lambda _event: False,
+                )(MERCHANT_FESTIVAL_EVENT_ID)
+                and decision == "counter"
+                and incoming_value >= outgoing_value * 0.75
+            ):
+                decision = "accept"
             score = (
                 decision_rank.get(decision, 0),
                 incoming_value - outgoing_value,
@@ -589,6 +656,14 @@ class SimpleAI:
             max(0, required - resources.get(resource_type, 0))
             for resource_type, required in cost.items()
         )
+
+    @staticmethod
+    def _goal_cost(game, player, cost_name):
+        if game is not None and cost_name == "road":
+            effective_cost = getattr(game, "get_effective_road_cost", None)
+            if effective_cost is not None:
+                return effective_cost(player)[0]
+        return BUILD_COSTS[cost_name]
 
     def build_domestic_trade_counter(self, active_player, responding_player, give, receive):
         counter_give = {resource_type: give.get(resource_type, 0) for resource_type in active_player.resources}
@@ -671,7 +746,10 @@ class SimpleAI:
             return None
 
         for cost_name in self._profile(player).goal_order:
-            missing = self._missing_cards(player, BUILD_COSTS[cost_name])
+            missing = self._missing_cards(
+                player,
+                self._goal_cost(game, player, cost_name),
+            )
             for resource_type in missing:
                 if resource_type in available:
                     return resource_type
@@ -780,15 +858,38 @@ class SimpleAI:
             lambda _event: False,
         )
         next_event = getattr(game, "get_next_forecast_event_id", lambda: None)()
+        remaining = getattr(
+            game,
+            "get_next_forecast_turns_remaining",
+            lambda: None,
+        )()
+        variant_config = getattr(game, "variant_config", None)
+        variant_options = getattr(variant_config, "options", {})
+        interval = max(
+            1,
+            int(variant_options.get("event_interval_turns", 6))
+            if getattr(game, "is_forecast_variant", lambda: False)()
+            else 6,
+        )
+        urgency = (
+            1.0
+            if remaining is None
+            else max(0.0, min(1.0, 1.0 - remaining / interval))
+        )
         if active_event(SHEEP_DROUGHT_EVENT_ID):
             weights[ResourceType.SHEEP] *= 0.35
         elif next_event == SHEEP_DROUGHT_EVENT_ID:
-            weights[ResourceType.SHEEP] *= 0.80
-        if (
-            active_event(WHEAT_HARVEST_EVENT_ID)
-            or next_event == WHEAT_HARVEST_EVENT_ID
-        ):
+            weights[ResourceType.SHEEP] *= 1.0 - 0.30 * urgency
+        if active_event(WHEAT_HARVEST_EVENT_ID):
             weights[ResourceType.WHEAT] *= 1.20
+        elif next_event == WHEAT_HARVEST_EVENT_ID:
+            weights[ResourceType.WHEAT] *= 1.0 + 0.25 * urgency
+        if active_event(CONSTRUCTION_BOOM_EVENT_ID):
+            weights[ResourceType.WOOD] *= 0.72
+            weights[ResourceType.BRICK] *= 0.72
+        elif next_event == CONSTRUCTION_BOOM_EVENT_ID:
+            weights[ResourceType.WOOD] *= 1.0 - 0.12 * urgency
+            weights[ResourceType.BRICK] *= 1.0 - 0.12 * urgency
         production = self._player_production_scores(game, player)
         strongest = max(production.values(), default=0)
         for resource_type in weights:
@@ -802,11 +903,20 @@ class SimpleAI:
     def _node_score(self, game, node, player):
         profile = self._profile(player)
         need_weights = self._resource_need_weights(game, player)
-        pip_score = sum(
-            get_token_pip_count(tile.number) * need_weights[tile.resource_type]
-            for tile in game.get_public_node_tiles(node)
-            if tile.resource_type != ResourceType.DESERT
-        )
+        raid_parameters = getattr(
+            game,
+            "get_forecast_event_parameters",
+            lambda _event: {},
+        )(BANDIT_RAID_EVENT_ID)
+        raid_number = raid_parameters.get("target_number")
+        pip_score = 0
+        for tile in game.get_public_node_tiles(node):
+            if tile.resource_type == ResourceType.DESERT:
+                continue
+            value = get_token_pip_count(tile.number) * need_weights[tile.resource_type]
+            if tile.number == raid_number:
+                value *= 0.55
+            pip_score += value
         resources = {
             tile.resource_type
             for tile in game.get_public_node_tiles(node)
@@ -815,6 +925,12 @@ class SimpleAI:
         production = self._player_production_scores(game, player)
         harbor_bonus = 0
         for harbor in game.get_public_node_harbors(node):
+            if getattr(
+                game,
+                "is_forecast_harbor_announced",
+                lambda _harbor: False,
+            )(harbor):
+                continue
             if harbor.resource_type is None:
                 harbor_bonus = max(harbor_bonus, profile.generic_harbor_bonus)
             else:
@@ -863,6 +979,12 @@ class SimpleAI:
             lambda _edge: 0,
         )(edge)
         score += discovery_count * 10
+        if getattr(
+            game,
+            "is_forecast_edge_announced",
+            lambda _edge: False,
+        )(edge):
+            score -= 35
         return score
 
     def _robber_score(self, game, tile, player):
@@ -895,6 +1017,13 @@ class SimpleAI:
                     + node.building.owner.total_resource_count()
                     * profile.robber_hand_weight
                 )
+        raid_number = getattr(
+            game,
+            "get_forecast_event_parameters",
+            lambda _event: {},
+        )(BANDIT_RAID_EVENT_ID).get("target_number")
+        if raid_number is not None and tile.number == raid_number:
+            score -= 30
         return score
 
     def _steal_target_score(self, game, candidate, player):

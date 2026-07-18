@@ -92,12 +92,15 @@ class VariantConfig:
     def forecast_events(
         cls,
         *,
+        catalog: str | None = None,
         forecast_lead_turns: int | None = None,
         event_interval_turns: int | None = None,
     ) -> VariantConfig:
         """Return the supported forecast-events configuration."""
 
         options = dict(DEFAULT_FORECAST_OPTIONS)
+        if catalog is not None:
+            options["catalog"] = catalog
         if forecast_lead_turns is not None:
             options["forecast_lead_turns"] = forecast_lead_turns
         if event_interval_turns is not None:

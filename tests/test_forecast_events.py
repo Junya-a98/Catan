@@ -6,8 +6,14 @@ import pytest
 
 from game.forecast_events import (
     DEFAULT_FORECAST_OPTIONS,
+    BANDIT_RAID_EVENT_ID,
+    CONSTRUCTION_BOOM_EVENT_ID,
+    EARTHQUAKE_EVENT_ID,
     EVENT_CATALOG,
     FORECAST_CATALOG_ID,
+    HARBOR_BLOCKADE_EVENT_ID,
+    LEGACY_FORECAST_CATALOG_ID,
+    MERCHANT_FESTIVAL_EVENT_ID,
     SHEEP_DROUGHT_EVENT_ID,
     WHEAT_HARVEST_EVENT_ID,
     ForecastEventError,
@@ -33,7 +39,7 @@ FORECAST_DOCUMENT = {
 
 
 def _config() -> VariantConfig:
-    return VariantConfig.forecast_events()
+    return VariantConfig.forecast_events(catalog=LEGACY_FORECAST_CATALOG_ID)
 
 
 def _initial_state(seed: str = DECK_SEED) -> VariantState:
@@ -158,6 +164,11 @@ def test_catalog_and_public_forecast_use_stable_ids_not_executable_values():
     assert set(EVENT_CATALOG) == {
         WHEAT_HARVEST_EVENT_ID,
         SHEEP_DROUGHT_EVENT_ID,
+        HARBOR_BLOCKADE_EVENT_ID,
+        CONSTRUCTION_BOOM_EVENT_ID,
+        MERCHANT_FESTIVAL_EVENT_ID,
+        BANDIT_RAID_EVENT_ID,
+        EARTHQUAKE_EVENT_ID,
     }
     assert public["forecast"]["event_id"] in EVENT_CATALOG
     assert all(

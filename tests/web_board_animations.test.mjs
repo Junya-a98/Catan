@@ -120,6 +120,8 @@ function loadAnimationFunctions() {
     variantConfigDocument,
     variantLabel,
     forecastEventPresentation,
+    forecastParameterLabel,
+    forecastActiveTiming,
     frontierPresentation,
     currentTurnSeat,
     domesticTradeActorSeat,
@@ -927,7 +929,19 @@ test("mixed AI identities stay hidden until result presentation", () => {
       },
       "mixed",
     ),
-    "CPU1: 建設候補を評価",
+    "判断中 — CPU1: 建設候補を評価",
+  );
+  assert.equal(
+    animation.aiCommentaryHeading(
+      {
+        player_name: "CPU1",
+        personality: null,
+        title: "建設候補を評価",
+      },
+      "mixed",
+      false,
+    ),
+    "直前のAI判断 — CPU1: 建設候補を評価",
   );
   assert.equal(
     animation.publicAIPersonalityLabel("expansion", "expansion"),
@@ -960,7 +974,7 @@ test("mixed AI identities stay hidden until result presentation", () => {
       },
       legacyMode,
     ),
-    "CPU2: 交易候補を評価",
+    "判断中 — CPU2: 交易候補を評価",
   );
   animation.state.lobby = null;
 });
@@ -976,7 +990,7 @@ test("room creation sends canonical standard and forecast variant documents", ()
       version: 1,
       kind: "forecast_events",
       options: {
-        catalog: "core_v1",
+        catalog: "core_v2",
         forecast_lead_turns: 2,
         event_interval_turns: 6,
       },
@@ -1034,7 +1048,7 @@ test("forecast card presents countdown and active effects from public state only
   assert.equal(presentation.visible, true);
   assert.equal(presentation.title, "大干ばつ");
   assert.equal(presentation.countdown, "あと3手番");
-  assert.deepEqual(Array.from(presentation.active), ["豊作: 次の麦生産に+1"]);
+  assert.deepEqual(Array.from(presentation.active), ["豊作: 次の麦生産に+1・次の麦生産まで"]);
   assert.equal(
     animation.forecastEventPresentation({ kind: "standard", public: {} }).visible,
     false,
@@ -1043,10 +1057,59 @@ test("forecast card presents countdown and active effects from public state only
 
 test("forecast mode controls and persistent event card are present and styled", () => {
   assert.match(indexSource, /<select name="variant_kind">[\s\S]*value="forecast_events"/);
-  assert.match(indexSource, /id="forecast-event-card" hidden/);
+  assert.match(indexSource, /id="forecast-event-card"[^>]*hidden/);
   assert.match(indexSource, /id="forecast-active-list"/);
+  assert.ok(indexSource.indexOf('id="forecast-compact-strip"') < indexSource.indexOf('id="board-shell"'));
+  assert.match(indexSource, /id="forecast-live-status"[^>]*role="status"/);
   assert.match(cssSource, /\.forecast-event-card\s*\{/);
   assert.match(cssSource, /\.forecast-event-card\[hidden\]\s*\{[\s\S]*display:\s*none/);
+  assert.match(cssSource, /@media \(max-width:\s*760px\)[\s\S]*\.forecast-compact-strip/);
+});
+
+test("all core_v2 forecast targets and active durations have readable labels", () => {
+  assert.equal(animation.forecastParameterLabel("harbor_blockade_v1", { harbor_id: "harbor-4" }), "対象: 交換所 #5");
+  assert.equal(animation.forecastParameterLabel("bandit_raid_v1", { target_number: 8 }), "対象数字: 8");
+  assert.equal(animation.forecastParameterLabel("earthquake_v1", { sector: 2 }), "対象: 南西側");
+  assert.equal(animation.forecastActiveTiming({ event_id: "harbor_blockade_v1", expires_turn: 9 }, 7), "残り2手番");
+  assert.equal(animation.forecastActiveTiming({ event_id: "construction_boom_v1", expires_turn: null }, 7), "次の有料街道まで");
+
+  const harborForecast = animation.forecastEventPresentation({
+    kind: "forecast_events",
+    public: {
+      completed_turns: 1,
+      forecast: {
+        event_id: "harbor_blockade_v1",
+        resolve_turn: 3,
+        parameters: { harbor_id: "harbor-4" },
+      },
+      active_effects: [],
+    },
+  });
+  assert.equal(
+    harborForecast.compact,
+    "港湾封鎖・あと2手番・対象: 交換所 #5",
+  );
+
+  for (const eventId of [
+    "wheat_harvest_v1",
+    "sheep_drought_v1",
+    "harbor_blockade_v1",
+    "construction_boom_v1",
+    "merchant_festival_v1",
+    "bandit_raid_v1",
+    "earthquake_v1",
+  ]) {
+    const presentation = animation.forecastEventPresentation({
+      kind: "forecast_events",
+      public: {
+        completed_turns: 1,
+        forecast: { event_id: eventId, resolve_turn: 3, parameters: {} },
+        active_effects: [],
+      },
+    });
+    assert.equal(presentation.visible, true);
+    assert.notEqual(presentation.title, "未知のイベント");
+  }
 });
 
 test("frontier mode includes fog status and generated terrain asset", () => {
