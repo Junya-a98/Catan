@@ -126,11 +126,15 @@ function loadAnimationFunctions() {
     domesticTradePresentation,
     tradeOfferSignature,
     formatTradeBundle,
+    buildTradeReceiveOperator,
+    renderTradePromptActions,
     commandOptionsForView,
     showLiveSnapshot,
     sendGameCommand,
     developmentCardInventoryPresentation,
     createDevelopmentCardInventory,
+    calculatePublicPoints,
+    createResultVpBreakdown,
     resetRoomState,
     personalityModeForView,
     publicAIPersonalityLabel,
@@ -144,6 +148,63 @@ function loadAnimationFunctions() {
 }
 
 const animation = loadAnimationFunctions();
+
+test("live score stays public even for the viewer's own hidden victory cards", () => {
+  animation.state.matchResult = null;
+  animation.state.snapshot = {
+    board_manifest: {
+      nodes: [
+        { building: { type: "settlement", owner_player_index: 0 } },
+        { building: { type: "city", owner_player_index: 0 } },
+      ],
+    },
+  };
+  const points = animation.calculatePublicPoints({
+    players: [{ victory_point_cards: 2 }, {}],
+    phase: {
+      name: "main",
+      longest_road_owner: 0,
+      largest_army_owner: 1,
+    },
+  });
+
+  assert.deepEqual([...points], [5, 2]);
+});
+
+test("finished score and result breakdown reveal the complete authoritative total", () => {
+  animation.state.matchResult = {
+    standings: [{ seat: 1, victory_points: 10 }],
+  };
+  const points = animation.calculatePublicPoints({
+    players: [{ victory_point_cards: 2 }],
+    phase: { name: "finished" },
+  });
+  assert.deepEqual([...points], [10]);
+
+  const breakdown = animation.createResultVpBreakdown({
+    name: "Host",
+    victory_points: 10,
+    vp_breakdown: {
+      settlements: { count: 4, points: 4 },
+      cities: { count: 1, points: 2 },
+      longest_road: { awarded: true, points: 2 },
+      largest_army: { awarded: false, points: 0 },
+      victory_point_cards: { count: 2, points: 2 },
+      total: 10,
+    },
+  });
+  assert.equal(breakdown.children.length, 5);
+  assert.deepEqual(
+    breakdown.children.map((child) => child.textContent),
+    [
+      "開拓地 4点（4軒）",
+      "都市 2点（1軒）",
+      "最長交易路 2点",
+      "最大騎士力 0点",
+      "勝利点カード 2点（2枚）",
+    ],
+  );
+});
 
 function manifest({ road = false, firstBuilding = null, secondBuilding = null, seed = 41 } = {}) {
   return {
@@ -542,7 +603,8 @@ test("domestic trade presentation always uses the viewer's give and receive dire
       partner: 1,
       editor: 0,
       give: { WOOD: 2, SHEEP: 0, WHEAT: 0, BRICK: 0, ORE: 0 },
-      receive: { WOOD: 0, SHEEP: 1, WHEAT: 0, BRICK: 0, ORE: 0 },
+      receive: { WOOD: 0, SHEEP: 1, WHEAT: 0, BRICK: 0, ORE: 1 },
+      receive_operator: "or",
       is_counter: false,
       is_broadcast: false,
       broadcast_index: -1,
@@ -554,12 +616,21 @@ test("domestic trade presentation always uses the viewer's give and receive dire
   assert.equal(proposer.incomingSide, "receive");
   assert.equal(proposer.counterpartyName, "Guest");
   assert.equal(animation.formatTradeBundle(proposer.outgoing), "木 2");
+  assert.equal(proposer.incomingOperator, "or");
+  assert.equal(
+    animation.formatTradeBundle(proposer.incoming, proposer.incomingOperator),
+    "羊 1 または 鉄 1",
+  );
 
   const responder = animation.domesticTradePresentation(gameState, 1);
   assert.equal(responder.outgoingSide, "receive");
   assert.equal(responder.incomingSide, "give");
   assert.equal(responder.counterpartyName, "Host");
-  assert.equal(animation.formatTradeBundle(responder.outgoing), "羊 1");
+  assert.equal(responder.outgoingOperator, "or");
+  assert.equal(
+    animation.formatTradeBundle(responder.outgoing, responder.outgoingOperator),
+    "羊 1 または 鉄 1",
+  );
   assert.equal(animation.domesticTradeActorSeat(gameState), 1);
 
   gameState.domestic_trade.is_counter = true;
@@ -599,6 +670,69 @@ test("trade offer identity ignores handoff phase but changes for counter or next
   const nextResponder = animation.tradeOfferSignature(gameState);
   gameState.domestic_trade.is_counter = true;
   assert.notEqual(animation.tradeOfferSignature(gameState), nextResponder);
+  const counter = animation.tradeOfferSignature(gameState);
+  gameState.domestic_trade.receive_operator = "or";
+  assert.notEqual(animation.tradeOfferSignature(gameState), counter);
+});
+
+test("OR editor and response controls expose explicit alternatives in both directions", () => {
+  const toggle = animation.buildTradeReceiveOperator("or", [
+    { command: "trade_receive_operator", args: { operator: "and" } },
+  ]);
+  const choices = toggle.children[1];
+  assert.deepEqual(
+    choices.children.map((button) => button.textContent),
+    ["すべて", "どれか1つ（OR）"],
+  );
+  assert.equal(choices.children[0].disabled, false);
+  assert.equal(choices.children[1].disabled, true);
+
+  const gameState = {
+    players: [{ name: "Host" }, { name: "Guest" }],
+    phase: {
+      name: "main",
+      special_phase: "domestic_trade_response",
+      turn_order: [0, 1],
+      current_player_index: 0,
+    },
+    domestic_trade: {
+      partner: 1,
+      give: { WOOD: 1 },
+      receive: { ORE: 1, WHEAT: 1 },
+      receive_operator: "or",
+      is_counter: false,
+      is_broadcast: true,
+      broadcast_index: 0,
+    },
+  };
+  const acceptOptions = [
+    { command: "trade_accept", args: { resource: "ORE" } },
+    { command: "trade_accept", args: { resource: "WHEAT" } },
+    { command: "trade_counter", args: {} },
+    { command: "trade_reject", args: {} },
+  ];
+  animation.renderTradePromptActions(
+    acceptOptions,
+    false,
+    animation.domesticTradePresentation(gameState, 1),
+  );
+  assert.deepEqual(
+    animation.elements["trade-prompt-actions"].children.map((button) => button.textContent),
+    ["鉄1を渡して承諾", "麦1を渡して承諾", "条件を変更する", "今回は拒否"],
+  );
+
+  gameState.domestic_trade.is_counter = true;
+  gameState.domestic_trade.is_broadcast = false;
+  gameState.phase.special_phase = "domestic_trade_counter_response";
+  animation.renderTradePromptActions(
+    acceptOptions.filter((option) => option.command !== "trade_counter"),
+    false,
+    animation.domesticTradePresentation(gameState, 0),
+  );
+  assert.deepEqual(
+    animation.elements["trade-prompt-actions"].children.map((button) => button.textContent),
+    ["鉄1を受け取って承諾", "麦1を受け取って承諾", "今回は拒否"],
+  );
 });
 
 function developmentPlayer(overrides = {}) {

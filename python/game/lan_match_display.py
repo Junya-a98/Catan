@@ -82,11 +82,14 @@ _SUPPORTED_COMMANDS = frozenset(
         "select_resource",
         "trade_partner",
         "trade_edit_side",
+        "trade_receive_operator",
         "trade_adjust",
         "use_development",
     }
 )
-_EMPTY_ARG_COMMANDS = frozenset(_SIMPLE_COMMAND_LABELS)
+_EMPTY_ARG_COMMANDS = frozenset(
+    command for command in _SIMPLE_COMMAND_LABELS if command != "trade_accept"
+)
 
 
 @dataclass(frozen=True)
@@ -481,6 +484,16 @@ def _option_args_well_formed(
         return set(args) == {"resource"} and args.get("resource") in RESOURCE_ORDER
     if command == "trade_edit_side":
         return set(args) == {"side"} and args.get("side") in ("give", "receive")
+    if command == "trade_receive_operator":
+        return (
+            set(args) == {"operator"}
+            and args.get("operator") in ("and", "or")
+        )
+    if command == "trade_accept":
+        return not args or (
+            set(args) == {"resource"}
+            and args.get("resource") in RESOURCE_ORDER
+        )
     if command == "trade_adjust":
         return (
             set(args) == {"side", "resource", "delta"}
@@ -1191,7 +1204,10 @@ def _draw_side(
         y += rendered.get_height() + 2
     trade = state.view.domestic_trade
     if state.view.special_phase and state.view.special_phase.startswith("domestic_trade"):
-        summary = f"渡す {_bundle_label(trade.give)}  /  受取 {_bundle_label(trade.receive)}"
+        receive = _bundle_label(trade.receive)
+        if trade.receive_operator == "or":
+            receive = _or_bundle_label(trade.receive)
+        summary = f"渡す {_bundle_label(trade.give)}  /  受取 {receive}"
         rendered = tiny_font.render(
             _truncate(tiny_font, summary, layout.guidance_rect.width - 20),
             True,
@@ -1394,6 +1410,8 @@ def _guidance_text(state: LanMatchDisplayState) -> str:
 def _command_label(view: NetworkGameView, option: _Option) -> str:
     command = option.command
     args = option.args
+    if command == "trade_accept" and args.get("resource") in RESOURCE_ORDER:
+        return f"{_RESOURCE_LABELS[args['resource']]}で承諾"
     if command in _SIMPLE_COMMAND_LABELS:
         return _SIMPLE_COMMAND_LABELS[command]
     if command == "select_resource":
@@ -1408,6 +1426,8 @@ def _command_label(view: NetworkGameView, option: _Option) -> str:
         return "プレイヤー"
     if command == "trade_edit_side":
         return "受取を編集" if args.get("side") == "receive" else "渡す側を編集"
+    if command == "trade_receive_operator":
+        return "ORにする" if args.get("operator") == "or" else "ANDにする"
     if command == "trade_adjust":
         side = "渡" if args.get("side") == "give" else "受"
         resource = _RESOURCE_LABELS.get(str(args.get("resource")), "?")
@@ -1428,6 +1448,15 @@ def _bundle_label(bundle: Mapping[str, int]) -> str:
         if bundle[key] > 0
     ]
     return "・".join(entries) if entries else "なし"
+
+
+def _or_bundle_label(bundle: Mapping[str, int]) -> str:
+    entries = [
+        f"{_RESOURCE_LABELS[key]}{bundle[key]}"
+        for key in RESOURCE_ORDER
+        if bundle[key] > 0
+    ]
+    return " または ".join(entries) if entries else "なし"
 
 
 def _draw_panel(

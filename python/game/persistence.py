@@ -387,6 +387,7 @@ def serialize_game(game):
             "partner": _optional_index(game.domestic_trade_partner, players, label="交渉相手"),
             "give": _resource_map_to_json(game.domestic_trade_give),
             "receive": _resource_map_to_json(game.domestic_trade_receive),
+            "receive_operator": game.domestic_trade_receive_operator,
             "edit_side": game.domestic_trade_edit_side,
             "editor": _optional_index(game.domestic_trade_editor, players, label="交渉編集者"),
             "is_counter": bool(game.domestic_trade_is_counter),
@@ -401,6 +402,9 @@ def serialize_game(game):
             ),
             "broadcast_receive": _resource_map_to_json(
                 game.domestic_trade_broadcast_receive
+            ),
+            "broadcast_receive_operator": (
+                game.domestic_trade_broadcast_receive_operator
             ),
             "broadcast_viewer": _optional_index(
                 game.domestic_trade_broadcast_viewer,
@@ -766,6 +770,12 @@ def restore_game(game, data, *, runtime_side_effects=True):
         trade_data.get("receive", {}),
         label="交渉要求",
     )
+    game.domestic_trade_receive_operator = trade_data.get(
+        "receive_operator",
+        "and",
+    )
+    if game.domestic_trade_receive_operator not in ("and", "or"):
+        raise SaveGameError("交渉要求の結合方法が不正です。")
     game.domestic_trade_edit_side = trade_data.get("edit_side", "give")
     if game.domestic_trade_edit_side not in ("give", "receive"):
         raise SaveGameError("交渉編集方向が不正です。")
@@ -797,6 +807,12 @@ def restore_game(game, data, *, runtime_side_effects=True):
         trade_data.get("broadcast_receive", {}),
         label="交易募集の要求",
     )
+    game.domestic_trade_broadcast_receive_operator = trade_data.get(
+        "broadcast_receive_operator",
+        "and",
+    )
+    if game.domestic_trade_broadcast_receive_operator not in ("and", "or"):
+        raise SaveGameError("交易募集要求の結合方法が不正です。")
     game.domestic_trade_broadcast_viewer = _restore_ref(
         trade_data.get("broadcast_viewer"),
         players,
@@ -911,7 +927,21 @@ def _validate_restored_domestic_trade(game):
     responder_index = game.domestic_trade_broadcast_index
     base_give = game.domestic_trade_broadcast_give
     base_receive = game.domestic_trade_broadcast_receive
+    base_receive_operator = game.domestic_trade_broadcast_receive_operator
     viewer = game.domestic_trade_broadcast_viewer
+
+    submitted_phases = {
+        "domestic_trade_handoff",
+        "domestic_trade_response",
+        "domestic_trade_counter_handoff",
+        "domestic_trade_counter_response",
+    }
+    if (
+        game.domestic_trade_receive_operator == "or"
+        and game.special_phase in submitted_phases
+        and sum(amount > 0 for amount in game.domestic_trade_receive.values()) < 2
+    ):
+        raise SaveGameError("OR交易条件の選択肢が不正です。")
 
     if not game.domestic_trade_is_broadcast:
         if (
@@ -919,6 +949,7 @@ def _validate_restored_domestic_trade(game):
             or responder_index != -1
             or any(base_give.values())
             or any(base_receive.values())
+            or base_receive_operator != "and"
             or viewer is not None
         ):
             raise SaveGameError("交易募集の状態が不正です。")
@@ -951,6 +982,7 @@ def _validate_restored_domestic_trade(game):
             or viewer is not active_player
             or any(base_give.values())
             or any(base_receive.values())
+            or base_receive_operator != "and"
         ):
             raise SaveGameError("交易募集の編集状態が不正です。")
         return
@@ -960,6 +992,10 @@ def _validate_restored_domestic_trade(game):
     if (
         sum(base_give.values()) <= 0
         or sum(base_receive.values()) <= 0
+        or (
+            base_receive_operator == "or"
+            and sum(amount > 0 for amount in base_receive.values()) < 2
+        )
         or any(
             base_give[resource_type] > 0
             and base_receive[resource_type] > 0
@@ -972,6 +1008,7 @@ def _validate_restored_domestic_trade(game):
     if not is_counter and (
         game.domestic_trade_give != base_give
         or game.domestic_trade_receive != base_receive
+        or game.domestic_trade_receive_operator != base_receive_operator
     ):
         raise SaveGameError("交易募集の提示条件が不正です。")
 

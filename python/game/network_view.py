@@ -91,6 +91,7 @@ _ACTION_MODES = frozenset((None, "road", "settlement", "city"))
 _BUILDING_TYPES = frozenset(("settlement", "city"))
 _BOARD_MODES = frozenset(("constrained", "fully_random", "custom"))
 _DOMESTIC_TRADE_EDIT_SIDES = frozenset(("give", "receive"))
+_DOMESTIC_TRADE_RECEIVE_OPERATORS = frozenset(("and", "or"))
 _FINGERPRINT_PATTERN = re.compile(r"[0-9a-f]{64}\Z")
 _VARIANT_STATE_KEYS = frozenset(
     {"format", "version", "kind", "config_fingerprint", "public"}
@@ -335,6 +336,7 @@ class DomesticTradeView:
     edit_side: str
     is_counter: bool
     is_broadcast: bool
+    receive_operator: str = "and"
 
 
 @dataclass(frozen=True)
@@ -381,6 +383,7 @@ class NetworkGameView:
             edit_side="give",
             is_counter=False,
             is_broadcast=False,
+            receive_operator="and",
         )
     )
     variant_state: VariantStateView = field(
@@ -1058,6 +1061,11 @@ def _parse_domestic_trade(raw: Any, player_count: int) -> DomesticTradeView:
         raise NetworkViewError(
             "snapshot.state.domestic_trade cannot give and receive one resource"
         )
+    receive_operator = _enum_text(
+        trade.get("receive_operator", "and"),
+        _DOMESTIC_TRADE_RECEIVE_OPERATORS,
+        "snapshot.state.domestic_trade.receive_operator",
+    )
     return DomesticTradeView(
         partner_seat=_optional_seat(
             _required(trade, "partner", "snapshot.state.domestic_trade"),
@@ -1084,6 +1092,7 @@ def _parse_domestic_trade(raw: Any, player_count: int) -> DomesticTradeView:
             _required(trade, "is_broadcast", "snapshot.state.domestic_trade"),
             "snapshot.state.domestic_trade.is_broadcast",
         ),
+        receive_operator=receive_operator,
     )
 
 

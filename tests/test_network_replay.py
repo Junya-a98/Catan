@@ -132,6 +132,15 @@ def result_document():
                 "builds": {"roads": 3, "settlements": 2, "cities": 1},
                 "trades": {"bank": 2, "domestic": 1},
                 "luck_index": 112.5,
+                "vp_breakdown": {
+                    "settlements": {"count": 2, "points": 2, "secret": 99},
+                    "cities": {"count": 1, "points": 2},
+                    "longest_road": {"awarded": False, "points": 0},
+                    "largest_army": {"awarded": False, "points": 0},
+                    "victory_point_cards": {"count": 1, "points": 1},
+                    "total": 5,
+                    "private_note": "do not expose",
+                },
                 "resources": {"WOOD": 99},
             },
             {
@@ -461,6 +470,14 @@ def test_bounded_history_relinks_events_and_vp_progression_to_retained_frames():
     assert result["replay"] == {"available": True, "frame_count": 2}
     assert "private_resources" not in result
     assert "resources" not in result["standings"][0]
+    assert result["standings"][0]["vp_breakdown"] == {
+        "settlements": {"count": 2, "points": 2},
+        "cities": {"count": 1, "points": 2},
+        "longest_road": {"awarded": False, "points": 0},
+        "largest_army": {"awarded": False, "points": 0},
+        "victory_point_cards": {"count": 1, "points": 1},
+        "total": 5,
+    }
     assert source_result == source_before
     json.dumps(payload, ensure_ascii=False, allow_nan=False)
 

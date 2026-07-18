@@ -1124,7 +1124,7 @@ function renderActions(options) {
   elements["action-hint"].textContent = targetCount
     ? `盤面上で光っている候補を選べます（${targetCount}か所）。`
     : isTradeEditor
-      ? "「− / ＋」で条件を調整します。同じ資源は交換の両側へ指定できません。"
+      ? "「− / ＋」で枚数を調整します。ORにした欄は、承諾側が候補から1種類を選びます。"
     : direct.length
       ? "行動を選ぶと権威サーバーが合法性を再確認します。"
       : state.welcome?.role === "spectator"
@@ -1166,12 +1166,14 @@ function renderTradeEditor(list, gameState, options) {
     textElement("strong", headingTitle),
     textElement(
       "span",
-      "左があなたの支払い、右があなたの受け取りです。相手の手札内訳は公開されません。",
+      "赤枠の「あなたが渡す」と緑枠の「あなたが受け取る」を確認してください。相手の手札内訳は公開されません。",
     ),
     textElement(
       "div",
-      "あなた: " + formatTradeBundle(presentation.outgoing) + " → "
-        + formatTradeBundle(presentation.incoming),
+      "あなた: "
+        + formatTradeBundle(presentation.outgoing, presentation.outgoingOperator)
+        + " → "
+        + formatTradeBundle(presentation.incoming, presentation.incomingOperator),
       "trade-live-summary",
     ),
   );
@@ -1186,6 +1188,7 @@ function renderTradeEditor(list, gameState, options) {
       subtitle: ownResourceSummary(gameState, viewerSeat),
       side: presentation.outgoingSide,
       bundle: presentation.outgoing,
+      operator: presentation.outgoingOperator,
       options,
     }),
     buildTradeSideEditor({
@@ -1194,6 +1197,7 @@ function renderTradeEditor(list, gameState, options) {
       subtitle: presentation.counterpartyName + "の手札内訳は非公開",
       side: presentation.incomingSide,
       bundle: presentation.incoming,
+      operator: presentation.incomingOperator,
       options,
     }),
   );
@@ -1213,7 +1217,13 @@ function renderTradeEditor(list, gameState, options) {
     const disabledSubmit = document.createElement("button");
     disabledSubmit.type = "button";
     disabledSubmit.className = "action-button primary-action";
-    disabledSubmit.textContent = "双方1枚以上で提案できます";
+    const receiveChoiceCount = TRADE_RESOURCE_KEYS.filter(
+      (resource) => Number(gameState.domestic_trade?.receive?.[resource]) > 0,
+    ).length;
+    disabledSubmit.textContent =
+      presentation.receiveOperator === "or" && receiveChoiceCount < 2
+        ? "OR候補を2種類以上選択"
+        : "双方1枚以上で提案できます";
     disabledSubmit.disabled = true;
     actions.append(disabledSubmit);
   }
@@ -1236,6 +1246,7 @@ function buildTradeSideEditor({
   subtitle,
   side,
   bundle,
+  operator,
   options,
 }) {
   const card = document.createElement("section");
@@ -1244,6 +1255,10 @@ function buildTradeSideEditor({
   heading.className = "trade-side-title";
   heading.append(textElement("strong", title), textElement("small", subtitle));
   card.append(heading);
+
+  if (side === "receive") {
+    card.append(buildTradeReceiveOperator(operator, options));
+  }
 
   const rows = document.createElement("div");
   rows.className = "trade-resource-list";
@@ -1274,6 +1289,39 @@ function buildTradeSideEditor({
   }
   card.append(rows);
   return card;
+}
+
+function buildTradeReceiveOperator(operator, options) {
+  const wrapper = document.createElement("div");
+  wrapper.className = "trade-operator-control";
+  wrapper.append(textElement("span", "候補の扱い", "trade-operator-label"));
+  const choices = document.createElement("div");
+  choices.className = "trade-operator-choices";
+  for (const [value, label] of [["and", "すべて"], ["or", "どれか1つ（OR）"]]) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = `trade-operator-button${operator === value ? " active" : ""}`;
+    button.textContent = label;
+    button.setAttribute("aria-pressed", operator === value ? "true" : "false");
+    const option = options.find(
+      (candidate) =>
+        candidate.command === "trade_receive_operator"
+        && candidate.args?.operator === value,
+    );
+    button.disabled = operator === value || !option || state.commandPending;
+    if (option) button.addEventListener("click", () => sendGameCommand(option));
+    choices.append(button);
+  }
+  wrapper.append(
+    choices,
+    textElement(
+      "small",
+      operator === "or"
+        ? "承諾する側が、この欄の候補から1種類を選びます。"
+        : "この欄に指定した資源をすべて交換します。",
+    ),
+  );
+  return wrapper;
 }
 
 function findTradeAdjustment(options, side, resource, delta) {
@@ -1341,6 +1389,7 @@ function domesticTradePresentation(gameState, viewerSeat) {
       ? "全員"
       : "相手";
   const proposerSeat = trade.is_counter ? trade.partner : turnSeat;
+  const receiveOperator = trade.receive_operator === "or" ? "or" : "and";
   return {
     turnSeat,
     partnerSeat: Number.isInteger(trade.partner) ? trade.partner : null,
@@ -1354,6 +1403,9 @@ function domesticTradePresentation(gameState, viewerSeat) {
     incomingSide,
     outgoing: trade[outgoingSide] || {},
     incoming: trade[incomingSide] || {},
+    outgoingOperator: outgoingSide === "receive" ? receiveOperator : "and",
+    incomingOperator: incomingSide === "receive" ? receiveOperator : "and",
+    receiveOperator,
     isCounter: Boolean(trade.is_counter),
     isBroadcast: Boolean(trade.is_broadcast),
     broadcastIndex: Number.isInteger(trade.broadcast_index)
@@ -1362,14 +1414,15 @@ function domesticTradePresentation(gameState, viewerSeat) {
   };
 }
 
-function formatTradeBundle(bundle) {
+function formatTradeBundle(bundle, operator = "and") {
   const parts = TRADE_RESOURCE_KEYS.flatMap((resource) => {
     const count = Number(bundle?.[resource]);
     return Number.isInteger(count) && count > 0
       ? [RESOURCE_LABELS[resource] + " " + count]
       : [];
   });
-  return parts.length ? parts.join("・") : "なし";
+  if (!parts.length) return "なし";
+  return parts.join(operator === "or" ? " または " : "・");
 }
 
 function canonicalTradeBundle(bundle) {
@@ -1388,6 +1441,7 @@ function tradeOfferSignature(gameState) {
     Number.isInteger(trade.broadcast_index) ? trade.broadcast_index : -1,
     canonicalTradeBundle(trade.give),
     canonicalTradeBundle(trade.receive),
+    trade.receive_operator === "or" ? "or" : "and",
   ].join("|");
 }
 
@@ -1452,9 +1506,11 @@ function renderIncomingTradePrompt(gameState, options, ownSeat) {
     : presentation.proposerName + "から交易の申し込み";
   elements["trade-prompt-description"].textContent = isHandoff
     ? "あなた宛ての提案です。「提案を見る」で条件と回答操作を表示します。"
-    : "交換する向きを確認して、承諾・拒否・条件変更を選んでください。";
+    : presentation.receiveOperator === "or"
+      ? "OR条件です。実行する資源候補を1つ選んで承諾するか、拒否・条件変更を選んでください。"
+      : "交換する向きを確認して、承諾・拒否・条件変更を選んでください。";
   renderTradePromptTerms(presentation, isHandoff);
-  renderTradePromptActions(options, isHandoff);
+  renderTradePromptActions(options, isHandoff, presentation);
 
   const rulesOpen = !elements["rules-drawer"]?.hidden;
   if (!state.tradePromptDismissed.has(signature) && !rulesOpen) {
@@ -1488,12 +1544,12 @@ function renderTradePromptTerms(presentation, hiddenForHandoff) {
     buildTradeTermCard(
       "outgoing",
       "あなたが渡す",
-      formatTradeBundle(presentation.outgoing),
+      formatTradeBundle(presentation.outgoing, presentation.outgoingOperator),
     ),
     buildTradeTermCard(
       "incoming",
       "あなたが受け取る",
-      formatTradeBundle(presentation.incoming),
+      formatTradeBundle(presentation.incoming, presentation.incomingOperator),
     ),
   );
 }
@@ -1505,7 +1561,7 @@ function buildTradeTermCard(className, label, value) {
   return card;
 }
 
-function renderTradePromptActions(options, isHandoff) {
+function renderTradePromptActions(options, isHandoff, presentation) {
   const container = elements["trade-prompt-actions"];
   container.replaceChildren();
   const allowed = isHandoff
@@ -1518,14 +1574,25 @@ function renderTradePromptActions(options, isHandoff) {
     trade_reject: "今回は拒否",
   };
   for (const command of allowed) {
-    const option = options.find((candidate) => candidate.command === command);
-    if (!option) continue;
-    const button = createActionButton(option, labels[command]);
-    button.addEventListener("click", () => {
-      setTradePromptButtonsDisabled(true);
-      if (command !== "trade_reveal") dismissTradePrompt();
-    });
-    container.append(button);
+    const matching = options.filter((candidate) => candidate.command === command);
+    for (const option of matching) {
+      let label = labels[command];
+      if (command === "trade_accept" && option.args?.resource) {
+        const resource = option.args.resource;
+        const bundle = presentation.outgoingSide === "receive"
+          ? presentation.outgoing
+          : presentation.incoming;
+        const count = Number(bundle?.[resource]) || 1;
+        const direction = presentation.outgoingSide === "receive" ? "渡して" : "受け取って";
+        label = `${RESOURCE_LABELS[resource] || resource}${count}を${direction}承諾`;
+      }
+      const button = createActionButton(option, label);
+      button.addEventListener("click", () => {
+        setTradePromptButtonsDisabled(true);
+        if (command !== "trade_reveal") dismissTradePrompt();
+      });
+      container.append(button);
+    }
   }
 }
 
@@ -2947,6 +3014,8 @@ function renderPlayers(
   const list = elements["player-list"];
   list.replaceChildren();
   const publicPoints = calculatePublicPoints(gameState);
+  const finished = gameState.phase?.name === "finished";
+  const finalScoresAvailable = finished && Array.isArray(state.matchResult?.standings);
   gameState.players.forEach((player, index) => {
     const card = document.createElement("article");
     card.className = `web-player-card${index === activeSeat ? " current" : ""}`;
@@ -2977,7 +3046,31 @@ function renderPlayers(
         ),
       );
     }
-    card.append(color, main, textElement("span", `VP ${publicPoints[index]}`, "player-vp"));
+    card.append(
+      color,
+      main,
+      textElement(
+        "span",
+        `${finalScoresAvailable ? "VP" : "公開VP"} ${publicPoints[index]}`,
+        "player-vp",
+      ),
+    );
+    const awards = [];
+    if (gameState.phase?.longest_road_owner === index) {
+      const length = Number(gameState.phase?.longest_road_length) || 0;
+      awards.push(`最長交易路 +2${length ? `（${length}本）` : ""}`);
+    }
+    if (gameState.phase?.largest_army_owner === index) {
+      const size = Number(gameState.phase?.largest_army_size) || Number(player.played_knights) || 0;
+      awards.push(`最大騎士力 +2${size ? `（騎士${size}枚使用）` : ""}`);
+    }
+    if (awards.length) {
+      const awardList = document.createElement("div");
+      awardList.className = "player-awards";
+      awardList.setAttribute("aria-label", "勝利点ボーナス");
+      awards.forEach((label) => awardList.append(textElement("span", label, "player-award-chip")));
+      card.append(awardList);
+    }
     if (player.resources && typeof player.resources === "object") {
       const strip = document.createElement("div");
       strip.className = "resource-strip";
@@ -3039,6 +3132,7 @@ function renderResultStandings(standings) {
       textElement("strong", `${row.name}${row.is_ai ? `（${aiPersonalityLabel(row.personality)}AI）` : ""}`),
       textElement("small", details),
     );
+    copy.append(createResultVpBreakdown(row));
     item.append(
       textElement("span", `#${row.rank || "—"}`, "result-rank"),
       color,
@@ -3047,6 +3141,71 @@ function renderResultStandings(standings) {
     );
     container.append(item);
   }
+}
+
+function createResultVpBreakdown(row) {
+  const breakdown = row.vp_breakdown || {};
+  const settlements = breakdown.settlements || {
+    count: Number(row.settlements) || 0,
+    points: Number(row.settlements) || 0,
+  };
+  const cities = breakdown.cities || {
+    count: Number(row.cities) || 0,
+    points: (Number(row.cities) || 0) * 2,
+  };
+  const longestRoad = breakdown.longest_road || {
+    awarded: Boolean(row.longest_road),
+    points: row.longest_road ? 2 : 0,
+  };
+  const largestArmy = breakdown.largest_army || {
+    awarded: Boolean(row.largest_army),
+    points: row.largest_army ? 2 : 0,
+  };
+  const visiblePoints =
+    Number(settlements.points || 0)
+    + Number(cities.points || 0)
+    + Number(longestRoad.points || 0)
+    + Number(largestArmy.points || 0);
+  const victoryPointCards = breakdown.victory_point_cards || {
+    count: Math.max(0, Number(row.victory_points || 0) - visiblePoints),
+    points: Math.max(0, Number(row.victory_points || 0) - visiblePoints),
+  };
+  const components = [
+    {
+      label: `開拓地 ${Number(settlements.points) || 0}点（${Number(settlements.count) || 0}軒）`,
+      awarded: Number(settlements.points) > 0,
+    },
+    {
+      label: `都市 ${Number(cities.points) || 0}点（${Number(cities.count) || 0}軒）`,
+      awarded: Number(cities.points) > 0,
+    },
+    {
+      label: `最長交易路 ${Number(longestRoad.points) || 0}点`,
+      awarded: Boolean(longestRoad.awarded),
+      bonus: true,
+    },
+    {
+      label: `最大騎士力 ${Number(largestArmy.points) || 0}点`,
+      awarded: Boolean(largestArmy.awarded),
+      bonus: true,
+    },
+    {
+      label: `勝利点カード ${Number(victoryPointCards.points) || 0}点（${Number(victoryPointCards.count) || 0}枚）`,
+      awarded: Number(victoryPointCards.points) > 0,
+      private: true,
+    },
+  ];
+  const container = document.createElement("div");
+  container.className = "result-vp-breakdown";
+  container.setAttribute("aria-label", `${row.name}の勝利点内訳`);
+  for (const component of components) {
+    const classNames = ["result-vp-chip"];
+    if (component.bonus && component.awarded) classNames.push("award");
+    if (component.private && component.awarded) classNames.push("private");
+    if (!component.awarded) classNames.push("zero");
+    container.append(textElement("span", component.label, classNames.join(" ")));
+  }
+  return container;
 }
 
 function renderResultChart(timeline, standings) {
@@ -3278,9 +3437,6 @@ function calculatePublicPoints(gameState) {
   const phase = gameState.phase || {};
   if (Number.isInteger(phase.longest_road_owner)) points[phase.longest_road_owner] += 2;
   if (Number.isInteger(phase.largest_army_owner)) points[phase.largest_army_owner] += 2;
-  gameState.players.forEach((player, index) => {
-    if (Number.isInteger(player.victory_point_cards)) points[index] += player.victory_point_cards;
-  });
   return points;
 }
 
@@ -3364,7 +3520,9 @@ function commandLabel(option) {
     trade_broadcast: "全員に募集",
     trade_submit: "この条件で提案",
     trade_reveal: "提案を確認",
-    trade_accept: "承諾する",
+    trade_accept: args.resource
+      ? `${RESOURCE_LABELS[args.resource] || args.resource}を選んで承諾`
+      : "承諾する",
     trade_counter: "条件を変更",
     trade_reject: "拒否する",
     finish_road_building: "街道建設を終了",
@@ -3377,6 +3535,9 @@ function commandLabel(option) {
   if (option.command === "steal") return `席${Number(args.seat_index) + 1}から略奪`;
   if (option.command === "trade_partner") return `席${Number(args.seat_index) + 1}と交渉`;
   if (option.command === "trade_edit_side") return args.side === "give" ? "渡す資源を編集" : "受け取る資源を編集";
+  if (option.command === "trade_receive_operator") {
+    return args.operator === "or" ? "この欄をORにする" : "この欄をすべてにする";
+  }
   if (option.command === "trade_adjust") {
     const direction = Number(args.delta) > 0 ? "+" : "−";
     return `${args.side === "give" ? "渡す" : "受取"} ${RESOURCE_LABELS[args.resource] || args.resource} ${direction}1`;

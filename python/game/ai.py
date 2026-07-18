@@ -547,6 +547,42 @@ class SimpleAI:
             return "counter"
         return "reject"
 
+    def choose_domestic_trade_branch(self, player, branches):
+        """Choose one exact branch without treating OR alternatives as additive.
+
+        ``branches`` contains ``(key, incoming, outgoing)`` tuples from the
+        authoritative game.  Decision quality is primary; for equally legal
+        decisions the AI prefers the branch with the best resource-value net.
+        Iteration order remains the final deterministic tie breaker.
+        """
+
+        best = None
+        decision_rank = {"reject": 0, "counter": 1, "accept": 2}
+        for order, (key, incoming, outgoing) in enumerate(branches):
+            decision = self.evaluate_domestic_trade(
+                player,
+                incoming=incoming,
+                outgoing=outgoing,
+            )
+            incoming_value = sum(
+                self._trade_resource_value(player, resource_type) * amount
+                for resource_type, amount in incoming.items()
+            )
+            outgoing_value = sum(
+                self._trade_resource_value(player, resource_type) * amount
+                for resource_type, amount in outgoing.items()
+            )
+            score = (
+                decision_rank.get(decision, 0),
+                incoming_value - outgoing_value,
+                -order,
+            )
+            if best is None or score > best[0]:
+                best = (score, decision, key)
+        if best is None:
+            return "reject", None
+        return best[1], best[2]
+
     @staticmethod
     def _resource_distance(resources, cost):
         return sum(

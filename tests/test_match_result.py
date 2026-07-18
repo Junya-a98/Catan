@@ -168,10 +168,26 @@ def test_replay_summary_builds_rankings_timeline_trade_counts_and_jump_events():
         "trades": {"bank": 1, "domestic": 1},
         "builds": {"roads": 2, "settlements": 2, "cities": 1},
         "luck_index": None,
+        "vp_breakdown": {
+            "settlements": {"count": 1, "points": 1},
+            "cities": {"count": 1, "points": 2},
+            "longest_road": {"awarded": True, "points": 2},
+            "largest_army": {"awarded": False, "points": 0},
+            "victory_point_cards": {"count": 1, "points": 1},
+            "total": 6,
+        },
     }
     assert bob["rank"] == 2
     assert bob["victory_points"] == 4
     assert bob["largest_army"] is True
+    assert bob["vp_breakdown"] == {
+        "settlements": {"count": 2, "points": 2},
+        "cities": {"count": 0, "points": 0},
+        "longest_road": {"awarded": False, "points": 0},
+        "largest_army": {"awarded": True, "points": 2},
+        "victory_point_cards": {"count": 0, "points": 0},
+        "total": 4,
+    }
     assert bob["trades"] == {"bank": 0, "domestic": 1}
 
     assert [entry["replay_frame_index"] for entry in result["vp_progression"]] == [0, 1, 4]
@@ -276,6 +292,38 @@ def test_replay_archive_objects_are_supported_without_importing_replay_module():
     assert result["important_events"][-1]["replay_frame_index"] == 4
 
 
+def test_unfinished_results_never_reveal_victory_point_card_breakdowns():
+    replay = {
+        "frames": [
+            {
+                "sequence": 0,
+                "snapshot": _snapshot(player1_cards=2),
+            }
+        ]
+    }
+
+    result = build_match_result(replay)
+
+    assert result["completed"] is False
+    assert all("vp_breakdown" not in row for row in result["standings"])
+
+
+def test_inconsistent_legacy_total_omits_impossible_breakdown():
+    replay = _replay_document()
+    metrics = {
+        "completed": True,
+        "winner_seat": 1,
+        "players": [{"seat": 1, "victory_points": 1}],
+    }
+    game = SimpleNamespace(match_metrics=metrics, replay_archive=replay)
+
+    result = build_match_result(game)
+
+    alice = next(row for row in result["standings"] if row["seat"] == 1)
+    assert alice["victory_points"] == 1
+    assert "vp_breakdown" not in alice
+
+
 def test_live_game_fallback_needs_no_pygame_or_replay_and_is_read_only():
     first = SimpleNamespace(
         name="Human",
@@ -323,6 +371,14 @@ def test_live_game_fallback_needs_no_pygame_or_replay_and_is_read_only():
     cpu = result["standings"][0]
     assert cpu["victory_points"] == 9  # 3 settlements + city + 2 hidden + army
     assert (cpu["roads"], cpu["settlements"], cpu["cities"]) == (4, 3, 1)
+    assert cpu["vp_breakdown"] == {
+        "settlements": {"count": 3, "points": 3},
+        "cities": {"count": 1, "points": 2},
+        "longest_road": {"awarded": False, "points": 0},
+        "largest_army": {"awarded": True, "points": 2},
+        "victory_point_cards": {"count": 2, "points": 2},
+        "total": 9,
+    }
     assert result["vp_progression"][0]["replay_frame_index"] is None
     assert result["important_events"][0]["replay_frame_index"] is None
     assert game.__dict__ == before

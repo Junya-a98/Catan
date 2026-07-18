@@ -123,6 +123,7 @@ _PUBLIC_STANDING_FIELDS = frozenset(
         "played_knights",
         "longest_road",
         "largest_army",
+        "vp_breakdown",
         "trades",
         "builds",
         "luck_index",
@@ -677,6 +678,11 @@ def _assert_snapshot_privacy(
                 "private_state_leak",
                 "提示前の交易条件を含むスナップショットは保存できません。",
             )
+    if domestic_trade.get("receive_operator", "and") != "and":
+        raise NetworkReplayError(
+            "private_state_leak",
+            "提示前のOR交易条件を含むスナップショットは保存できません。",
+        )
 
 
 def _spectator_snapshot(snapshot: Mapping[str, Any]) -> dict[str, Any]:
@@ -701,6 +707,7 @@ def _spectator_snapshot(snapshot: Mapping[str, Any]) -> dict[str, Any]:
             bundle = domestic_trade.get(field)
             if isinstance(bundle, dict):
                 domestic_trade[field] = {key: 0 for key in bundle}
+        domestic_trade["receive_operator"] = "and"
     return result
 
 
@@ -804,7 +811,35 @@ def _public_standing(value: Mapping[str, Any]) -> dict[str, Any]:
             for key, item in builds.items()
             if key in {"roads", "settlements", "cities"}
         }
+    breakdown = standing.get("vp_breakdown")
+    if isinstance(breakdown, Mapping):
+        standing["vp_breakdown"] = _public_vp_breakdown(breakdown)
     return standing
+
+
+def _public_vp_breakdown(value: Mapping[str, Any]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key in (
+        "settlements",
+        "cities",
+        "longest_road",
+        "largest_army",
+        "victory_point_cards",
+    ):
+        component = value.get(key)
+        if not isinstance(component, Mapping):
+            continue
+        allowed = {"count", "points"}
+        if key in {"longest_road", "largest_army"}:
+            allowed = {"awarded", "points"}
+        result[key] = {
+            nested_key: deepcopy(item)
+            for nested_key, item in component.items()
+            if nested_key in allowed
+        }
+    if "total" in value:
+        result["total"] = deepcopy(value["total"])
+    return result
 
 
 def _public_timeline_entry(value: Mapping[str, Any]) -> dict[str, Any]:

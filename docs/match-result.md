@@ -6,7 +6,7 @@
 - `game.match_result`: ゲーム状態とリプレイから公開用のversion付きJSONを生成
 - `game.result_display`: JSONをPygameで表示し、クリック位置だけをゲーム本体へ返す
 
-この境界により、将来のWeb版やLAN対戦では同じリザルトJSONをHTTP / WebSocketで送り、ブラウザ側だけ別の表示実装に置き換えられます。非公開の手札や発展カード内訳はリザルトJSONへ含めません。
+この境界により、Web版やLAN対戦では同じリザルトJSONをHTTP / WebSocketで送り、ブラウザ側だけ別の表示実装に置き換えられます。対局中の手札や発展カード内訳は含めません。対局終了後に公開情報となる勝利点カードの枚数だけは、最終VPの説明に必要なため `vp_breakdown` へ含めます。
 
 ## リザルト形式
 
@@ -26,6 +26,14 @@
       "seat": 2,
       "name": "CPU1",
       "victory_points": 10,
+      "vp_breakdown": {
+        "settlements": {"count": 2, "points": 2},
+        "cities": {"count": 2, "points": 4},
+        "longest_road": {"awarded": true, "points": 2},
+        "largest_army": {"awarded": false, "points": 0},
+        "victory_point_cards": {"count": 2, "points": 2},
+        "total": 10
+      },
       "builds": {"roads": 9, "settlements": 4, "cities": 3},
       "trades": {"bank": 2, "domestic": 4},
       "luck_index": 108.4
@@ -54,6 +62,8 @@
 フィールドはJSON安全な値だけで構成されます。受信側は未知の追加フィールドを無視し、`format` と `version` を確認してから利用してください。
 
 `sequence` は対局内の意味的な時系列、`replay_frame_index` はリプレイへのジャンプ位置です。セーブ地点から再開した場合など、対応する過去リプレイがない項目は `replay_frame_index: null` のまま `sequence` で正しい順序を保ちます。プレイヤーの計測IDには表示名ではなく `seat-1`〜`seat-4` を使い、改名・再接続後も同じ席を追跡します。
+
+`vp_breakdown` の開拓地・都市は累積建設数ではなく、最終盤面に残っている駒から計算します。最長交易路と最大騎士力は獲得者だけ2点、勝利点カードは最終総点から公開得点を差し引いて復元し、古いリプレイでも総点と内訳が一致するようにします。
 
 ## 運指数
 

@@ -147,9 +147,9 @@ class _HeadlessCatanGame(game_module.CatanGame):
             self._count_action(proposer, "domestic_trade_offers")
         return result
 
-    def execute_domestic_trade(self):
+    def execute_domestic_trade(self, selected_resource=None):
         proposer = self.get_current_player()
-        result = super().execute_domestic_trade()
+        result = super().execute_domestic_trade(selected_resource)
         if result:
             self._count_action(proposer, "domestic_trades_completed")
         return result

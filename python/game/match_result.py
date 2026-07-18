@@ -60,6 +60,14 @@ def build_match_result(game: Any = None, *, replay: Any = None) -> dict[str, Any
 
     winner_seat = _winner_seat(metrics, final_snapshot, game, standings)
     winner_name = _winner_name(metrics, winner_seat, standings)
+    completed_value = _metric_value(metrics, "completed")
+    completed = (
+        bool(completed_value)
+        if completed_value is not None
+        else winner_seat is not None
+    )
+    if completed:
+        _attach_vp_breakdowns(standings)
     standings = _rank_standings(standings, winner_seat)
 
     metric_timeline = _metric_value(
@@ -89,13 +97,6 @@ def build_match_result(game: Any = None, *, replay: Any = None) -> dict[str, Any
 
     board_mode, board_seed = _board_identity(final_snapshot, game, replay)
     victory_target = _victory_target(final_snapshot, game, replay, metrics)
-    completed_value = _metric_value(metrics, "completed")
-    completed = (
-        bool(completed_value)
-        if completed_value is not None
-        else winner_seat is not None
-    )
-
     source = "match_metrics" if metrics else ("replay" if frames else "game")
     return {
         "format": MATCH_RESULT_FORMAT,
@@ -505,6 +506,63 @@ def _fill_cumulative_build_fallbacks(standings: list[dict[str, Any]]) -> None:
             builds["settlements"] = row["settlements"] + row["cities"]
         if builds["cities"] is None:
             builds["cities"] = row["cities"]
+
+
+def _attach_vp_breakdowns(standings: list[dict[str, Any]]) -> None:
+    """Expose the complete score composition only in the post-match result.
+
+    ``settlements`` and ``cities`` are the pieces currently on the board, not
+    the cumulative build counters.  The remaining points are victory-point
+    cards: the base game and the forecast-events variant have no other hidden
+    score source.  A redacted legacy snapshot without an authoritative final
+    total cannot reconstruct cards that were never recorded, so it safely
+    reports only the points present in that source.
+    """
+
+    for row in standings:
+        settlement_count = _integer(row.get("settlements"), 0, minimum=0)
+        city_count = _integer(row.get("cities"), 0, minimum=0)
+        settlement_points = settlement_count
+        city_points = city_count * 2
+        longest_road_points = 2 if row.get("longest_road") else 0
+        largest_army_points = 2 if row.get("largest_army") else 0
+        public_points = (
+            settlement_points
+            + city_points
+            + longest_road_points
+            + largest_army_points
+        )
+        total = _integer(row.get("victory_points"), public_points, minimum=0)
+        if public_points > total:
+            # Metric adapters are deliberately permissive, but publishing a
+            # mathematically impossible breakdown is worse than omitting the
+            # optional explanation for that malformed legacy row.
+            row.pop("vp_breakdown", None)
+            continue
+        victory_point_cards = max(0, total - public_points)
+        row["vp_breakdown"] = {
+            "settlements": {
+                "count": settlement_count,
+                "points": settlement_points,
+            },
+            "cities": {
+                "count": city_count,
+                "points": city_points,
+            },
+            "longest_road": {
+                "awarded": bool(row.get("longest_road")),
+                "points": longest_road_points,
+            },
+            "largest_army": {
+                "awarded": bool(row.get("largest_army")),
+                "points": largest_army_points,
+            },
+            "victory_point_cards": {
+                "count": victory_point_cards,
+                "points": victory_point_cards,
+            },
+            "total": total,
+        }
 
 
 def _metric_rows(value: Any) -> list[Any]:

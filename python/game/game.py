@@ -1859,6 +1859,7 @@ class CatanGame:
         self.domestic_trade_receive = {
             resource_type: 0 for resource_type in RESOURCE_TYPES
         }
+        self.domestic_trade_receive_operator = "and"
         self.domestic_trade_edit_side = "give"
         self.domestic_trade_editor = None
         self.domestic_trade_is_counter = False
@@ -1871,6 +1872,7 @@ class CatanGame:
         self.domestic_trade_broadcast_receive = {
             resource_type: 0 for resource_type in RESOURCE_TYPES
         }
+        self.domestic_trade_broadcast_receive_operator = "and"
         self.domestic_trade_broadcast_viewer = None
 
     def clear_player_handoff_state(self):
@@ -3709,13 +3711,23 @@ class CatanGame:
 
     def get_domestic_trade_summary(self):
         give = self.format_resource_bundle(self.domestic_trade_give)
-        receive = self.format_resource_bundle(self.domestic_trade_receive)
+        receive = self.format_domestic_trade_receive()
         return f"渡す {give} / 欲しい {receive}"
 
     def get_domestic_trade_compact_summary(self):
         give = self.format_resource_bundle(self.domestic_trade_give)
-        receive = self.format_resource_bundle(self.domestic_trade_receive)
+        receive = self.format_domestic_trade_receive()
         return f"{give} → {receive}"
+
+    def format_domestic_trade_receive(self):
+        if self.domestic_trade_receive_operator != "or":
+            return self.format_resource_bundle(self.domestic_trade_receive)
+        choices = [
+            f"{RESOURCE_LABELS[resource_type]}{amount}"
+            for resource_type in RESOURCE_TYPES
+            if (amount := self.domestic_trade_receive.get(resource_type, 0)) > 0
+        ]
+        return " または ".join(choices) if choices else "なし"
 
     def get_domestic_trade_broadcast_progress(self):
         total = len(self.domestic_trade_broadcast_responders)
@@ -3887,6 +3899,16 @@ class CatanGame:
         self.domestic_trade_edit_side = side
         return True
 
+    def set_domestic_trade_receive_operator(self, operator):
+        if (
+            self.special_phase != "domestic_trade_edit"
+            or operator not in ("and", "or")
+            or operator == self.domestic_trade_receive_operator
+        ):
+            return False
+        self.domestic_trade_receive_operator = operator
+        return True
+
     def get_domestic_trade_quantity_limit(self, side, resource_type):
         active_player = self.get_current_player()
         editor = self.domestic_trade_editor
@@ -3924,12 +3946,65 @@ class CatanGame:
             for resource_type, amount in bundle.items()
         )
 
+    def get_domestic_trade_receive_branches(self):
+        """Return stable, exact receive bundles for the current offer.
+
+        ``and`` keeps the legacy bundle intact.  ``or`` treats every positive
+        resource row as a separate alternative; the accepting player must
+        explicitly select one of those rows before any cards move.
+        """
+
+        if self.domestic_trade_receive_operator == "and":
+            return [(None, dict(self.domestic_trade_receive))]
+        return [
+            (
+                resource_type,
+                {
+                    candidate: (
+                        self.domestic_trade_receive[resource_type]
+                        if candidate is resource_type
+                        else 0
+                    )
+                    for candidate in RESOURCE_TYPES
+                },
+            )
+            for resource_type in RESOURCE_TYPES
+            if self.domestic_trade_receive.get(resource_type, 0) > 0
+        ]
+
+    def get_domestic_trade_receive_bundle(self, selected_resource=None):
+        if self.domestic_trade_receive_operator == "and":
+            return (
+                dict(self.domestic_trade_receive)
+                if selected_resource is None
+                else None
+            )
+        if selected_resource not in RESOURCE_TYPES:
+            return None
+        amount = self.domestic_trade_receive.get(selected_resource, 0)
+        if amount <= 0:
+            return None
+        return {
+            resource_type: amount if resource_type is selected_resource else 0
+            for resource_type in RESOURCE_TYPES
+        }
+
     def validate_domestic_trade_terms(self):
         if (
             sum(self.domestic_trade_give.values()) <= 0
             or sum(self.domestic_trade_receive.values()) <= 0
         ):
             return False, "国内交易では双方が1枚以上の資源を渡す必要があります。"
+        if self.domestic_trade_receive_operator not in ("and", "or"):
+            return False, "受け取り条件の結合方法が不正です。"
+        if (
+            self.domestic_trade_receive_operator == "or"
+            and sum(
+                amount > 0 for amount in self.domestic_trade_receive.values()
+            )
+            < 2
+        ):
+            return False, "OR条件では欲しい資源を2種類以上指定してください。"
         if any(
             self.domestic_trade_give[resource_type] > 0
             and self.domestic_trade_receive[resource_type] > 0
@@ -3946,22 +4021,49 @@ class CatanGame:
             return False, f"{editor.name} が持っている枚数を超えています。"
         return True, ""
 
-    def can_execute_domestic_trade(self):
+    def can_execute_domestic_trade(self, selected_resource=None):
         active_player = self.get_current_player()
         partner = self.domestic_trade_partner
+        receive_bundle = self.get_domestic_trade_receive_bundle(
+            selected_resource
+        )
         return bool(
             active_player is not None
             and partner is not None
+            and receive_bundle is not None
             and self.player_can_pay_bundle(active_player, self.domestic_trade_give)
-            and self.player_can_pay_bundle(partner, self.domestic_trade_receive)
+            and self.player_can_pay_bundle(partner, receive_bundle)
         )
 
     def restore_domestic_trade_broadcast_terms(self):
         self.domestic_trade_give = dict(self.domestic_trade_broadcast_give)
         self.domestic_trade_receive = dict(self.domestic_trade_broadcast_receive)
+        self.domestic_trade_receive_operator = (
+            self.domestic_trade_broadcast_receive_operator
+        )
         self.domestic_trade_is_counter = False
         self.domestic_trade_editor = self.get_current_player()
         self.domestic_trade_edit_side = "give"
+
+    def evaluate_ai_domestic_trade_branches(self, player, *, responding_partner):
+        branches = []
+        for selected_resource, receive_bundle in (
+            self.get_domestic_trade_receive_branches()
+        ):
+            if not self.can_execute_domestic_trade(selected_resource):
+                continue
+            incoming = (
+                self.domestic_trade_give
+                if responding_partner
+                else receive_bundle
+            )
+            outgoing = (
+                receive_bundle
+                if responding_partner
+                else self.domestic_trade_give
+            )
+            branches.append((selected_resource, incoming, outgoing))
+        return self.ai.choose_domestic_trade_branch(player, branches)
 
     def advance_domestic_trade_broadcast(self):
         if not self.domestic_trade_is_broadcast:
@@ -4019,15 +4121,20 @@ class CatanGame:
                 actor=partner,
             )
             if active_player.is_ai:
-                decision = self.ai.evaluate_domestic_trade(
-                    active_player,
-                    incoming=self.domestic_trade_receive,
-                    outgoing=self.domestic_trade_give,
+                decision, selected_resource = (
+                    self.evaluate_ai_domestic_trade_branches(
+                        active_player,
+                        responding_partner=False,
+                    )
                 )
-                if decision == "accept" and self.can_execute_domestic_trade():
-                    return self.execute_domestic_trade()
+                if (
+                    decision == "accept"
+                    and self.can_execute_domestic_trade(selected_resource)
+                ):
+                    return self.execute_domestic_trade(selected_resource)
                 return self.reject_domestic_trade(
-                    active_player, "変更条件を受け入れませんでした"
+                    active_player,
+                    "変更条件を受け入れませんでした",
                 )
             self.special_phase = "domestic_trade_counter_handoff"
             return True
@@ -4035,6 +4142,9 @@ class CatanGame:
         if self.domestic_trade_is_broadcast:
             self.domestic_trade_broadcast_give = dict(self.domestic_trade_give)
             self.domestic_trade_broadcast_receive = dict(self.domestic_trade_receive)
+            self.domestic_trade_broadcast_receive_operator = (
+                self.domestic_trade_receive_operator
+            )
             self.add_log(f"{active_player.name} が全員に交易を募集: {summary}")
             self.record_event(
                 f"{active_player.name}が全員に交易を募集",
@@ -4067,14 +4177,26 @@ class CatanGame:
     def resolve_ai_domestic_trade_response(self):
         partner = self.domestic_trade_partner
         active_player = self.get_current_player()
-        decision = self.ai.evaluate_domestic_trade(
+        decision, selected_resource = self.evaluate_ai_domestic_trade_branches(
             partner,
-            incoming=self.domestic_trade_give,
-            outgoing=self.domestic_trade_receive,
+            responding_partner=True,
         )
-        if decision == "accept" and self.can_execute_domestic_trade():
-            return self.execute_domestic_trade()
+        if (
+            decision == "accept"
+            and self.can_execute_domestic_trade(selected_resource)
+        ):
+            return self.execute_domestic_trade(selected_resource)
         if decision == "counter":
+            if selected_resource is not None:
+                selected_bundle = self.get_domestic_trade_receive_bundle(
+                    selected_resource
+                )
+                if selected_bundle is None:
+                    return self.reject_domestic_trade(
+                        partner, "提案を拒否しました"
+                    )
+                self.domestic_trade_receive = selected_bundle
+                self.domestic_trade_receive_operator = "and"
             counter = self.ai.build_domestic_trade_counter(
                 active_player,
                 partner,
@@ -4137,21 +4259,26 @@ class CatanGame:
         self.special_phase = "domestic_trade_edit"
         return True
 
-    def accept_domestic_trade(self):
+    def accept_domestic_trade(self, selected_resource=None):
         if self.special_phase not in (
             "domestic_trade_response",
             "domestic_trade_counter_response",
         ):
             return False
-        if not self.can_execute_domestic_trade():
+        if not self.can_execute_domestic_trade(selected_resource):
             self.notify_invalid(
                 "どちらかの手札が条件を満たさないため、この交易は成立しません。"
             )
             return False
-        return self.execute_domestic_trade()
+        return self.execute_domestic_trade(selected_resource)
 
-    def execute_domestic_trade(self):
-        if not self.can_execute_domestic_trade():
+    def execute_domestic_trade(self, selected_resource=None):
+        if not self.can_execute_domestic_trade(selected_resource):
+            return False
+        receive_bundle = self.get_domestic_trade_receive_bundle(
+            selected_resource
+        )
+        if receive_bundle is None:
             return False
         previous_viewer = (
             self.domestic_trade_broadcast_viewer
@@ -4161,18 +4288,18 @@ class CatanGame:
         active_player = self.get_current_player()
         partner = self.domestic_trade_partner
         give_text = self.format_resource_bundle(self.domestic_trade_give)
-        receive_text = self.format_resource_bundle(self.domestic_trade_receive)
+        receive_text = self.format_resource_bundle(receive_bundle)
         for resource_type, amount in self.domestic_trade_give.items():
             if amount <= 0:
                 continue
             active_player.remove_resource(resource_type, amount)
             partner.add_resource(resource_type, amount)
-        for resource_type, amount in self.domestic_trade_receive.items():
+        for resource_type, amount in receive_bundle.items():
             if amount <= 0:
                 continue
             partner.remove_resource(resource_type, amount)
             active_player.add_resource(resource_type, amount)
-        self.record_public_gain(active_player, self.domestic_trade_receive, "国内交易")
+        self.record_public_gain(active_player, receive_bundle, "国内交易")
         self.record_public_gain(partner, self.domestic_trade_give, "国内交易")
         self.play_sound("card")
         self.add_log(
@@ -5049,6 +5176,12 @@ class CatanGame:
                 self.add_log(
                     f"最大騎士力: {candidates[0].name} が獲得 ({max_knights} 枚)"
                 )
+                self.record_event(
+                    f"{candidates[0].name}が最大騎士力を獲得",
+                    f"騎士{max_knights}枚使用・2 VP",
+                    level="success",
+                    actor=candidates[0],
+                )
             return
 
         self.largest_army_owner = None
@@ -5699,6 +5832,12 @@ class CatanGame:
             if previous_owner != candidates[0]:
                 self.add_log(
                     f"最長交易路: {candidates[0].name} が獲得 ({max_length} 本)"
+                )
+                self.record_event(
+                    f"{candidates[0].name}が最長交易路を獲得",
+                    f"連続{max_length}本・2 VP",
+                    level="success",
+                    actor=candidates[0],
                 )
             return
 

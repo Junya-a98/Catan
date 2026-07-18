@@ -34,6 +34,7 @@ SUPPORTED_GAME_COMMANDS = frozenset(
         "trade_partner",
         "trade_broadcast",
         "trade_edit_side",
+        "trade_receive_operator",
         "trade_adjust",
         "trade_submit",
         "trade_reveal",
@@ -64,6 +65,7 @@ _GAME_COMMAND_OPTION_ORDER = (
     "trade_partner",
     "trade_broadcast",
     "trade_edit_side",
+    "trade_receive_operator",
     "trade_adjust",
     "trade_submit",
     "trade_reveal",
@@ -103,7 +105,6 @@ _EMPTY_ARGS_COMMANDS = frozenset(
         "trade_broadcast",
         "trade_submit",
         "trade_reveal",
-        "trade_accept",
         "trade_counter",
         "trade_reject",
         "finish_road_building",
@@ -465,6 +466,16 @@ def _domestic_trade_options(
             for side in ("give", "receive")
             if side != edit_side
         )
+        receive_operator = getattr(
+            game,
+            "domestic_trade_receive_operator",
+            "and",
+        )
+        options.extend(
+            _command_option("trade_receive_operator", operator=operator)
+            for operator in ("and", "or")
+            if operator != receive_operator
+        )
         give = getattr(game, "domestic_trade_give", {})
         receive = getattr(game, "domestic_trade_receive", {})
         for side, bundle, other_bundle in (
@@ -508,8 +519,7 @@ def _domestic_trade_options(
     ):
         options.append(_command_option("trade_reveal"))
     elif special_phase == "domestic_trade_response":
-        if game.can_execute_domestic_trade():
-            options.append(_command_option("trade_accept"))
+        options.extend(_domestic_trade_accept_options(game))
         options.extend(
             (
                 _command_option("trade_counter"),
@@ -517,14 +527,27 @@ def _domestic_trade_options(
             )
         )
     elif special_phase == "domestic_trade_counter_response":
-        if game.can_execute_domestic_trade():
-            options.append(_command_option("trade_accept"))
+        options.extend(_domestic_trade_accept_options(game))
         options.append(_command_option("trade_reject"))
 
     # Every domestic-trade sub-phase is cancellable by the active editor or
     # responder, including the reveal gates retained for compatibility.
     options.append(_command_option("cancel"))
     return options
+
+
+def _domestic_trade_accept_options(game: Any) -> list[dict[str, Any]]:
+    if getattr(game, "domestic_trade_receive_operator", "and") == "and":
+        return (
+            [_command_option("trade_accept")]
+            if game.can_execute_domestic_trade()
+            else []
+        )
+    return [
+        _command_option("trade_accept", resource=resource.name)
+        for resource, _bundle in game.get_domestic_trade_receive_branches()
+        if resource is not None and game.can_execute_domestic_trade(resource)
+    ]
 
 
 def _board_target_options(
@@ -707,6 +730,8 @@ def _dispatch(game: Any, command: str, args: dict[str, Any]) -> None:
         game.select_domestic_trade_broadcast()
     elif command == "trade_edit_side":
         _trade_edit_side(game, args)
+    elif command == "trade_receive_operator":
+        _trade_receive_operator(game, args)
     elif command == "trade_adjust":
         _trade_adjust(game, args)
     elif command == "trade_submit":
@@ -714,7 +739,7 @@ def _dispatch(game: Any, command: str, args: dict[str, Any]) -> None:
     elif command == "trade_reveal":
         _trade_reveal(game)
     elif command == "trade_accept":
-        _trade_accept(game)
+        _trade_accept(game, args)
     elif command == "trade_counter":
         _require_phase(game, "domestic_trade_response")
         game.begin_domestic_trade_counter()
@@ -963,6 +988,18 @@ def _trade_edit_side(game: Any, args: dict[str, Any]) -> None:
     game.set_domestic_trade_edit_side(side)
 
 
+def _trade_receive_operator(game: Any, args: dict[str, Any]) -> None:
+    _expect_fields(args, "operator")
+    _require_phase(game, "domestic_trade_edit")
+    operator = args["operator"]
+    if operator not in ("and", "or"):
+        raise NetworkActionError("invalid_args", "OR条件の指定が不正です。")
+    if operator == getattr(game, "domestic_trade_receive_operator", "and"):
+        raise NetworkActionError("no_state_change", "既にその条件です。")
+    if not game.set_domestic_trade_receive_operator(operator):
+        _not_allowed("受け取り条件を変更できません。")
+
+
 def _trade_adjust(game: Any, args: dict[str, Any]) -> None:
     _expect_fields(args, "side", "resource", "delta")
     _require_phase(game, "domestic_trade_edit")
@@ -996,15 +1033,22 @@ def _trade_reveal(game: Any) -> None:
         _not_allowed("交易回答画面へ進めませんでした。")
 
 
-def _trade_accept(game: Any) -> None:
+def _trade_accept(game: Any, args: dict[str, Any]) -> None:
     if getattr(game, "special_phase", None) not in (
         "domestic_trade_response",
         "domestic_trade_counter_response",
     ):
         _not_allowed("現在は交易を承諾できません。")
-    if not game.can_execute_domestic_trade():
+    operator = getattr(game, "domestic_trade_receive_operator", "and")
+    if operator == "and":
+        _expect_fields(args)
+        selected_resource = None
+    else:
+        _expect_fields(args, "resource")
+        selected_resource = _resource_from_name(args["resource"])
+    if not game.can_execute_domestic_trade(selected_resource):
         _not_allowed("現在の手札では交易条件を満たせません。")
-    game.accept_domestic_trade()
+    game.accept_domestic_trade(selected_resource)
 
 
 def _use_development(game: Any, args: dict[str, Any]) -> None:

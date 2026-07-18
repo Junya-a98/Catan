@@ -531,6 +531,7 @@ def build_state_snapshot(game, *, viewer_player_index=None, revision=0):
             bundle = domestic_trade.get(field)
             if isinstance(bundle, dict):
                 domestic_trade[field] = {key: 0 for key in bundle}
+        domestic_trade["receive_operator"] = "and"
 
     # Checkpoints use true VP totals for the local post-game graph.  Those
     # totals include unrevealed VP development cards, and historic checkpoints
