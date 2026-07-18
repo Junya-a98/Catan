@@ -1,10 +1,13 @@
 import os
+import random
 
 os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
 os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
 
 import pygame
 
+from game import game as game_module
+from game.ai_personality import get_ai_personality_profile
 from game.building import Building, BuildingType
 from game.game import CatanGame
 from game.resources import BUILD_COSTS, ResourceType
@@ -37,7 +40,11 @@ def test_ai_configuration_marks_last_players_as_cpu():
         close_game(game)
 
 
-def test_mixed_ai_mode_assigns_distinct_personalities_and_can_be_cycled():
+def test_mixed_ai_mode_assigns_secret_distinct_personalities_and_can_be_cycled(
+    monkeypatch,
+):
+    private_seeds = iter((0, 1))
+    monkeypatch.setattr(game_module.secrets, "randbits", lambda _bits: next(private_seeds))
     game = create_game(ai_player_count=1)
     try:
         assert game.set_ai_personality_mode("mixed") is True
@@ -47,9 +54,21 @@ def test_mixed_ai_mode_assigns_distinct_personalities_and_can_be_cycled():
         assert [player.ai_personality for player in game.players] == [
             "standard",
             "expansion",
-            "trader",
             "disruptor",
+            "trader",
         ]
+        gameplay_random_state = random.getstate()
+        game.assign_ai_personalities()
+        assert random.getstate() == gameplay_random_state
+        first_cpu = game.players[1]
+        assert game.get_player_ai_personality_label(first_cpu) == (
+            get_ai_personality_profile(first_cpu.ai_personality).label
+        )
+        assert game.get_public_player_ai_personality_label(first_cpu) == "性格非公開"
+        game.set_ai_status(first_cpu, "配置候補を比較", log=True)
+        assert game.log_messages[-1] == (
+            "CPU1（性格非公開）の判断: 配置候補を比較"
+        )
         buttons = {button.action: button for button in game.build_buttons()}
         assert buttons["ai_personality_cycle"].label == "性格 混合"
 
@@ -62,6 +81,18 @@ def test_mixed_ai_mode_assigns_distinct_personalities_and_can_be_cycled():
             if player.is_ai
         )
         assert "AI 3人（拡大重視）" in game.get_board_configuration_summary()
+
+        assert game.set_ai_personality_mode("mixed") is True
+        previous_lineup = [
+            player.ai_personality for player in game.players if player.is_ai
+        ]
+        game.restart_game(randomize_seed=False)
+        assert [
+            player.ai_personality for player in game.players if player.is_ai
+        ] == ["trader", "disruptor", "expansion"]
+        assert [
+            player.ai_personality for player in game.players if player.is_ai
+        ] != previous_lineup
     finally:
         close_game(game)
 

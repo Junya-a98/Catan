@@ -342,6 +342,48 @@ def test_replay_rejects_an_already_filtered_snapshot_with_variant_private_data()
     assert error.value.code == "private_state_leak"
 
 
+def test_replay_rejects_mixed_ai_personality_leaks():
+    player_leak = snapshot(0, 0)
+    player_leak["state"]["players"][1].update(
+        {"is_ai": True, "ai_personality": "trader"}
+    )
+    player_leak["state"]["ai"] = {
+        "personality_mode": "mixed",
+        "status": {
+            "player_name": "Bob",
+            "personality": None,
+            "title": "判断中",
+        },
+    }
+
+    with pytest.raises(NetworkReplayError) as player_error:
+        NetworkReplayStore().record_snapshot("MIX001", player_leak)
+
+    assert player_error.value.code == "private_state_leak"
+
+    status_leak = copy.deepcopy(player_leak)
+    status_leak["state"]["players"][1]["ai_personality"] = None
+    status_leak["state"]["ai"]["status"]["personality"] = "trader"
+    with pytest.raises(NetworkReplayError) as status_error:
+        NetworkReplayStore().record_snapshot("MIX002", status_leak)
+
+    assert status_error.value.code == "private_state_leak"
+
+    safe = copy.deepcopy(status_leak)
+    safe["state"]["players"][1]["ai_personality"] = None
+    safe["state"]["ai"]["status"]["personality"] = None
+    NetworkReplayStore().record_snapshot("MIX003", safe)
+
+    text_leak = copy.deepcopy(safe)
+    text_leak["state"]["history"]["log_messages"] = [
+        "Bob（交渉重視）の判断: 交易条件を評価"
+    ]
+    with pytest.raises(NetworkReplayError) as text_error:
+        NetworkReplayStore().record_snapshot("MIX004", text_leak)
+
+    assert text_error.value.code == "private_state_leak"
+
+
 def test_bounded_history_relinks_events_and_vp_progression_to_retained_frames():
     clock = Clock()
     store = NetworkReplayStore(max_frames=2, clock=clock)

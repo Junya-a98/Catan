@@ -1,6 +1,7 @@
 from collections.abc import Mapping
 from dataclasses import asdict, replace
 import random
+import secrets
 
 import pygame
 
@@ -239,6 +240,7 @@ class CatanGame:
         self.ai = SimpleAI()
         self.ai_player_count = max(0, int(ai_player_count))
         self.ai_personality_mode = normalize_ai_personality_mode(ai_personality_mode)
+        self._mixed_ai_personality_seed = secrets.randbits(128)
         self.ai_action_delay_ms = max(0, int(ai_action_delay_ms))
         timed_speed_indices = [
             index
@@ -907,16 +909,26 @@ class CatanGame:
             normalize_ai_personality(getattr(player, "ai_personality", STANDARD))
         ].label
 
+    def get_public_player_ai_personality_label(self, player):
+        """Return the in-match label without revealing a mixed AI profile."""
+        if player is None or not player.is_ai:
+            return ""
+        if self.ai_personality_mode == MIXED:
+            return "性格非公開"
+        return self.get_player_ai_personality_label(player)
+
     def assign_ai_personalities(self):
         """Apply the selected pre-game personality mode without rebuilding seats."""
+        mixed_personalities = list(MIXED_AI_PERSONALITIES)
+        random.Random(self._mixed_ai_personality_seed).shuffle(mixed_personalities)
         cpu_index = 0
         for player in self.players:
             if not player.is_ai:
                 player.ai_personality = STANDARD
                 continue
             if self.ai_personality_mode == MIXED:
-                personality = MIXED_AI_PERSONALITIES[
-                    cpu_index % len(MIXED_AI_PERSONALITIES)
+                personality = mixed_personalities[
+                    cpu_index % len(mixed_personalities)
                 ]
             else:
                 personality = normalize_ai_personality(self.ai_personality_mode)
@@ -968,7 +980,7 @@ class CatanGame:
         }
         if log and previous != (player.name, title):
             suffix = f" — {detail}" if detail else ""
-            personality_label = self.get_player_ai_personality_label(player)
+            personality_label = self.get_public_player_ai_personality_label(player)
             self.add_log(f"{player.name}（{personality_label}）の判断: {title}{suffix}")
 
     def record_public_gain(self, player, bundle, source):
@@ -1774,6 +1786,10 @@ class CatanGame:
 
     def restart_game(self, *, randomize_seed=False):
         player_count = len(self.players) or 2
+        # A completed result reveals the previous lineup.  Rotate the private
+        # seed before rebuilding so the next mixed match cannot be inferred
+        # from that reveal, without consuming the gameplay RNG.
+        self._mixed_ai_personality_seed = secrets.randbits(128)
         if randomize_seed:
             self.board_seed = self.generate_board_seed()
             if self.board_mode == "custom":
@@ -2646,7 +2662,7 @@ class CatanGame:
             title = f"{tracker_title} — {actor.name}"
         elif actor.is_ai:
             title = (
-                f"{actor.name}（{self.get_player_ai_personality_label(actor)}）の手番"
+                f"{actor.name}（{self.get_public_player_ai_personality_label(actor)}）の手番"
             )
         else:
             title = f"あなたの手番 — {actor.name}"
@@ -2732,7 +2748,9 @@ class CatanGame:
                 secondary = (
                     detail or "盤面・公開情報・自分の手札から合法手を比較します。"
                 )
-                personality_label = self.get_player_ai_personality_label(active_ai)
+                personality_label = self.get_public_player_ai_personality_label(
+                    active_ai
+                )
                 return [
                     f"{active_ai.name}（{personality_label}）: {status_title}",
                     secondary,
@@ -6287,6 +6305,7 @@ class CatanGame:
                 for player in self.players
             },
             victory_point_target=self.victory_point_target,
+            hide_ai_personalities=self.ai_personality_mode == MIXED,
         )
         if self.replay_mode:
             tracker_title, tracker_subtitle, tracker_steps = (

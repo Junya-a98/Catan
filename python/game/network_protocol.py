@@ -5,6 +5,7 @@ import math
 import re
 import struct
 
+from game.ai_personality import AI_PERSONALITY_PROFILES, MIXED
 from game.custom_map import CustomMapError, CustomMapSpec
 from game.persistence import serialize_game
 from game.variant import VariantConfig
@@ -39,6 +40,52 @@ _FRAME_HEADER = struct.Struct("!I")
 _GAME_COMMAND_PATTERN = re.compile(
     rf"[a-z][a-z0-9_]{{0,{MAX_GAME_COMMAND_NAME_LENGTH - 1}}}\Z"
 )
+
+
+def _mixed_ai_identity_patterns(players):
+    aliases = sorted(
+        {
+            value
+            for profile in AI_PERSONALITY_PROFILES.values()
+            for value in (profile.key, profile.label)
+            if value
+        },
+        key=len,
+        reverse=True,
+    )
+    alias_pattern = "|".join(re.escape(alias) for alias in aliases)
+    patterns = []
+    for player in players:
+        if not isinstance(player, Mapping) or not player.get("is_ai"):
+            continue
+        name = player.get("name")
+        if not isinstance(name, str) or not name:
+            continue
+        patterns.append(
+            re.compile(
+                rf"(?P<ai_name>{re.escape(name)})(?:（|\()\s*(?:{alias_pattern})(?:AI)?\s*(?:）|\))"
+            )
+        )
+    return tuple(patterns)
+
+
+def _redact_mixed_ai_identity_strings(value, patterns):
+    """Remove legacy personality labels from every public text surface."""
+    if isinstance(value, str):
+        for pattern in patterns:
+            value = pattern.sub(
+                lambda match: f"{match.group('ai_name')}（AI）",
+                value,
+            )
+        return value
+    if isinstance(value, list):
+        for index, item in enumerate(value):
+            value[index] = _redact_mixed_ai_identity_strings(item, patterns)
+        return value
+    if isinstance(value, dict):
+        for key, item in value.items():
+            value[key] = _redact_mixed_ai_identity_strings(item, patterns)
+    return value
 
 
 class NetworkProtocolError(ValueError):
@@ -429,6 +476,12 @@ def build_state_snapshot(game, *, viewer_player_index=None, revision=0):
         maximum=MAX_SAFE_JSON_INTEGER,
     )
 
+    ai_state = state.get("ai")
+    hide_mixed_personalities = (
+        isinstance(ai_state, dict)
+        and ai_state.get("personality_mode") == MIXED
+    )
+
     for index, player in enumerate(state["players"]):
         resources = player["resources"]
         development_cards = player["development_cards"]
@@ -439,12 +492,30 @@ def build_state_snapshot(game, *, viewer_player_index=None, revision=0):
             + sum(new_development_cards.values())
             + player["victory_point_cards"]
         )
+        if hide_mixed_personalities and player.get("is_ai"):
+            # Keep the authority's assigned profile intact.  Only the public
+            # projection is redacted, including finished/replay snapshots; the
+            # completed match result is the sole reveal boundary.
+            player["ai_personality"] = None
         if index == viewer_player_index:
             continue
         player["resources"] = None
         player["development_cards"] = None
         player["new_development_cards"] = None
         player["victory_point_cards"] = None
+
+    if hide_mixed_personalities:
+        ai_status = ai_state.get("status")
+        if isinstance(ai_status, dict):
+            ai_status["personality"] = None
+        # Old saves and non-headless authority logs may already contain text
+        # such as ``CPU1（拡大重視）の判断``.  Mixed profiles remain private in
+        # every live/finished/replay snapshot, so scrub those derived strings
+        # as well as the structured personality fields.
+        _redact_mixed_ai_identity_strings(
+            state,
+            _mixed_ai_identity_patterns(state["players"]),
+        )
 
     phase = state.get("phase", {})
     domestic_trade = state.get("domestic_trade")

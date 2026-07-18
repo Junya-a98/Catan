@@ -22,6 +22,7 @@ import threading
 import time
 from typing import Any
 
+from game.ai_personality import AI_PERSONALITY_PROFILES, MIXED
 from game.match_result import build_match_result
 
 
@@ -41,6 +42,52 @@ _PRIVATE_PLAYER_FIELDS = (
     "new_development_cards",
     "victory_point_cards",
 )
+
+
+def _mixed_ai_identity_patterns(
+    players: Sequence[Any],
+) -> tuple[re.Pattern[str], ...]:
+    aliases = sorted(
+        {
+            value
+            for profile in AI_PERSONALITY_PROFILES.values()
+            for value in (profile.key, profile.label)
+            if value
+        },
+        key=len,
+        reverse=True,
+    )
+    alias_pattern = "|".join(re.escape(alias) for alias in aliases)
+    return tuple(
+        re.compile(
+            rf"{re.escape(name)}(?:（|\()\s*(?:{alias_pattern})(?:AI)?\s*(?:）|\))"
+        )
+        for player in players
+        if isinstance(player, Mapping)
+        and player.get("is_ai")
+        and isinstance((name := player.get("name")), str)
+        and name
+    )
+
+
+def _contains_mixed_ai_identity(
+    value: Any,
+    patterns: Sequence[re.Pattern[str]],
+) -> bool:
+    if isinstance(value, str):
+        return any(pattern.search(value) is not None for pattern in patterns)
+    if isinstance(value, Mapping):
+        return any(
+            _contains_mixed_ai_identity(item, patterns) for item in value.values()
+        )
+    if isinstance(value, Sequence) and not isinstance(
+        value,
+        (str, bytes, bytearray),
+    ):
+        return any(_contains_mixed_ai_identity(item, patterns) for item in value)
+    return False
+
+
 _PUBLIC_VARIANT_STATE_FIELDS = frozenset(
     {"format", "version", "kind", "config_fingerprint", "public"}
 )
@@ -555,9 +602,24 @@ def _assert_snapshot_privacy(
                 "invalid_snapshot", "variant_stateの公開文書が不正です。"
             )
 
+    ai_state = state.get("ai")
+    mixed_personalities_are_private = (
+        isinstance(ai_state, Mapping)
+        and ai_state.get("personality_mode") == MIXED
+    )
+
     for index, raw_player in enumerate(players):
         if not isinstance(raw_player, Mapping):
             raise NetworkReplayError("invalid_snapshot", "プレイヤー状態が不正です。")
+        if (
+            mixed_personalities_are_private
+            and raw_player.get("is_ai")
+            and raw_player.get("ai_personality") is not None
+        ):
+            raise NetworkReplayError(
+                "private_state_leak",
+                "混合AIの非公開性格を含むスナップショットは保存できません。",
+            )
         if index == viewer_player_index:
             continue
         leaked = [
@@ -569,6 +631,25 @@ def _assert_snapshot_privacy(
             raise NetworkReplayError(
                 "private_state_leak",
                 "他プレイヤーの非公開情報を含むスナップショットは保存できません。",
+            )
+
+    if mixed_personalities_are_private:
+        ai_status = ai_state.get("status")
+        if (
+            isinstance(ai_status, Mapping)
+            and ai_status.get("personality") is not None
+        ):
+            raise NetworkReplayError(
+                "private_state_leak",
+                "混合AIの非公開性格を含む実況状態は保存できません。",
+            )
+        if _contains_mixed_ai_identity(
+            state,
+            _mixed_ai_identity_patterns(players),
+        ):
+            raise NetworkReplayError(
+                "private_state_leak",
+                "混合AIの非公開性格を含む表示文は保存できません。",
             )
 
     development_deck = state.get("development_deck")

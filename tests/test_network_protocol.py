@@ -28,6 +28,7 @@ from game.network_protocol import (
     build_state_snapshot,
     encode_frame,
 )
+from game.network_replay import NetworkReplayStore
 from game.resources import ResourceType
 from game.road import Road
 
@@ -90,6 +91,110 @@ def test_spectator_snapshot_hides_every_players_private_cards(game):
 
     assert all(player["resources"] is None for player in snapshot["state"]["players"])
     assert [player["resource_total"] for player in snapshot["state"]["players"]] == [2, 3, 0]
+
+
+def test_mixed_ai_personalities_are_private_until_the_match_result():
+    mixed_game = CatanGame(
+        board_seed=9191,
+        ai_player_count=2,
+        ai_personality_mode="mixed",
+        headless=True,
+    )
+    mixed_game.ai_player_count = 2
+    mixed_game.configure_players(3, reset_logs=False)
+    authority_ai = [
+        player for player in mixed_game.players if player.is_ai
+    ]
+    authority_personalities = [
+        player.ai_personality for player in authority_ai
+    ]
+    assert len(authority_personalities) == 2
+    assert len(set(authority_personalities)) == 2
+    assert set(authority_personalities) <= {
+        "expansion",
+        "trader",
+        "disruptor",
+    }
+    mixed_game.set_ai_status(
+        authority_ai[0],
+        "初期ダイス",
+        "配置順を評価しています。",
+    )
+    mixed_game.log_messages = [
+        f"{authority_ai[0].name}（拡大重視）の判断: 初期配置を評価"
+    ]
+    mixed_game.latest_event = {
+        "title": f"{authority_ai[1].name}（trader）の判断",
+        "detail": "交渉条件を評価しています。",
+        "level": "info",
+        "color": (0, 0, 0),
+    }
+
+    for viewer in (0, None):
+        snapshot = build_state_snapshot(
+            mixed_game,
+            viewer_player_index=viewer,
+            revision=4,
+        )
+        assert snapshot["state"]["ai"]["personality_mode"] == "mixed"
+        assert [
+            player["ai_personality"]
+            for player in snapshot["state"]["players"]
+            if player["is_ai"]
+        ] == [None, None]
+        assert snapshot["state"]["ai"]["status"]["personality"] is None
+        history = snapshot["state"]["history"]
+        assert history["log_messages"] == [
+            f"{authority_ai[0].name}（AI）の判断: 初期配置を評価"
+        ]
+        assert history["latest_event"]["title"] == (
+            f"{authority_ai[1].name}（AI）の判断"
+        )
+        assert "拡大重視" not in str(snapshot)
+        assert "（trader）" not in str(snapshot)
+
+    replay_store = NetworkReplayStore(max_frames=2)
+    replay_store.capture_game("MIXRES", mixed_game, revision=4)
+    mixed_game.phase = "finished"
+    mixed_game.winner = mixed_game.players[0]
+    finished = build_state_snapshot(
+        mixed_game,
+        viewer_player_index=0,
+        revision=5,
+    )
+    assert [
+        player["ai_personality"]
+        for player in finished["state"]["players"]
+        if player["is_ai"]
+    ] == [None, None]
+    assert [
+        player.ai_personality for player in authority_ai
+    ] == authority_personalities
+    replay_store.capture_game("MIXRES", mixed_game, revision=5)
+    for frame_index in (0, 1):
+        frame = replay_store.frame_payload(
+            "MIXRES",
+            viewer_player_index=0,
+            frame_index=frame_index,
+        )
+        assert [
+            player["ai_personality"]
+            for player in frame["snapshot"]["state"]["players"]
+            if player["is_ai"]
+        ] == [None, None]
+    result = replay_store.result_payload(
+        "MIXRES",
+        viewer_player_index=0,
+    )["result"]
+    authority_by_name = {
+        player.name: player.ai_personality for player in authority_ai
+    }
+    result_by_name = {
+        row["name"]: row["personality"]
+        for row in result["standings"]
+        if row["is_ai"]
+    }
+    assert result_by_name == authority_by_name
 
 
 def test_variant_state_is_public_only_for_players_and_spectators(

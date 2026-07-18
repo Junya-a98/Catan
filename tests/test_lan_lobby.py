@@ -143,7 +143,7 @@ def test_ai_seats_are_public_ready_members_and_only_humans_consume_connections()
             "ready": True,
             "reservation_seconds_remaining": None,
             "is_ai": True,
-            "ai_personality": "expansion",
+            "ai_personality": None,
         },
         {
             "display_name": "CPU2",
@@ -153,7 +153,7 @@ def test_ai_seats_are_public_ready_members_and_only_humans_consume_connections()
             "ready": True,
             "reservation_seconds_remaining": None,
             "is_ai": True,
-            "ai_personality": "trader",
+            "ai_personality": None,
         },
     ]
 

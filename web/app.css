@@ -1654,6 +1654,133 @@ body.modal-open {
   background: rgba(5, 18, 27, 0.55);
 }
 
+.development-inventory {
+  grid-column: 2 / -1;
+  min-width: 0;
+  overflow: hidden;
+  border: 1px solid rgba(116, 211, 201, 0.24);
+  border-radius: 10px;
+  background: rgba(5, 18, 27, 0.42);
+}
+
+.development-inventory > summary {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  gap: 7px;
+  align-items: center;
+  min-height: 38px;
+  padding: 7px 10px;
+  color: #dce8ee;
+  font-size: 11px;
+  font-weight: 850;
+  list-style: none;
+  cursor: pointer;
+}
+
+.development-inventory > summary::-webkit-details-marker {
+  display: none;
+}
+
+.development-inventory > summary::before {
+  color: var(--gold-strong);
+  content: "▸";
+  transition: transform 160ms ease;
+}
+
+.development-inventory[open] > summary::before {
+  transform: rotate(90deg);
+}
+
+.development-inventory > summary:hover {
+  background: rgba(116, 211, 201, 0.08);
+}
+
+.development-inventory > summary:focus-visible {
+  outline: 2px solid var(--gold-strong);
+  outline-offset: -2px;
+}
+
+.development-inventory-count {
+  color: var(--gold-strong);
+}
+
+.development-inventory-body {
+  display: grid;
+  padding: 0 10px 10px;
+  gap: 8px;
+}
+
+.development-inventory-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(132px, 1fr));
+  gap: 6px;
+}
+
+.development-inventory-group {
+  min-width: 0;
+  padding: 8px;
+  border: 1px solid rgba(159, 191, 207, 0.13);
+  border-radius: 8px;
+  background: rgba(23, 55, 74, 0.58);
+}
+
+.development-inventory-group > strong,
+.development-inventory-group > small {
+  display: block;
+}
+
+.development-inventory-group > strong {
+  font-size: 10px;
+}
+
+.development-inventory-group > small {
+  margin-top: 2px;
+  color: var(--muted);
+  font-size: 9px;
+  line-height: 1.4;
+}
+
+.development-inventory-group.new {
+  border-color: rgba(244, 195, 93, 0.3);
+}
+
+.development-inventory-group.private {
+  border-color: rgba(190, 145, 230, 0.3);
+}
+
+.development-card-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 6px;
+}
+
+.development-card-chip,
+.development-card-empty {
+  overflow-wrap: anywhere;
+  font-size: 9px;
+  line-height: 1.35;
+}
+
+.development-card-chip {
+  padding: 3px 5px;
+  color: #e6f3f3;
+  font-weight: 800;
+  border-radius: 5px;
+  background: rgba(5, 18, 27, 0.62);
+}
+
+.development-card-empty {
+  color: var(--muted);
+}
+
+.development-inventory-privacy {
+  margin: 0;
+  color: #8de4d4;
+  font-size: 9px;
+  line-height: 1.4;
+}
+
 .event-panel h2 {
   margin-top: 0;
   font-size: 16px;
@@ -2275,6 +2402,10 @@ noscript {
   .trade-editor-grid,
   .trade-prompt-terms,
   .trade-prompt-actions {
+    grid-template-columns: 1fr;
+  }
+
+  .development-inventory-grid {
     grid-template-columns: 1fr;
   }
 

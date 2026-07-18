@@ -8,6 +8,7 @@ import pytest
 
 from game import game as game_module
 from game.game import CatanGame
+from game.log_display import player_card_role_label
 from game.resources import ResourceType
 
 
@@ -37,6 +38,30 @@ def game_factory():
 def give_from_bank(game, player, resource_type, amount):
     assert game.bank.withdraw(resource_type, amount)
     player.add_resource(resource_type, amount)
+
+
+def test_mixed_ai_player_card_uses_generic_role_until_result(game_factory):
+    game = game_factory(ai_player_count=1)
+    cpu = game.players[-1]
+    cpu.ai_personality = "disruptor"
+
+    assert player_card_role_label(cpu) == "妨害"
+    assert player_card_role_label(cpu, hide_ai_personalities=True) == "AI"
+
+    game.ai_personality_mode = "mixed"
+    captured = {}
+
+    def capture_resources(*args, **kwargs):
+        captured["hide_ai_personalities"] = kwargs["hide_ai_personalities"]
+
+    original_draw_resource_counts = game_module.draw_resource_counts
+    game_module.draw_resource_counts = capture_resources
+    try:
+        game.render()
+    finally:
+        game_module.draw_resource_counts = original_draw_resource_counts
+
+    assert captured == {"hide_ai_personalities": True}
 
 
 def test_normal_human_turn_handoff_hides_private_panels_until_reveal(game_factory, monkeypatch):

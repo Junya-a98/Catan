@@ -608,6 +608,7 @@ class LobbyRoom:
 
     def _public_ai_members(self) -> list[dict[str, Any]]:
         personalities = self._ai_personality_lineup()
+        hide_lineup = self.settings.ai_personality_mode == MIXED
         return [
             {
                 "display_name": f"CPU{cpu_index}",
@@ -617,7 +618,9 @@ class LobbyRoom:
                 "ready": True,
                 "reservation_seconds_remaining": None,
                 "is_ai": True,
-                "ai_personality": personality,
+                # The selected mode is public, but a mixed lineup is meant to
+                # be inferred from play and revealed only in the match result.
+                "ai_personality": None if hide_lineup else personality,
             }
             for cpu_index, (seat, personality) in enumerate(
                 zip(

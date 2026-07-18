@@ -16,6 +16,10 @@ class FakeElement {
     this.textContent = "";
     this.hidden = false;
     this.disabled = false;
+    this.focusCalls = [];
+    this.scrollCalls = [];
+    this.children = [];
+    this.listeners = new Map();
     this.classList = {
       add() {},
       remove() {},
@@ -34,12 +38,16 @@ class FakeElement {
     });
   }
 
-  addEventListener() {}
-  append() {}
-  replaceChildren() {}
+  addEventListener(type, listener) {
+    const listeners = this.listeners.get(type) || [];
+    listeners.push(listener);
+    this.listeners.set(type, listeners);
+  }
+  append(...children) { this.children.push(...children); }
+  replaceChildren(...children) { this.children = [...children]; }
   setAttribute() {}
-  focus() {}
-  scrollIntoView() {}
+  focus(options) { this.focusCalls.push(options); }
+  scrollIntoView(options) { this.scrollCalls.push(options); }
   remove() {}
 }
 
@@ -79,7 +87,10 @@ function loadAnimationFunctions() {
     clearTimeout() {},
     confirm: () => true,
     matchMedia: () => ({ matches: false }),
-    requestAnimationFrame() {},
+    requestAnimationFrame(callback) {
+      if (typeof callback === "function") callback();
+      return 1;
+    },
     scrollTo() {},
     setInterval: () => 0,
     setTimeout: () => 0,
@@ -115,6 +126,18 @@ function loadAnimationFunctions() {
     domesticTradePresentation,
     tradeOfferSignature,
     formatTradeBundle,
+    commandOptionsForView,
+    showLiveSnapshot,
+    sendGameCommand,
+    developmentCardInventoryPresentation,
+    createDevelopmentCardInventory,
+    resetRoomState,
+    personalityModeForView,
+    publicAIPersonalityLabel,
+    lobbyAIMemberDescription,
+    playerIdentityLabel,
+    aiCommentaryHeading,
+    elements,
     audioCalls: globalThis.__audioCalls,
   };`, sandbox, { filename: "web/app.js" });
   return sandbox.__animationTest;
@@ -169,8 +192,45 @@ function resetAnimationState() {
   animation.state.welcome = null;
   animation.state.replayIndex = null;
   animation.state.currentView = null;
+  animation.state.replayPlaying = false;
+  animation.state.replayTimer = null;
+  animation.state.replayRequestPending = false;
+  animation.state.replayExpectedIndex = null;
+  animation.state.replayRequestGeneration = 0;
+  animation.state.replayManifest = null;
+  animation.state.commandPending = false;
+  animation.state.nextSequence = 0;
+  animation.state.developmentInventoryOpen = null;
+  animation.elements["board-shell"].focusCalls.length = 0;
+  animation.elements["board-shell"].scrollCalls.length = 0;
   animation.clearPendingBoardAnimations();
   animation.audioCalls.length = 0;
+}
+
+function replayFrameEvent(index, revision = 70 + index) {
+  return {
+    type: "network_replay_frame",
+    room_code: "ROOM01",
+    snapshot: snapshot(revision),
+    controls: {
+      frame_index: index,
+      revision,
+      label: "frame " + index,
+    },
+  };
+}
+
+function armReplayFrame(index) {
+  animation.state.welcome = { room_code: "ROOM01" };
+  animation.state.replayRequestPending = true;
+  animation.state.replayExpectedIndex = index;
+}
+
+function deliverReplayFrame(event, batch = [event]) {
+  armReplayFrame(event.controls.frame_index);
+  animation.processEvents(batch, { animateLive: false });
+  animation.state.replayRequestPending = false;
+  animation.state.replayExpectedIndex = null;
 }
 
 test("board diff finds only newly built roads, settlements, and city upgrades", () => {
@@ -263,10 +323,13 @@ test("bootstrap and replay updates are baselines, while a live revision queues o
 
   resetAnimationState();
   animation.processEvents([previous], { animateLive: false });
+  const historicalSnapshot = animation.state.snapshot;
   animation.state.replayIndex = 0;
   animation.processEvents([next]);
   assert.equal(animation.state.pendingBuildAnimations.size, 0);
   assert.equal(animation.state.pendingDiceAnimation, null);
+  assert.equal(animation.state.snapshot, historicalSnapshot);
+  assert.equal(animation.state.liveSnapshot, next);
 
   resetAnimationState();
   animation.processEvents([previous], { animateLive: false });
@@ -280,6 +343,115 @@ test("bootstrap and replay updates are baselines, while a live revision queues o
   const secondPlan = animation.takePendingBoardAnimations(next);
   assert.equal(secondPlan.buildKeys.size, 0);
   assert.equal(secondPlan.dice, null);
+});
+
+test("replay entry focuses once while later frames preserve the viewport", () => {
+  resetAnimationState();
+  animation.state.replayManifest = {
+    frame_count: 3,
+    frames: [null, null, null],
+  };
+  const board = animation.elements["board-shell"];
+  const first = replayFrameEvent(0);
+  deliverReplayFrame(first, [first, first]);
+  assert.equal(board.focusCalls.length, 1);
+  assert.equal(board.scrollCalls.length, 1);
+  assert.equal(board.scrollCalls[0].block, "center");
+
+  deliverReplayFrame(replayFrameEvent(1));
+  animation.state.replayPlaying = true;
+  deliverReplayFrame(replayFrameEvent(2));
+  deliverReplayFrame(replayFrameEvent(2));
+  assert.equal(board.focusCalls.length, 1);
+  assert.equal(board.scrollCalls.length, 1);
+});
+
+test("explicit live return and a later replay entry may focus once again", () => {
+  resetAnimationState();
+  animation.state.replayManifest = {
+    frame_count: 2,
+    frames: [null, null],
+  };
+  const board = animation.elements["board-shell"];
+  const historical = replayFrameEvent(0, 80);
+  deliverReplayFrame(historical);
+  assert.equal(board.scrollCalls.length, 1);
+
+  const live = snapshot(99);
+  animation.state.liveSnapshot = live;
+  animation.state.replayPlaying = true;
+  animation.showLiveSnapshot();
+  assert.equal(animation.state.replayIndex, null);
+  assert.equal(animation.state.snapshot, live);
+  assert.equal(animation.state.replayPlaying, false);
+  assert.equal(board.scrollCalls.length, 2);
+
+  deliverReplayFrame(historical);
+  assert.equal(board.scrollCalls.length, 3);
+  deliverReplayFrame(replayFrameEvent(1, 81));
+  assert.equal(board.scrollCalls.length, 3);
+});
+
+test("a late replay response cannot undo explicit live return", () => {
+  resetAnimationState();
+  animation.state.replayManifest = {
+    frame_count: 2,
+    frames: [null, null],
+  };
+  const board = animation.elements["board-shell"];
+  deliverReplayFrame(replayFrameEvent(0, 80));
+  const live = snapshot(99);
+  animation.state.liveSnapshot = live;
+
+  armReplayFrame(1);
+  const late = replayFrameEvent(1, 81);
+  animation.showLiveSnapshot();
+  const scrollsAfterLive = board.scrollCalls.length;
+  animation.processEvents([late], { animateLive: false });
+
+  assert.equal(animation.state.replayIndex, null);
+  assert.equal(animation.state.snapshot, live);
+  assert.equal(animation.state.replayRequestPending, false);
+  assert.equal(board.scrollCalls.length, scrollsAfterLive);
+});
+
+test("a replay response from a room that was reset is ignored", () => {
+  resetAnimationState();
+  animation.state.replayManifest = {
+    frame_count: 2,
+    frames: [null, null],
+  };
+  armReplayFrame(1);
+  const late = replayFrameEvent(1, 81);
+
+  animation.resetRoomState(false);
+  animation.processEvents([late], { animateLive: false });
+
+  assert.equal(animation.state.welcome, null);
+  assert.equal(animation.state.snapshot, null);
+  assert.equal(animation.state.replayIndex, null);
+  assert.equal(animation.state.replayRequestPending, false);
+  assert.equal(animation.elements["board-shell"].scrollCalls.length, 0);
+});
+
+test("replay suppresses options and stale command submission", async () => {
+  resetAnimationState();
+  const actionable = snapshot(90);
+  actionable.command_options = [
+    { command: "roll_dice", args: {} },
+  ];
+  assert.equal(animation.commandOptionsForView(actionable).length, 1);
+
+  animation.state.snapshot = actionable;
+  animation.state.replayIndex = 0;
+  animation.state.nextSequence = 7;
+  assert.deepEqual(
+    Array.from(animation.commandOptionsForView(actionable)),
+    [],
+  );
+  await animation.sendGameCommand(actionable.command_options[0]);
+  assert.equal(animation.state.commandPending, false);
+  assert.equal(animation.state.nextSequence, 7);
 });
 
 test("dice pip layouts contain exactly the displayed face value", () => {
@@ -429,6 +601,236 @@ test("trade offer identity ignores handoff phase but changes for counter or next
   assert.notEqual(animation.tradeOfferSignature(gameState), nextResponder);
 });
 
+function developmentPlayer(overrides = {}) {
+  return {
+    development_card_total: 0,
+    development_cards: {
+      KNIGHT: 0,
+      ROAD_BUILDING: 0,
+      YEAR_OF_PLENTY: 0,
+      MONOPOLY: 0,
+    },
+    new_development_cards: {
+      KNIGHT: 0,
+      ROAD_BUILDING: 0,
+      YEAR_OF_PLENTY: 0,
+      MONOPOLY: 0,
+    },
+    victory_point_cards: 0,
+    ...overrides,
+  };
+}
+
+function descendantText(element) {
+  if (!element || typeof element !== "object") return "";
+  return [
+    element.textContent || "",
+    ...(element.children || []).map(descendantText),
+  ].join(" ");
+}
+
+test("own development inventory groups usable, new, and private victory cards", () => {
+  const player = developmentPlayer({
+    development_card_total: 4,
+    development_cards: {
+      KNIGHT: 2,
+      ROAD_BUILDING: 0,
+      YEAR_OF_PLENTY: 0,
+      MONOPOLY: 0,
+    },
+    new_development_cards: {
+      KNIGHT: 0,
+      ROAD_BUILDING: 0,
+      YEAR_OF_PLENTY: 0,
+      MONOPOLY: 1,
+    },
+    victory_point_cards: 1,
+  });
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(
+      animation.developmentCardInventoryPresentation(player, true),
+    )),
+    {
+      visible: true,
+      total: 4,
+      empty: false,
+      usable: [{ key: "KNIGHT", label: "騎士", count: 2 }],
+      newlyPurchased: [{ key: "MONOPOLY", label: "独占", count: 1 }],
+      victoryPoints: 1,
+    },
+  );
+});
+
+test("development inventory renders privately and preserves its toggle", () => {
+  resetAnimationState();
+  const player = developmentPlayer({
+    development_cards: {
+      KNIGHT: 1,
+      ROAD_BUILDING: 0,
+      YEAR_OF_PLENTY: 0,
+      MONOPOLY: 0,
+    },
+  });
+  const own = animation.createDevelopmentCardInventory(player, true);
+  assert.equal(own.id, "details");
+  assert.equal(own.className, "development-inventory");
+  assert.equal(own.open, true);
+  assert.match(descendantText(own), /使用候補/);
+  assert.match(descendantText(own), /騎士 ×1/);
+  assert.match(descendantText(own), /あなたにだけ表示/);
+  assert.equal(
+    animation.createDevelopmentCardInventory(player, false),
+    null,
+  );
+
+  own.open = false;
+  for (const listener of own.listeners.get("toggle") || []) listener();
+  const rerendered = animation.createDevelopmentCardInventory(player, true);
+  assert.equal(rerendered.open, false);
+
+  animation.resetRoomState(false);
+  assert.equal(animation.state.developmentInventoryOpen, null);
+});
+
+test("own zero-card inventory remains available with a clear empty state", () => {
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(
+      animation.developmentCardInventoryPresentation(
+        developmentPlayer(),
+        true,
+      ),
+    )),
+    {
+      visible: true,
+      total: 0,
+      empty: true,
+      usable: [],
+      newlyPurchased: [],
+      victoryPoints: 0,
+    },
+  );
+  const rendered = animation.createDevelopmentCardInventory(
+    developmentPlayer(),
+    true,
+  );
+  assert.equal(rendered.open, false);
+  assert.match(descendantText(rendered), /所持なし/);
+});
+
+test("development contents stay hidden from opponents and malformed viewers", () => {
+  const privatePlayer = developmentPlayer({
+    development_cards: {
+      KNIGHT: 1,
+      ROAD_BUILDING: 0,
+      YEAR_OF_PLENTY: 0,
+      MONOPOLY: 0,
+    },
+  });
+  assert.equal(
+    animation.developmentCardInventoryPresentation(
+      privatePlayer,
+      false,
+    ).visible,
+    false,
+  );
+  assert.equal(
+    animation.developmentCardInventoryPresentation(
+      {
+        ...privatePlayer,
+        development_cards: null,
+        new_development_cards: null,
+        victory_point_cards: null,
+      },
+      true,
+    ).visible,
+    false,
+  );
+  assert.equal(
+    animation.developmentCardInventoryPresentation(
+      {
+        ...privatePlayer,
+        development_cards: {
+          ...privatePlayer.development_cards,
+          KNIGHT: -1,
+        },
+      },
+      true,
+    ).visible,
+    false,
+  );
+});
+
+test("mixed AI identities stay hidden until result presentation", () => {
+  assert.equal(
+    animation.publicAIPersonalityLabel("mixed", "expansion"),
+    null,
+  );
+  assert.equal(
+    animation.lobbyAIMemberDescription(
+      { ai_personality: null },
+      "mixed",
+    ),
+    "AI · 性格は対局後に公開 · サーバー管理",
+  );
+  assert.equal(
+    animation.playerIdentityLabel(
+      {
+        name: "CPU1",
+        marker: "◆",
+        is_ai: true,
+        ai_personality: null,
+      },
+      "mixed",
+    ),
+    "◆ CPU1・AI",
+  );
+  assert.equal(
+    animation.aiCommentaryHeading(
+      {
+        player_name: "CPU1",
+        personality: null,
+        title: "建設候補を評価",
+      },
+      "mixed",
+    ),
+    "CPU1: 建設候補を評価",
+  );
+  assert.equal(
+    animation.publicAIPersonalityLabel("expansion", "expansion"),
+    "拡大重視",
+  );
+
+  animation.state.lobby = {
+    settings: { ai_personality_mode: "mixed" },
+  };
+  const legacyMode = animation.personalityModeForView({ ai: {} });
+  assert.equal(legacyMode, "mixed");
+  assert.equal(
+    animation.playerIdentityLabel(
+      {
+        name: "CPU2",
+        marker: "▲",
+        is_ai: true,
+        ai_personality: "trader",
+      },
+      legacyMode,
+    ),
+    "▲ CPU2・AI",
+  );
+  assert.equal(
+    animation.aiCommentaryHeading(
+      {
+        player_name: "CPU2",
+        personality: "trader",
+        title: "交易候補を評価",
+      },
+      legacyMode,
+    ),
+    "CPU2: 交易候補を評価",
+  );
+  animation.state.lobby = null;
+});
+
 test("room creation sends canonical standard and forecast variant documents", () => {
   assert.deepEqual(
     JSON.parse(JSON.stringify(animation.variantConfigDocument("standard"))),
@@ -528,6 +930,26 @@ test("rules, trade prompt, two-column editor, and responsive audio controls are 
   assert.match(cssSource, /\.trade-editor-grid\s*\{[\s\S]*grid-template-columns:\s*repeat\(auto-fit/);
   assert.match(cssSource, /@media \(hover: none\), \(pointer: coarse\)[\s\S]*\.trade-adjust-button/);
   assert.match(appSource, /state\.replayIndex === null[\s\S]*viewer_player_index === ownSeat/);
+});
+
+test("development inventory is accessible, private, and responsive", () => {
+  assert.match(appSource, /document\.createElement\("details"\)/);
+  assert.match(
+    appSource,
+    /index === ownSeat && index === snapshotViewerSeat/,
+  );
+  assert.match(
+    cssSource,
+    /\.development-inventory > summary:focus-visible/,
+  );
+  assert.match(
+    cssSource,
+    /\.development-inventory-grid\s*\{[\s\S]*repeat\(auto-fit, minmax\(132px, 1fr\)\)/,
+  );
+  assert.match(
+    cssSource,
+    /@media \(max-width: 440px\)[\s\S]*\.development-inventory-grid\s*\{[\s\S]*grid-template-columns:\s*1fr/,
+  );
 });
 
 test("animation CSS includes bounce, halo, dice landing, and reduced-motion overrides", () => {

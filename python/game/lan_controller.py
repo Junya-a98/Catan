@@ -19,6 +19,7 @@ import secrets
 import threading
 from typing import Any, Callable, Mapping
 
+from game.ai_personality import DISRUPTOR, EXPANSION, MIXED, TRADER
 from game.game import CatanGame
 from game.lan_lobby import (
     ROOM_CODE_ALPHABET,
@@ -57,6 +58,8 @@ MAX_CONNECTION_ID_LENGTH = 128
 MAX_AI_STEPS_PER_TICK = 8
 DEFAULT_AI_STEPS_PER_TICK = 1
 _RANDOM_LOCK = threading.RLock()
+_MIXED_AI_PERSONALITIES = (EXPANSION, TRADER, DISRUPTOR)
+_MIXED_AI_SEED_SALT = 0x4D49584544
 
 
 class LanControllerError(ValueError):
@@ -145,6 +148,26 @@ def _default_game_factory(
     game.clear_log()
     game.add_log("LAN対戦を開始しました。")
     return game
+
+
+def _assign_private_mixed_ai_personalities(
+    game: Any,
+    settings: RoomSettings,
+    match_seed: int,
+) -> None:
+    """Assign a stable secret mixed lineup without changing match RNG."""
+
+    if settings.ai_personality_mode != MIXED:
+        return
+    ai_players = [
+        player
+        for player in getattr(game, "players", ())
+        if getattr(player, "is_ai", False)
+    ]
+    personalities = list(_MIXED_AI_PERSONALITIES)
+    random.Random(match_seed ^ _MIXED_AI_SEED_SALT).shuffle(personalities)
+    for player, personality in zip(ai_players, personalities):
+        player.ai_personality = personality
 
 
 def _default_ai_stepper(game: Any) -> bool:
@@ -546,6 +569,11 @@ class LanServerController:
                 try:
                     random.seed(context.match_seed)
                     game = self._game_factory(context.lobby.settings, player_names)
+                    _assign_private_mixed_ai_personalities(
+                        game,
+                        context.lobby.settings,
+                        context.match_seed,
+                    )
                     match_random_state = random.getstate()
                 finally:
                     random.setstate(caller_state)

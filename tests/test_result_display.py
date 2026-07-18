@@ -16,6 +16,7 @@ from game.result_display import (
     draw_result_display,
     hit_test_result_display,
     normalise_match_result,
+    result_player_role_label,
     selected_replay_frame,
 )
 
@@ -151,6 +152,19 @@ def test_normalise_match_result_accepts_mappings_and_orders_standings():
     assert result.victory_target == 10
     assert [snapshot.turn for snapshot in result.vp_progression] == [0, 12, 27, 43, 61]
     assert result.important_events[3].replay_frame == 9
+
+
+def test_result_player_role_reveals_ai_personality_only_in_postgame_summary():
+    payload = result_mapping(event_count=0)
+    payload["players"][0]["personality"] = "trader"
+
+    result = normalise_match_result(payload)
+    trader = next(player for player in result.players if player.name == "CPU交渉")
+    human = next(player for player in result.players if player.name == "Player1")
+
+    assert trader.personality == "trader"
+    assert result_player_role_label(trader) == "AI・交渉重視"
+    assert result_player_role_label(human) == "PLAYER"
 
 
 def test_normalise_match_result_accepts_plain_dataclasses_and_tied_ranks():

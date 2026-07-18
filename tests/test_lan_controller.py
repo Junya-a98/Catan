@@ -231,9 +231,10 @@ def test_ai_only_opponents_fill_lobby_and_advance_as_authoritative_seats():
     ]
     assert [member.get("ai_personality") for member in lobby["members"]] == [
         None,
-        "expansion",
-        "trader",
+        None,
+        None,
     ]
+    controller._rooms[room_code].match_seed = 0
     full = controller.handle(
         "late",
         message(
@@ -248,15 +249,23 @@ def test_ai_only_opponents_fill_lobby_and_advance_as_authoritative_seats():
 
     controller.handle("host", message("set_ready", ready=True))
     started = controller.handle("host", message("start_game"))
-    assert any(item.message["type"] == "state_snapshot" for item in started)
+    start_snapshot = next(
+        item.message
+        for item in started
+        if item.connection_id == "host"
+        and item.message["type"] == "state_snapshot"
+    )
+    assert [
+        player["ai_personality"]
+        for player in start_snapshot["state"]["players"][1:]
+    ] == [None, None]
     game = controller._rooms[room_code].game
     assert [player.is_ai for player in game.players] == [False, True, True]
     assert [player.name for player in game.players] == ["Host", "CPU1", "CPU2"]
-    assert [player.ai_personality for player in game.players] == [
-        "standard",
-        "expansion",
-        "trader",
+    authority_personalities = [
+        player.ai_personality for player in game.players if player.is_ai
     ]
+    assert authority_personalities == ["disruptor", "trader"]
 
     host_roll = controller.handle(
         "host",
@@ -278,13 +287,23 @@ def test_ai_only_opponents_fill_lobby_and_advance_as_authoritative_seats():
     )
     assert ai_snapshot["revision"] == 2
     assert ai_snapshot["state"]["ai"]["status"]["player_name"] == "CPU1"
+    assert ai_snapshot["state"]["ai"]["status"]["personality"] is None
     assert ai_snapshot["state"]["ai"]["status"]["title"] == "初期ダイス"
+    assert [
+        player["ai_personality"]
+        for player in ai_snapshot["state"]["players"][1:]
+    ] == [None, None]
     assert ai_snapshot["state"]["players"][1]["resources"] is None
     assert ai_snapshot["command_options"] == []
     assert random.getstate() == before_tick_rng
     replay = controller.replay_frame_for_connection("host", 2)
     assert replay["controls"]["frame_count"] == 3
     assert replay["controls"]["revision"] == 2
+    assert [
+        player["ai_personality"]
+        for player in replay["snapshot"]["state"]["players"][1:]
+    ] == [None, None]
+    assert replay["snapshot"]["state"]["ai"]["status"]["personality"] is None
 
 
 def test_ai_tick_step_limit_is_bounded_and_each_decision_has_a_revision():

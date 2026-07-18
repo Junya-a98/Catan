@@ -22,6 +22,25 @@ AI_PERSONALITY_CARD_LABELS = {
 PROHIBITED_LINE_START = frozenset("、。，．・：；？！)]｝〕〉》」』】〙〗〟’”")
 
 
+def player_card_role_label(
+    player,
+    *,
+    visible_player=None,
+    hide_ai_personalities=False,
+):
+    if getattr(player, "is_ai", False):
+        if hide_ai_personalities:
+            return "AI"
+        personality = get_ai_personality_profile(
+            getattr(player, "ai_personality", "standard")
+        )
+        return AI_PERSONALITY_CARD_LABELS.get(
+            personality.key,
+            personality.label,
+        )
+    return "あなた" if player is visible_player else "人間"
+
+
 def _load_font(size):
     return get_font(size)
 
@@ -211,6 +230,7 @@ def draw_resource_counts(
     current_player=None,
     public_gain_by_player=None,
     victory_point_target=None,
+    hide_ai_personalities=False,
 ):
     if not players:
         return
@@ -251,18 +271,11 @@ def draw_resource_counts(
         )
         vp_surface = title_font.render(vp_label, True, (255, 236, 178))
 
-        if getattr(player, "is_ai", False):
-            personality = get_ai_personality_profile(
-                getattr(player, "ai_personality", "standard")
-            )
-            role_label = AI_PERSONALITY_CARD_LABELS.get(
-                personality.key,
-                personality.label,
-            )
-        elif player is visible_player:
-            role_label = "あなた"
-        else:
-            role_label = "人間"
+        role_label = player_card_role_label(
+            player,
+            visible_player=visible_player,
+            hide_ai_personalities=hide_ai_personalities,
+        )
         marker = getattr(player, "marker", "●")
         name_label = f"{marker} {player.name}・{role_label}"
         name_width = card_rect.width - 18 - 10 - vp_surface.get_width() - 16

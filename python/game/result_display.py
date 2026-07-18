@@ -12,6 +12,7 @@ from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 
 import pygame
 
+from game.ai_personality import get_ai_personality_profile
 from game.assets import get_font
 from game.constants import COLORS
 
@@ -55,6 +56,7 @@ class ResultPlayerSummary:
     domestic_trades: int = 0
     luck_index: Optional[float] = None
     is_ai: bool = False
+    personality: Optional[str] = None
     rank: int = 1
 
 
@@ -178,6 +180,15 @@ def _safe_color(value: Any, fallback: Tuple[int, int, int]) -> Tuple[int, int, i
     return tuple(channels)
 
 
+def result_player_role_label(player: ResultPlayerSummary) -> str:
+    if not player.is_ai:
+        return "PLAYER"
+    if not player.personality:
+        return "AI"
+    profile = get_ai_personality_profile(player.personality)
+    return f"AI・{profile.label}"
+
+
 def _normalise_player(source: Any, index: int) -> ResultPlayerSummary:
     name = _safe_text(
         _get_value(source, ("name", "player_name")),
@@ -214,6 +225,11 @@ def _normalise_player(source: Any, index: int) -> ResultPlayerSummary:
             if explicit_total is None
             else _safe_int(explicit_total)
         )
+    personality = _safe_text(
+        _get_value(source, ("personality", "ai_personality")),
+        "",
+        32,
+    )
     return ResultPlayerSummary(
         name=name,
         victory_points=_safe_int(
@@ -231,6 +247,7 @@ def _normalise_player(source: Any, index: int) -> ResultPlayerSummary:
         domestic_trades=domestic_trades,
         luck_index=_safe_float(_get_value(source, ("luck_index", "luck"))),
         is_ai=bool(_get_value(source, ("is_ai",), False)),
+        personality=personality or None,
     )
 
 
@@ -339,6 +356,7 @@ def normalise_match_result(summary: Any) -> MatchResultSummary:
                 domestic_trades=player.domestic_trades,
                 luck_index=player.luck_index,
                 is_ai=player.is_ai,
+                personality=player.personality,
                 rank=rank,
             )
         )
@@ -754,7 +772,7 @@ def _draw_standings(
 
         name_x = player_rect.x + 51
         name_max_width = max(80, round(player_rect.width * 0.27))
-        role = "AI" if player.is_ai else "PLAYER"
+        role = result_player_role_label(player)
         name_text = _truncate(name_font, player.name, name_max_width)
         screen.blit(
             name_font.render(name_text, True, COLORS["WHITE"]),
@@ -1032,5 +1050,6 @@ __all__ = (
     "draw_result_display",
     "hit_test_result_display",
     "normalise_match_result",
+    "result_player_role_label",
     "selected_replay_frame",
 )

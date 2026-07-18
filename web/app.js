@@ -19,6 +19,18 @@ const CARD_LABELS = {
   year_of_plenty: "収穫",
   monopoly: "独占",
 };
+const DEVELOPMENT_CARD_KEYS = Object.freeze([
+  "KNIGHT",
+  "ROAD_BUILDING",
+  "YEAR_OF_PLENTY",
+  "MONOPOLY",
+]);
+const DEVELOPMENT_CARD_LABELS = Object.freeze({
+  KNIGHT: "騎士",
+  ROAD_BUILDING: "街道建設",
+  YEAR_OF_PLENTY: "収穫",
+  MONOPOLY: "独占",
+});
 const BOARD_RESOURCE_COLORS = {
   WOOD: [62, 129, 75],
   SHEEP: [126, 178, 75],
@@ -73,6 +85,8 @@ const state = {
   replayPlaying: false,
   replayTimer: null,
   replayRequestPending: false,
+  replayExpectedIndex: null,
+  replayRequestGeneration: 0,
   socket: null,
   socketReady: false,
   socketConnecting: false,
@@ -92,6 +106,7 @@ const state = {
   tradePromptSignature: null,
   tradePromptDismissed: new Set(),
   tradePromptNotified: new Set(),
+  developmentInventoryOpen: null,
 };
 
 const elements = Object.fromEntries(
@@ -502,7 +517,12 @@ function processEvents(events, { animateLive = true } = {}) {
       case "replay_frame":
       case "network_replay_frame": {
         const index = Number.isInteger(event.index) ? event.index : event.controls?.frame_index;
-        if (Number.isInteger(index) && event.snapshot) {
+        if (
+          Number.isInteger(index)
+          && event.snapshot
+          && isExpectedReplayFrame(event, index)
+        ) {
+          const enteringReplay = state.replayIndex === null;
           state.replayIndex = index;
           state.snapshot = event.snapshot;
           const frames = replayFrameEntries();
@@ -514,7 +534,7 @@ function processEvents(events, { animateLive = true } = {}) {
             };
           }
           dirty = true;
-          focusBoardAfterRender = true;
+          focusBoardAfterRender = focusBoardAfterRender || enteringReplay;
         }
         break;
       }
@@ -541,7 +561,7 @@ function processEvents(events, { animateLive = true } = {}) {
     }
   }
   if (dirty) render();
-  if (focusBoardAfterRender) focusGameBoard();
+  if (focusBoardAfterRender && state.replayIndex !== null) focusGameBoard();
 }
 
 function reconcileSequence(event) {
@@ -832,6 +852,7 @@ function showToast(message, isError = false) {
 }
 
 function resetRoomState(renderNow = true) {
+  invalidateReplayRequest();
   state.welcome = null;
   state.lobby = null;
   state.snapshot = null;
@@ -848,6 +869,7 @@ function resetRoomState(renderNow = true) {
   state.tradePromptSignature = null;
   state.tradePromptDismissed.clear();
   state.tradePromptNotified.clear();
+  state.developmentInventoryOpen = null;
   hideTradePrompt();
   clearPendingBoardAnimations();
   sessionStorage.removeItem("catan-reconnect");
@@ -916,7 +938,10 @@ function renderMembers(lobby) {
         "small",
         member
           ? member.is_ai
-            ? `${aiPersonalityLabel(member.ai_personality)}AI · サーバー管理`
+            ? lobbyAIMemberDescription(
+              member,
+              lobby.settings?.ai_personality_mode,
+            )
             : `${roleLabel(member.role)} · ${member.connected ? "接続中" : "再接続待ち"}`
           : "参加者を待っています",
       ),
@@ -966,12 +991,34 @@ function renderLobbySettings(settings) {
   }
 }
 
+function commandOptionsForView(snapshot) {
+  if (state.replayIndex !== null) return [];
+  return Array.isArray(snapshot?.command_options)
+    ? snapshot.command_options
+    : [];
+}
+
+function isExpectedReplayFrame(event, index) {
+  return Boolean(
+    state.replayRequestPending
+    && state.replayExpectedIndex === index
+    && typeof state.welcome?.room_code === "string"
+    && event?.room_code === state.welcome.room_code
+  );
+}
+
+function personalityModeForView(gameState) {
+  return gameState?.ai?.personality_mode
+    ?? state.lobby?.settings?.ai_personality_mode;
+}
+
 function renderGame() {
   const snapshot = state.snapshot;
   const gameState = snapshot.state;
   const phase = gameState.phase || {};
   const activeSeat = activePlayerIndex(gameState);
   const ownSeat = state.welcome?.seat_index;
+  const personalityMode = personalityModeForView(gameState);
   const title = phaseTitle(gameState, activeSeat);
   elements["game-room-label"].textContent = `ROOM ${state.welcome?.room_code || "------"} · ${roleLabel(state.welcome?.role)}`;
   elements["game-phase-title"].textContent = title.title;
@@ -979,7 +1026,7 @@ function renderGame() {
   elements["revision-badge"].textContent = `rev. ${snapshot.revision}`;
   elements["victory-target-label"].textContent = `${gameState.rules?.victory_point_target || 10} VP`;
 
-  const options = Array.isArray(snapshot.command_options) ? snapshot.command_options : [];
+  const options = commandOptionsForView(snapshot);
   state.targetOptions = new Map(
     options
       .filter((option) => typeof option?.args?.target === "string")
@@ -989,13 +1036,22 @@ function renderGame() {
   renderBoard(snapshot.board_manifest, gameState.players || [], animationPlan);
   renderActions(options);
   renderIncomingTradePrompt(gameState, options, ownSeat);
-  renderPlayers(gameState, activeSeat, ownSeat);
+  renderPlayers(
+    gameState,
+    activeSeat,
+    ownSeat,
+    snapshot.viewer_player_index,
+    personalityMode,
+  );
   const latest = gameState.history?.latest_event || {};
   elements["latest-event-title"].textContent = latest.title || "進行中";
   elements["latest-event-detail"].textContent = latest.detail || "次の操作を待っています。";
   renderForecastEvent(gameState.variant_state);
   renderFrontierStatus(gameState.variant_state);
-  renderAICommentary(gameState.ai?.status);
+  renderAICommentary(
+    gameState.ai?.status,
+    personalityMode,
+  );
   const finished = state.liveSnapshot?.state?.phase?.name === "finished";
   elements["result-dashboard"].hidden = !finished;
   if (finished) {
@@ -1037,11 +1093,14 @@ function renderFrontierStatus(variantState) {
   elements["frontier-status-detail"].textContent = presentation.detail;
 }
 
-function renderAICommentary(status) {
+function renderAICommentary(status, personalityMode) {
   const visible = Boolean(status?.player_name && status?.title);
   elements["ai-commentary"].hidden = !visible;
   if (!visible) return;
-  elements["ai-commentary-title"].textContent = `${status.player_name}（${aiPersonalityLabel(status.personality)}）: ${status.title}`;
+  elements["ai-commentary-title"].textContent = aiCommentaryHeading(
+    status,
+    personalityMode,
+  );
   elements["ai-commentary-detail"].textContent = status.detail || "次の一手を評価しています。";
 }
 
@@ -1527,7 +1586,7 @@ function syncAudioScene(view) {
 }
 
 async function sendGameCommand(option) {
-  if (state.commandPending || !state.snapshot) return;
+  if (state.replayIndex !== null || state.commandPending || !state.snapshot) return;
   state.commandPending = true;
   renderActions(state.snapshot.command_options || []);
   const sequence = state.nextSequence;
@@ -2708,7 +2767,183 @@ function renderLegend(players) {
   });
 }
 
-function renderPlayers(gameState, activeSeat, ownSeat) {
+function developmentCardInventoryPresentation(player, isOwnPlayer) {
+  const hidden = {
+    visible: false,
+    total: 0,
+    empty: true,
+    usable: [],
+    newlyPurchased: [],
+    victoryPoints: 0,
+  };
+  if (
+    !isOwnPlayer
+    || !isDevelopmentCardCountMap(player?.development_cards)
+    || !isDevelopmentCardCountMap(player?.new_development_cards)
+    || !Number.isInteger(player?.victory_point_cards)
+    || player.victory_point_cards < 0
+  ) {
+    return hidden;
+  }
+  const usable = developmentCardEntries(player.development_cards);
+  const newlyPurchased = developmentCardEntries(
+    player.new_development_cards,
+  );
+  const victoryPoints = player.victory_point_cards;
+  const total = usable.reduce((sum, item) => sum + item.count, 0)
+    + newlyPurchased.reduce((sum, item) => sum + item.count, 0)
+    + victoryPoints;
+  return {
+    visible: true,
+    total,
+    empty: total === 0,
+    usable,
+    newlyPurchased,
+    victoryPoints,
+  };
+}
+
+function isDevelopmentCardCountMap(value) {
+  return Boolean(
+    value
+    && typeof value === "object"
+    && !Array.isArray(value)
+    && DEVELOPMENT_CARD_KEYS.every(
+      (key) => Number.isInteger(value[key]) && value[key] >= 0,
+    ),
+  );
+}
+
+function developmentCardEntries(counts) {
+  return DEVELOPMENT_CARD_KEYS.flatMap((key) => {
+    const count = counts[key];
+    return count > 0
+      ? [{ key, label: DEVELOPMENT_CARD_LABELS[key], count }]
+      : [];
+  });
+}
+
+function createDevelopmentCardInventory(player, isOwnPlayer) {
+  const inventory = developmentCardInventoryPresentation(
+    player,
+    isOwnPlayer,
+  );
+  if (!inventory.visible) return null;
+
+  const details = document.createElement("details");
+  details.className = "development-inventory";
+  details.open = state.developmentInventoryOpen === null
+    ? inventory.total > 0
+    : state.developmentInventoryOpen;
+  details.addEventListener("toggle", () => {
+    state.developmentInventoryOpen = details.open;
+  });
+
+  const summary = document.createElement("summary");
+  summary.append(
+    textElement("span", "発展カードの内訳"),
+    textElement(
+      "span",
+      inventory.empty ? "所持なし" : `${inventory.total}枚`,
+      "development-inventory-count",
+    ),
+  );
+  details.append(summary);
+
+  const body = document.createElement("div");
+  body.className = "development-inventory-body";
+  const groups = document.createElement("div");
+  groups.className = "development-inventory-grid";
+  groups.append(
+    createDevelopmentCardGroup({
+      title: "使用候補",
+      description: "前の手番までに購入（状況により使用不可）",
+      entries: inventory.usable,
+      emptyLabel: "使用候補のカードなし",
+      className: "usable",
+    }),
+    createDevelopmentCardGroup({
+      title: "今手番に購入",
+      description: "次の自分の手番から使用できます",
+      entries: inventory.newlyPurchased,
+      emptyLabel: "新しく購入したカードなし",
+      className: "new",
+    }),
+    createVictoryPointCardGroup(inventory.victoryPoints),
+  );
+  body.append(
+    groups,
+    textElement(
+      "p",
+      "この内訳はあなたにだけ表示されています。",
+      "development-inventory-privacy",
+    ),
+  );
+  details.append(body);
+  return details;
+}
+
+function createDevelopmentCardGroup({
+  title,
+  description,
+  entries,
+  emptyLabel,
+  className,
+}) {
+  const group = document.createElement("section");
+  group.className = `development-inventory-group ${className}`;
+  group.setAttribute("aria-label", title);
+  group.append(
+    textElement("strong", title),
+    textElement("small", description),
+    createDevelopmentCardChipList(entries, emptyLabel),
+  );
+  return group;
+}
+
+function createDevelopmentCardChipList(entries, emptyLabel) {
+  const list = document.createElement("div");
+  list.className = "development-card-chips";
+  if (!entries.length) {
+    list.append(
+      textElement("span", emptyLabel, "development-card-empty"),
+    );
+    return list;
+  }
+  for (const entry of entries) {
+    list.append(
+      textElement(
+        "span",
+        `${entry.label} ×${entry.count}`,
+        "development-card-chip",
+      ),
+    );
+  }
+  return list;
+}
+
+function createVictoryPointCardGroup(count) {
+  const group = document.createElement("section");
+  group.className = "development-inventory-group private";
+  group.setAttribute("aria-label", "勝利点カード（非公開）");
+  group.append(
+    textElement("strong", "勝利点カード（非公開）"),
+    textElement("small", "勝利条件へ加算される秘密得点です"),
+    createDevelopmentCardChipList(
+      count > 0 ? [{ label: "勝利点", count }] : [],
+      "勝利点カードなし",
+    ),
+  );
+  return group;
+}
+
+function renderPlayers(
+  gameState,
+  activeSeat,
+  ownSeat,
+  snapshotViewerSeat,
+  personalityMode,
+) {
   const list = elements["player-list"];
   list.replaceChildren();
   const publicPoints = calculatePublicPoints(gameState);
@@ -2720,9 +2955,10 @@ function renderPlayers(gameState, activeSeat, ownSeat) {
     color.style.background = playerColor(gameState.players, index);
     const main = document.createElement("div");
     main.className = "player-main";
-    const identity = player.is_ai
-      ? `${player.marker || ""} ${player.name}・${aiPersonalityLabel(player.ai_personality)}AI`
-      : `${player.marker || ""} ${player.name}`;
+    const identity = playerIdentityLabel(
+      player,
+      personalityMode,
+    );
     main.append(
       textElement("strong", identity.trim()),
       textElement(
@@ -2750,6 +2986,11 @@ function renderPlayers(gameState, activeSeat, ownSeat) {
       }
       card.append(strip);
     }
+    const inventory = createDevelopmentCardInventory(
+      player,
+      index === ownSeat && index === snapshotViewerSeat,
+    );
+    if (inventory) card.append(inventory);
     list.append(card);
   });
 }
@@ -2912,14 +3153,14 @@ function syncReplayControls() {
     "aria-valuetext",
     available ? `${index + 1} / ${count}` : "リプレイなし",
   );
-  elements["replay-slider"].disabled = !available;
+  elements["replay-slider"].disabled = !available || state.replayRequestPending;
   const atStart = index <= 0;
   const atEnd = state.replayIndex === null || index >= count - 1;
-  elements["replay-first"].disabled = !available || atStart;
-  elements["replay-previous"].disabled = !available || atStart;
+  elements["replay-first"].disabled = !available || atStart || state.replayRequestPending;
+  elements["replay-previous"].disabled = !available || atStart || state.replayRequestPending;
   elements["replay-play"].disabled = count < 2;
-  elements["replay-next"].disabled = !available || atEnd;
-  elements["replay-last"].disabled = !available || atEnd;
+  elements["replay-next"].disabled = !available || atEnd || state.replayRequestPending;
+  elements["replay-last"].disabled = !available || atEnd || state.replayRequestPending;
   elements["result-live-button"].disabled = state.replayIndex === null;
   elements["replay-position"].textContent = state.replayIndex === null
     ? "LIVE"
@@ -2937,16 +3178,30 @@ function syncReplayControls() {
 async function requestReplayFrame(index) {
   const count = replayFrameCount();
   if (state.replayRequestPending || !Number.isInteger(index) || index < 0 || index >= count) return;
+  const generation = state.replayRequestGeneration;
   state.replayRequestPending = true;
+  state.replayExpectedIndex = index;
+  syncReplayControls();
   try {
     await sendMessage(wireMessage("replay_frame_request", { index }));
   } catch (error) {
-    stopReplay();
-    showToast(error.message, true);
+    if (state.replayRequestGeneration === generation) {
+      stopReplay();
+      showToast(error.message, true);
+    }
   } finally {
-    state.replayRequestPending = false;
-    syncReplayControls();
+    if (state.replayRequestGeneration === generation) {
+      state.replayRequestPending = false;
+      state.replayExpectedIndex = null;
+      syncReplayControls();
+    }
   }
+}
+
+function invalidateReplayRequest() {
+  state.replayRequestGeneration += 1;
+  state.replayRequestPending = false;
+  state.replayExpectedIndex = null;
 }
 
 function stopReplay() {
@@ -2974,6 +3229,7 @@ function scheduleReplay() {
 }
 
 function showLiveSnapshot() {
+  invalidateReplayRequest();
   stopReplay();
   state.replayIndex = null;
   if (state.liveSnapshot) state.snapshot = state.liveSnapshot;
@@ -3154,6 +3410,44 @@ function aiPersonalityLabel(mode) {
     trader: "交渉重視",
     disruptor: "妨害重視",
   }[mode] || mode || "標準";
+}
+
+function publicAIPersonalityLabel(personalityMode, assignedPersonality) {
+  if (personalityMode === "mixed") return null;
+  return aiPersonalityLabel(assignedPersonality || personalityMode);
+}
+
+function lobbyAIMemberDescription(member, personalityMode) {
+  const personality = publicAIPersonalityLabel(
+    personalityMode,
+    member?.ai_personality,
+  );
+  return personality
+    ? `${personality}AI · サーバー管理`
+    : "AI · 性格は対局後に公開 · サーバー管理";
+}
+
+function playerIdentityLabel(player, personalityMode) {
+  const base = `${player?.marker || ""} ${player?.name || ""}`.trim();
+  if (!player?.is_ai) return base;
+  const personality = publicAIPersonalityLabel(
+    personalityMode,
+    player.ai_personality,
+  );
+  return personality
+    ? `${base}・${personality}AI`
+    : `${base}・AI`;
+}
+
+function aiCommentaryHeading(status, personalityMode) {
+  const personality = publicAIPersonalityLabel(
+    personalityMode,
+    status?.personality,
+  );
+  const speaker = personality
+    ? `${status?.player_name || "AI"}（${personality}）`
+    : status?.player_name || "AI";
+  return `${speaker}: ${status?.title || "判断中"}`;
 }
 
 function playerColor(players, index) {
