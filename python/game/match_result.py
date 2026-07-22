@@ -11,9 +11,22 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from typing import Any
 
+from game.variant import (
+    COMPOSITE_EVENTS_ECONOMY_CATALOG,
+    COMPOSITE_GRAND_CAMPAIGN_CATALOG,
+    COMPOSITE_VARIANT_KIND,
+    CREDIT_VARIANT_KIND,
+    VariantConfig,
+)
+from game.variant_state import VariantState, VariantStateError
+
 
 MATCH_RESULT_FORMAT = "catan-match-result"
 MATCH_RESULT_VERSION = 1
+_PUBLIC_VARIANT_STATE_KEYS = frozenset(
+    {"format", "version", "kind", "config_fingerprint", "public"}
+)
+_FULL_VARIANT_STATE_KEYS = _PUBLIC_VARIANT_STATE_KEYS | {"private"}
 
 __all__ = (
     "MATCH_RESULT_FORMAT",
@@ -230,6 +243,7 @@ def _standings_from_snapshot(snapshot: Mapping[str, Any]) -> list[dict[str, Any]
 
     longest_owner = _valid_player_index(phase.get("longest_road_owner"), len(raw_players))
     army_owner = _valid_player_index(phase.get("largest_army_owner"), len(raw_players))
+    credit_rows = _credit_rows_from_snapshot(snapshot, len(raw_players))
     standings = []
     for index, raw_player in enumerate(raw_players):
         player = raw_player if isinstance(raw_player, Mapping) else {}
@@ -238,6 +252,8 @@ def _standings_from_snapshot(snapshot: Mapping[str, Any]) -> list[dict[str, Any]
             points += 2
         if index == army_owner:
             points += 2
+        credit_penalty, credit_status, credit_count = credit_rows[index]
+        points = max(0, points + credit_penalty)
         standings.append(
             _standing(
                 seat=index + 1,
@@ -252,9 +268,81 @@ def _standings_from_snapshot(snapshot: Mapping[str, Any]) -> list[dict[str, Any]
                 played_knights=player.get("played_knights", 0),
                 longest_road=index == longest_owner,
                 largest_army=index == army_owner,
+                debt_penalty=credit_penalty,
+                debt_status=credit_status,
+                debt_count=credit_count,
             )
         )
     return standings
+
+
+def _credit_rows_from_snapshot(
+    snapshot: Mapping[str, Any],
+    player_count: int,
+) -> list[tuple[int, str | None, int]]:
+    """Read only public liability fields from a final/replay snapshot."""
+
+    rows: list[tuple[int, str | None, int]] = [
+        (0, None, 0) for _ in range(player_count)
+    ]
+    public = _credit_public_from_snapshot(snapshot)
+    if public is None:
+        return rows
+    loans = public.get("loans")
+    if not isinstance(loans, Sequence) or isinstance(loans, (str, bytes)):
+        return rows
+    seen = set()
+    for raw in loans:
+        if not isinstance(raw, Mapping):
+            continue
+        borrower = _valid_player_index(raw.get("borrower_index"), player_count)
+        status = raw.get("status")
+        if borrower is None or borrower in seen or status not in ("active", "delinquent"):
+            continue
+        rows[borrower] = (-1 if status == "active" else -2, status, 1)
+        seen.add(borrower)
+    return rows
+
+
+def _credit_public_from_snapshot(
+    snapshot: Mapping[str, Any],
+) -> Mapping[str, Any] | None:
+    """Validate one public projection and return only its credit component."""
+
+    document = snapshot.get("variant_state")
+    if not isinstance(document, Mapping):
+        return None
+    keys = frozenset(document)
+    if keys not in (_PUBLIC_VARIANT_STATE_KEYS, _FULL_VARIANT_STATE_KEYS):
+        return None
+
+    kind = document.get("kind")
+    if kind == CREDIT_VARIANT_KIND:
+        config = VariantConfig.credit()
+    elif kind == COMPOSITE_VARIANT_KIND:
+        public = document.get("public")
+        catalog = public.get("catalog") if isinstance(public, Mapping) else None
+        if catalog == COMPOSITE_EVENTS_ECONOMY_CATALOG:
+            config = VariantConfig.composite_events_economy()
+        elif catalog == COMPOSITE_GRAND_CAMPAIGN_CATALOG:
+            config = VariantConfig.composite_grand_campaign()
+        else:
+            return None
+    else:
+        return None
+
+    # A local save also carries authority-private state.  Results intentionally
+    # validate and consume only the same public projection available to replay
+    # viewers; future draw piles and mutation sequences never enter this path.
+    public_document = {
+        key: document[key] for key in _PUBLIC_VARIANT_STATE_KEYS
+    }
+    try:
+        state = VariantState.from_public_document(public_document, config=config)
+    except VariantStateError:
+        return None
+    credit_state = state.component_state(CREDIT_VARIANT_KIND)
+    return None if credit_state is None else credit_state.public
 
 
 def _standings_from_game(game: Any) -> list[dict[str, Any]]:
@@ -295,6 +383,13 @@ def _standings_from_game(game: Any) -> list[dict[str, Any]]:
                 points = _fallback_live_points(game, player, building_points)
         else:
             points = _fallback_live_points(game, player, building_points)
+        get_loan = getattr(game, "get_resource_credit_loan", None)
+        loan = get_loan(player) if callable(get_loan) else None
+        debt_penalty = _integer(
+            getattr(loan, "public_vp_modifier", 0),
+            0,
+            minimum=-2,
+        )
         standings.append(
             _standing(
                 seat=index + 1,
@@ -309,6 +404,9 @@ def _standings_from_game(game: Any) -> list[dict[str, Any]]:
                 played_knights=getattr(player, "played_knights", 0),
                 longest_road=getattr(game, "longest_road_owner", None) is player,
                 largest_army=getattr(game, "largest_army_owner", None) is player,
+                debt_penalty=debt_penalty,
+                debt_status=_text(getattr(loan, "status", "")) or None,
+                debt_count=1 if loan is not None else 0,
             )
         )
     return standings
@@ -340,8 +438,11 @@ def _standing(
     bank_trades: Any = None,
     domestic_trades: Any = None,
     luck_index: Any = None,
+    debt_penalty: Any = 0,
+    debt_status: Any = None,
+    debt_count: Any = 0,
 ) -> dict[str, Any]:
-    return {
+    row = {
         "rank": 0,
         "seat": _integer(seat, 1, minimum=1),
         "name": _text(name),
@@ -367,6 +468,18 @@ def _standing(
         },
         "luck_index": _optional_number(luck_index),
     }
+    normalised_debt_count = _integer(debt_count, 0, minimum=0)
+    normalised_debt_penalty = _integer(debt_penalty, 0, minimum=-2)
+    normalised_debt_status = _text(debt_status) or None
+    if normalised_debt_count or normalised_debt_penalty or normalised_debt_status:
+        row.update(
+            {
+                "debt_penalty": normalised_debt_penalty,
+                "debt_status": normalised_debt_status,
+                "debt_count": normalised_debt_count,
+            }
+        )
+    return row
 
 
 def _apply_metric_standings(
@@ -512,11 +625,10 @@ def _attach_vp_breakdowns(standings: list[dict[str, Any]]) -> None:
     """Expose the complete score composition only in the post-match result.
 
     ``settlements`` and ``cities`` are the pieces currently on the board, not
-    the cumulative build counters.  The remaining points are victory-point
-    cards: the base game and the forecast-events variant have no other hidden
-    score source.  A redacted legacy snapshot without an authoritative final
-    total cannot reconstruct cards that were never recorded, so it safely
-    reports only the points present in that source.
+    the cumulative build counters.  Public resource-credit liabilities are
+    subtracted before the remaining difference is identified as secret
+    victory-point cards.  This keeps the post-match reveal correct without
+    making a live hidden card inferable from a negative public score source.
     """
 
     for row in standings:
@@ -526,21 +638,26 @@ def _attach_vp_breakdowns(standings: list[dict[str, Any]]) -> None:
         city_points = city_count * 2
         longest_road_points = 2 if row.get("longest_road") else 0
         largest_army_points = 2 if row.get("largest_army") else 0
-        public_points = (
+        positive_public_points = (
             settlement_points
             + city_points
             + longest_road_points
             + largest_army_points
         )
-        total = _integer(row.get("victory_points"), public_points, minimum=0)
-        if public_points > total:
+        debt_penalty = _integer(row.get("debt_penalty"), 0, minimum=-2)
+        total = _integer(
+            row.get("victory_points"),
+            max(0, positive_public_points + debt_penalty),
+            minimum=0,
+        )
+        victory_point_cards = total - positive_public_points - debt_penalty
+        if victory_point_cards < 0:
             # Metric adapters are deliberately permissive, but publishing a
             # mathematically impossible breakdown is worse than omitting the
             # optional explanation for that malformed legacy row.
             row.pop("vp_breakdown", None)
             continue
-        victory_point_cards = max(0, total - public_points)
-        row["vp_breakdown"] = {
+        breakdown = {
             "settlements": {
                 "count": settlement_count,
                 "points": settlement_points,
@@ -563,6 +680,13 @@ def _attach_vp_breakdowns(standings: list[dict[str, Any]]) -> None:
             },
             "total": total,
         }
+        if debt_penalty or row.get("debt_count") or row.get("debt_status"):
+            breakdown["debt_penalty"] = {
+                "count": _integer(row.get("debt_count"), 0, minimum=0),
+                "status": _text(row.get("debt_status")) or None,
+                "points": debt_penalty,
+            }
+        row["vp_breakdown"] = breakdown
 
 
 def _metric_rows(value: Any) -> list[Any]:

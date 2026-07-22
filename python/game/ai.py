@@ -9,8 +9,6 @@ from game.development_cards import DevelopmentCardType
 from game.forecast_events import (
     BANDIT_RAID_EVENT_ID,
     CONSTRUCTION_BOOM_EVENT_ID,
-    EARTHQUAKE_EVENT_ID,
-    HARBOR_BLOCKADE_EVENT_ID,
     MERCHANT_FESTIVAL_EVENT_ID,
     SHEEP_DROUGHT_EVENT_ID,
     WHEAT_HARVEST_EVENT_ID,
@@ -65,6 +63,33 @@ class SimpleAI:
             game.handle_roll_dice()
             return True
 
+        if (
+            getattr(game, "is_credit_variant", lambda: False)()
+            and not getattr(game, "credit_action_taken_this_turn", False)
+        ):
+            payment = getattr(
+                game,
+                "choose_resource_credit_repayment",
+                lambda _player: None,
+            )(player)
+            loan = getattr(game, "get_resource_credit_loan", lambda _player: None)(
+                player
+            )
+            if payment is not None and loan is not None:
+                self._set_status(
+                    game,
+                    player,
+                    "ローンを優先返済",
+                    "公開VP減点と延滞を避けるため、利用可能な資源から返済します",
+                )
+                game.repay_resource_credit(
+                    player,
+                    loan.loan_id,
+                    loan.revision,
+                    payment,
+                )
+                return True
+
         if not game.development_card_used_this_turn and self._play_development_card(game, player):
             return True
 
@@ -118,6 +143,73 @@ class SimpleAI:
 
         priority_goals = profile.goal_order[:2]
 
+        if (
+            getattr(game, "is_trade_auction_variant", lambda: False)()
+            and not getattr(game, "ai_auction_action_attempted", False)
+        ):
+            award = self._choose_trade_auction_award(game, player)
+            if award is not None:
+                game.ai_auction_action_attempted = True
+                auction, bid = award
+                self._set_status(
+                    game,
+                    player,
+                    "公開競売の落札者を決定",
+                    "建設目標に役立つ入札を比較して最も価値の高い条件を選びます",
+                )
+                game.accept_trade_auction(
+                    player,
+                    auction.auction_id,
+                    auction.revision,
+                    bid.bidder_index,
+                )
+                return True
+            bid_choice = self._choose_trade_auction_bid(
+                game,
+                player,
+                goals=priority_goals,
+            )
+            if bid_choice is not None:
+                game.ai_auction_action_attempted = True
+                auction, offer = bid_choice
+                self._set_status(
+                    game,
+                    player,
+                    "公開競売へ入札",
+                    "建設目標の不足を減らせる出品へ余剰資源を提示します",
+                )
+                game.bid_trade_auction(
+                    player,
+                    auction.auction_id,
+                    auction.revision,
+                    offer,
+                )
+                return True
+
+        if (
+            getattr(game, "is_trade_market_variant", lambda: False)()
+            and not getattr(game, "ai_market_action_attempted", False)
+        ):
+            market_order = self._choose_trade_market_fill(
+                game,
+                player,
+                goals=priority_goals,
+            )
+            if market_order is not None:
+                game.ai_market_action_attempted = True
+                self._set_status(
+                    game,
+                    player,
+                    "常設市場で購入",
+                    "優先建設までの不足が最も減る公開注文を選びます",
+                )
+                game.fill_trade_market_order(
+                    player,
+                    market_order.order_id,
+                    market_order.revision,
+                )
+                return True
+
         if not game.ai_domestic_trade_attempted:
             domestic_trade = self._choose_domestic_trade(
                 game,
@@ -155,6 +247,17 @@ class SimpleAI:
             game.start_bank_trade()
             game.select_bank_trade_resource(give_resource)
             game.select_bank_trade_resource(receive_resource)
+            return True
+
+        credit_resource = self._choose_resource_credit_borrow(game, player)
+        if credit_resource is not None:
+            self._set_status(
+                game,
+                player,
+                "建設用の資源を借入",
+                "完成まで1枚だけ足りない優先建設に限定して銀行信用を使います",
+            )
+            game.borrow_resource_credit(player, credit_resource)
             return True
 
         road_edges = game.get_buildable_road_edges(player)
@@ -222,6 +325,40 @@ class SimpleAI:
             game.select_bank_trade_resource(give_resource)
             game.select_bank_trade_resource(receive_resource)
             return True
+
+        if (
+            getattr(game, "is_trade_market_variant", lambda: False)()
+            and not getattr(game, "ai_market_action_attempted", False)
+        ):
+            game.ai_market_action_attempted = True
+            listing = self._choose_trade_market_listing(game, player)
+            if listing is not None:
+                offer, wanted = listing
+                self._set_status(
+                    game,
+                    player,
+                    "常設市場へ出品",
+                    "余剰資源1枚を次の建設に足りない資源へ交換します",
+                )
+                game.create_trade_market_order(player, offer, wanted)
+                return True
+
+        if (
+            getattr(game, "is_trade_auction_variant", lambda: False)()
+            and not getattr(game, "ai_auction_action_attempted", False)
+        ):
+            game.ai_auction_action_attempted = True
+            listing = self._choose_trade_auction_listing(game, player)
+            if listing is not None:
+                offer, minimum_bid_cards = listing
+                self._set_status(
+                    game,
+                    player,
+                    "公開競売を開始",
+                    "余剰資源を公開し、複数の交換条件を募集します",
+                )
+                game.create_trade_auction(player, offer, minimum_bid_cards)
+                return True
 
         self._set_status(game, player, "手番を終了", "実行できる建設・購入・交易がありません")
         game.record_event(
@@ -409,6 +546,41 @@ class SimpleAI:
         ) >= self._profile(player).knight_leader_threshold
         return can_claim_largest_army or robber_blocks_self or leader_threat
 
+    def _choose_resource_credit_borrow(self, game, player):
+        """Borrow only when one card immediately completes a priority goal."""
+
+        if (
+            not getattr(game, "is_credit_variant", lambda: False)()
+            or getattr(game, "credit_action_taken_this_turn", False)
+            or not getattr(game, "can_borrow_resource_credit", lambda *_args: False)(
+                player
+            )
+        ):
+            return None
+        # A fresh -1 public modifier can delay a near win.  At that point the
+        # AI waits for ordinary production/trading instead of using credit.
+        current_points = game.get_player_victory_points(player)
+        if current_points >= game.victory_point_target - 2:
+            return None
+
+        available = player.resource_ledger.available_map()
+        profile = self._profile(player)
+        for goal in profile.goal_order:
+            if goal not in ("city", "settlement", "development", "road"):
+                continue
+            cost = self._goal_cost(game, player, goal)
+            missing = {
+                resource: amount - available[resource]
+                for resource, amount in cost.items()
+                if available[resource] < amount
+            }
+            if sum(missing.values()) != 1:
+                continue
+            resource = next(iter(missing))
+            if game.can_borrow_resource_credit(player, resource):
+                return resource
+        return None
+
     def _choose_bank_trade(
         self,
         game,
@@ -431,12 +603,267 @@ class SimpleAI:
                     if give_resource == receive_resource:
                         continue
                     reserve = cost.get(give_resource, 0)
-                    surplus = player.resources[give_resource] - reserve
+                    surplus = (
+                        player.available_resource_count(give_resource) - reserve
+                    )
                     if surplus >= rate:
                         candidates.append((surplus - rate, give_resource))
                 if candidates:
                     return max(candidates, key=lambda candidate: candidate[0])[1], receive_resource
         return None
+
+    def _choose_trade_market_fill(self, game, player, *, goals):
+        """Choose only from public terms and the AI's own available hand."""
+
+        available = player.resource_ledger.available_map()
+        best = None
+        best_score = 0
+        for order in game.get_trade_market_orders():
+            if not game.can_fill_trade_market_order(player, order):
+                continue
+            after = dict(available)
+            for resource_type, amount in order.wanted.items():
+                after[resource_type] -= amount
+            for resource_type, amount in order.offer.items():
+                after[resource_type] += amount
+            goal_benefit = 0
+            for rank, goal in enumerate(goals):
+                cost = self._goal_cost(game, player, goal)
+                before_missing = sum(
+                    max(0, amount - available.get(resource_type, 0))
+                    for resource_type, amount in cost.items()
+                )
+                after_missing = sum(
+                    max(0, amount - after.get(resource_type, 0))
+                    for resource_type, amount in cost.items()
+                )
+                goal_benefit = max(
+                    goal_benefit,
+                    (before_missing - after_missing) * (len(goals) - rank),
+                )
+            value_delta = sum(order.offer.values()) - sum(order.wanted.values())
+            score = goal_benefit * 4 + value_delta
+            if score > best_score:
+                best_score = score
+                best = order
+        return best
+
+    def _choose_trade_market_listing(self, game, player):
+        if not game.can_create_trade_market_order(player):
+            return None
+        profile = self._profile(player)
+        available = player.resource_ledger.available_map()
+        for goal in profile.goal_order:
+            cost = self._goal_cost(game, player, goal)
+            missing = [
+                resource_type
+                for resource_type, amount in cost.items()
+                if available.get(resource_type, 0) < amount
+            ]
+            if not missing:
+                continue
+            wanted_resource = missing[0]
+            candidates = [
+                resource_type
+                for resource_type in available
+                if resource_type is not wanted_resource
+                and available[resource_type] > cost.get(resource_type, 0)
+            ]
+            if not candidates:
+                candidates = [
+                    resource_type
+                    for resource_type in available
+                    if resource_type is not wanted_resource
+                    and available[resource_type] > 0
+                    and resource_type not in cost
+                ]
+            if not candidates:
+                continue
+            offer_resource = max(
+                candidates,
+                key=lambda resource_type: (
+                    available[resource_type] - cost.get(resource_type, 0),
+                    -resource_type.value,
+                ),
+            )
+            return ({offer_resource: 1}, {wanted_resource: 1})
+        return None
+
+    def choose_trade_auction_bid(self, game, player, auction):
+        """Build one deterministic AI bid from public terms and its own hand."""
+
+        return self._build_trade_auction_bid(
+            game,
+            player,
+            auction,
+            goals=self._profile(player).goal_order[:2],
+        )
+
+    def _choose_trade_auction_bid(self, game, player, *, goals):
+        best = None
+        best_score = 0
+        for auction in game.get_trade_auctions():
+            offer = self._build_trade_auction_bid(
+                game,
+                player,
+                auction,
+                goals=goals,
+            )
+            if offer is None:
+                continue
+            lot_total = sum(auction.offer.values())
+            payment_total = sum(offer.values())
+            previous = auction.get_bid(game.players.index(player))
+            goal_gain = self._auction_goal_gain(
+                game,
+                player,
+                auction.offer,
+                offer,
+                goals,
+                restored_payment=previous.offer if previous is not None else None,
+            )
+            score = goal_gain * 5 + lot_total - payment_total
+            if score > best_score:
+                best_score = score
+                best = auction, offer
+        return best
+
+    def _build_trade_auction_bid(self, game, player, auction, *, goals):
+        if not game.can_bid_trade_auction(player, auction):
+            return None
+        bidder_index = game.players.index(player)
+        previous = auction.get_bid(bidder_index)
+        available = player.resource_ledger.available_map()
+        if previous is not None:
+            for resource_type, amount in previous.offer.items():
+                available[resource_type] += amount
+
+        useful_lot = any(
+            auction.offer.get(resource_type, 0) > 0
+            and player.available_resource_count(resource_type)
+            < self._goal_cost(game, player, goal).get(resource_type, 0)
+            for goal in goals
+            for resource_type in auction.offer
+        )
+        profile = self._profile(player)
+        if not useful_lot and profile.key != TRADER:
+            return None
+        if (
+            auction.minimum_bid_cards
+            > sum(auction.offer.values()) + (1 if profile.key == TRADER else 0)
+        ):
+            return None
+
+        primary_cost = self._goal_cost(game, player, goals[0]) if goals else {}
+        candidates = sorted(
+            (
+                resource_type
+                for resource_type, amount in available.items()
+                if amount > 0 and resource_type not in auction.offer
+            ),
+            key=lambda resource_type: (
+                available[resource_type] - primary_cost.get(resource_type, 0),
+                available[resource_type],
+                -resource_type.value,
+            ),
+            reverse=True,
+        )
+        remaining = auction.minimum_bid_cards
+        bid = {}
+        for resource_type in candidates:
+            reserve = primary_cost.get(resource_type, 0)
+            spendable = max(0, available[resource_type] - reserve)
+            if spendable <= 0 and profile.key == TRADER:
+                spendable = available[resource_type]
+            take = min(remaining, spendable)
+            if take > 0:
+                bid[resource_type] = take
+                remaining -= take
+            if remaining == 0:
+                break
+        if remaining > 0 or (previous is not None and dict(previous.offer) == bid):
+            return None
+        return bid if game.can_bid_trade_auction(player, auction, bid) else None
+
+    def _auction_goal_gain(
+        self,
+        game,
+        player,
+        lot,
+        payment,
+        goals,
+        *,
+        restored_payment=None,
+    ):
+        available = player.resource_ledger.available_map()
+        if restored_payment is not None:
+            for resource_type, amount in restored_payment.items():
+                available[resource_type] += amount
+        after = dict(available)
+        for resource_type, amount in payment.items():
+            after[resource_type] -= amount
+        for resource_type, amount in lot.items():
+            after[resource_type] += amount
+        gain = 0
+        for rank, goal in enumerate(goals):
+            cost = self._goal_cost(game, player, goal)
+            before_missing = sum(
+                max(0, amount - available.get(resource_type, 0))
+                for resource_type, amount in cost.items()
+            )
+            after_missing = sum(
+                max(0, amount - after.get(resource_type, 0))
+                for resource_type, amount in cost.items()
+            )
+            gain = max(gain, (before_missing - after_missing) * (len(goals) - rank))
+        return gain
+
+    def _choose_trade_auction_award(self, game, player):
+        player_index = game.players.index(player)
+        best = None
+        best_score = float("-inf")
+        goals = self._profile(player).goal_order[:2]
+        for auction in game.get_trade_auctions():
+            if auction.seller_index != player_index or not auction.bids:
+                continue
+            if not game.can_accept_trade_auction(player, auction):
+                continue
+            for bid in auction.bids:
+                goal_gain = self._auction_goal_gain(
+                    game,
+                    player,
+                    bid.offer,
+                    auction.offer,
+                    goals,
+                    restored_payment=auction.offer,
+                )
+                score = goal_gain * 5 + sum(bid.offer.values())
+                if score > best_score:
+                    best_score = score
+                    best = auction, bid
+        return best
+
+    def _choose_trade_auction_listing(self, game, player):
+        if not game.can_create_trade_auction(player):
+            return None
+        available = player.resource_ledger.available_map()
+        profile = self._profile(player)
+        primary_cost = self._goal_cost(game, player, profile.goal_order[0])
+        candidates = [
+            resource_type
+            for resource_type, amount in available.items()
+            if amount > primary_cost.get(resource_type, 0)
+        ]
+        if not candidates:
+            return None
+        resource_type = max(
+            candidates,
+            key=lambda candidate: (
+                available[candidate] - primary_cost.get(candidate, 0),
+                -candidate.value,
+            ),
+        )
+        return {resource_type: 1}, 1
 
     def _choose_domestic_trade(
         self,
@@ -472,9 +899,10 @@ class SimpleAI:
                 )
                 for partner in partners:
                     give_candidates = []
-                    for give_resource, amount in player.resources.items():
+                    for give_resource in player.resources:
                         if give_resource == receive_resource:
                             continue
+                        amount = player.available_resource_count(give_resource)
                         reserve = max(
                             0,
                             cost.get(give_resource, 0)
@@ -519,10 +947,13 @@ class SimpleAI:
         profile = self._profile(player)
         if not incoming or not outgoing:
             return "reject"
-        if any(player.resources[resource_type] < amount for resource_type, amount in outgoing.items()):
+        if any(
+            player.available_resource_count(resource_type) < amount
+            for resource_type, amount in outgoing.items()
+        ):
             return "reject"
-        before_resources = dict(player.resources)
-        after_resources = dict(player.resources)
+        before_resources = player.resource_ledger.available_map()
+        after_resources = dict(before_resources)
         for resource_type, amount in outgoing.items():
             after_resources[resource_type] -= amount
         for resource_type, amount in incoming.items():
@@ -696,8 +1127,9 @@ class SimpleAI:
         return None
 
     def _trade_resource_value(self, player, resource_type):
+        available = player.available_resource_count(resource_type)
         value = 10
-        if player.resources[resource_type] == 0:
+        if available == 0:
             value += 3
         profile_key = self._profile(player).key
         goal_weights = {
@@ -708,9 +1140,9 @@ class SimpleAI:
         }[profile_key]
         for weight, cost_name in goal_weights:
             cost = BUILD_COSTS[cost_name]
-            if cost.get(resource_type, 0) > player.resources[resource_type]:
+            if cost.get(resource_type, 0) > available:
                 value += weight
-        value -= min(4, max(0, player.resources[resource_type] - 2))
+        value -= min(4, max(0, available - 2))
         return value
 
     def _choose_monopoly_resource(self, game, player):
@@ -753,7 +1185,10 @@ class SimpleAI:
             for resource_type in missing:
                 if resource_type in available:
                     return resource_type
-        return min(available, key=lambda resource_type: player.resources[resource_type])
+        return min(
+            available,
+            key=lambda resource_type: player.available_resource_count(resource_type),
+        )
 
     def _choose_discard(self, player):
         preferred_goal = next(
@@ -1046,9 +1481,9 @@ class SimpleAI:
 
     def _missing_cards(self, player, cost):
         return {
-            resource_type: amount - player.resources.get(resource_type, 0)
+            resource_type: amount - player.available_resource_count(resource_type)
             for resource_type, amount in cost.items()
-            if player.resources.get(resource_type, 0) < amount
+            if player.available_resource_count(resource_type) < amount
         }
 
     def _edge_midpoint(self, edge):

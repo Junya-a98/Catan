@@ -31,6 +31,16 @@ SUPPORTED_GAME_COMMANDS = frozenset(
         "buy_development",
         "start_bank_trade",
         "start_domestic_trade",
+        "market_create",
+        "market_fill",
+        "market_cancel",
+        "auction_create",
+        "auction_bid",
+        "auction_cancel_bid",
+        "auction_accept",
+        "auction_cancel",
+        "credit_borrow",
+        "credit_repay",
         "trade_partner",
         "trade_broadcast",
         "trade_edit_side",
@@ -43,6 +53,20 @@ SUPPORTED_GAME_COMMANDS = frozenset(
         "trade_reject",
         "use_development",
         "finish_road_building",
+    }
+)
+
+# Persistent multiplayer systems may need a very small number of commands
+# from an authenticated participant who is not the current turn actor.  Keep
+# this an explicit wire-command allowlist: adding a command to
+# ``SUPPORTED_GAME_COMMANDS`` must never make it usable out of turn by
+# accident.  The auction dispatcher still owns the domain-level legality
+# checks (lot/revision/escrow); this policy only answers whether the trusted
+# session seat may reach that dispatcher at all.
+OFF_TURN_GAME_COMMANDS = frozenset(
+    {
+        "auction_bid",
+        "auction_cancel_bid",
     }
 )
 
@@ -62,6 +86,16 @@ _GAME_COMMAND_OPTION_ORDER = (
     "buy_development",
     "start_bank_trade",
     "start_domestic_trade",
+    "market_create",
+    "market_fill",
+    "market_cancel",
+    "auction_create",
+    "auction_bid",
+    "auction_cancel_bid",
+    "auction_accept",
+    "auction_cancel",
+    "credit_borrow",
+    "credit_repay",
     "trade_partner",
     "trade_broadcast",
     "trade_edit_side",
@@ -185,9 +219,10 @@ def build_game_command_options(
     stable board identifiers, making the result suitable for both Pygame and
     future browser clients.
 
-    A spectator, invalid/AI seat, non-active seat, or finished match receives
-    an empty list.  Descriptors are deterministic, unique by ``command`` plus
-    ``args``, and capped by :data:`MAX_GAME_COMMAND_OPTIONS`.
+    A spectator, invalid/AI seat, or finished match receives an empty list.
+    Non-active human seats receive only explicitly allowlisted persistent
+    auction commands. Descriptors are deterministic, unique by ``command``
+    plus ``args``, and capped by :data:`MAX_GAME_COMMAND_OPTIONS`.
     """
 
     players = list(getattr(game, "players", ()))
@@ -198,9 +233,12 @@ def build_game_command_options(
         or getattr(players[seat_index], "is_ai", False)
         or getattr(game, "phase", None) == "finished"
         or getattr(game, "winner", None) is not None
-        or resolve_active_actor_index(game) != seat_index
     ):
         return []
+
+    actor_index = resolve_active_actor_index(game)
+    if actor_index != seat_index:
+        return _build_off_turn_auction_options(game, players[seat_index])
 
     phase = getattr(game, "phase", None)
     if phase == "initial":
@@ -216,6 +254,15 @@ def build_game_command_options(
             special_phase,
         )
     return _build_main_command_options(game, players[seat_index])
+
+
+def _build_off_turn_auction_options(
+    game: Any,
+    player: Any,
+) -> list[dict[str, Any]]:
+    if not is_off_turn_game_command_allowed(game, "auction_bid"):
+        return []
+    return _finalise_command_options(_trade_auction_command_options(game, player))
 
 
 def _build_initial_command_options(game: Any) -> list[dict[str, Any]]:
@@ -293,10 +340,111 @@ def _build_main_command_options(
         options.append(_command_option("start_bank_trade"))
     if game.has_domestic_trade_option(player):
         options.append(_command_option("start_domestic_trade"))
+    if getattr(game, "can_create_trade_market_order", lambda _player: False)(
+        player
+    ):
+        options.append(_command_option("market_create"))
+    get_market_orders = getattr(game, "get_trade_market_orders", lambda: ())
+    player_index = list(getattr(game, "players", ())).index(player)
+    for order in get_market_orders():
+        if order.seller_index == player_index:
+            options.append(
+                _command_option(
+                    "market_cancel",
+                    order_id=order.order_id,
+                    revision=order.revision,
+                )
+            )
+        elif getattr(game, "can_fill_trade_market_order", lambda *_args: False)(
+            player,
+            order,
+        ):
+            options.append(
+                _command_option(
+                    "market_fill",
+                    order_id=order.order_id,
+                    revision=order.revision,
+                )
+            )
+    options.extend(_trade_auction_command_options(game, player))
+    options.extend(_resource_credit_command_options(game, player))
     if getattr(game, "action_mode", None) is not None:
         options.append(_command_option("cancel"))
     options.append(_command_option("end_turn"))
     return _finalise_command_options(options)
+
+
+def _resource_credit_command_options(game: Any, player: Any) -> list[dict[str, Any]]:
+    options: list[dict[str, Any]] = []
+    for resource in RESOURCE_TYPES:
+        if getattr(game, "can_borrow_resource_credit", lambda *_args: False)(
+            player,
+            resource,
+        ):
+            options.append(
+                _command_option("credit_borrow", resource=resource.name)
+            )
+    loan = getattr(game, "get_resource_credit_loan", lambda _player: None)(player)
+    if loan is not None and getattr(
+        game,
+        "can_repay_resource_credit",
+        lambda *_args: False,
+    )(player):
+        options.append(
+            _command_option(
+                "credit_repay",
+                loan_id=loan.loan_id,
+                revision=loan.revision,
+            )
+        )
+    return options
+
+
+def _trade_auction_command_options(game: Any, player: Any) -> list[dict[str, Any]]:
+    options: list[dict[str, Any]] = []
+    if getattr(game, "can_create_trade_auction", lambda _player: False)(player):
+        options.append(_command_option("auction_create"))
+    players = list(getattr(game, "players", ()))
+    try:
+        player_index = players.index(player)
+    except ValueError:
+        return options
+    for auction in getattr(game, "get_trade_auctions", lambda: ())():
+        reference = {
+            "auction_id": auction.auction_id,
+            "revision": auction.revision,
+        }
+        if auction.seller_index == player_index:
+            if getattr(game, "can_accept_trade_auction", lambda *_args: False)(
+                player,
+                auction,
+            ):
+                options.extend(
+                    _command_option(
+                        "auction_accept",
+                        **reference,
+                        bidder_index=bid.bidder_index,
+                    )
+                    for bid in auction.bids
+                )
+            if getattr(game, "can_cancel_trade_auction", lambda *_args: False)(
+                player,
+                auction,
+            ):
+                options.append(_command_option("auction_cancel", **reference))
+            continue
+        if getattr(game, "can_bid_trade_auction", lambda *_args: False)(
+            player,
+            auction,
+        ):
+            options.append(_command_option("auction_bid", **reference))
+        if getattr(
+            game,
+            "can_cancel_trade_auction_bid",
+            lambda *_args: False,
+        )(player, auction):
+            options.append(_command_option("auction_cancel_bid", **reference))
+    return options
 
 
 def _development_command_options(
@@ -389,7 +537,7 @@ def _bank_trade_give_options(game: Any, player: Any) -> list[dict[str, Any]]:
         _command_option("select_resource", resource=resource.name)
         for resource in RESOURCE_TYPES
         if resource in rates
-        and player.resources.get(resource, 0) >= rates[resource]
+        and player.available_resource_count(resource) >= rates[resource]
         and any(
             receive is not resource and game.bank.available(receive) > 0
             for receive in RESOURCE_TYPES
@@ -407,7 +555,7 @@ def _bank_trade_receive_options(
     rates = game.get_trade_rates(player)
     can_still_pay = (
         give_resource in rates
-        and player.resources.get(give_resource, 0) >= rates[give_resource]
+        and player.available_resource_count(give_resource) >= rates[give_resource]
     )
     options = [
         _command_option("select_resource", resource=resource.name)
@@ -455,7 +603,7 @@ def _domestic_trade_options(
             _command_option("trade_partner", seat_index=index)
             for index, candidate in enumerate(getattr(game, "players", ()))
             if candidate is not active_player
-            and candidate.total_resource_count() > 0
+            and candidate.available_resource_total() > 0
         )
         if game.get_domestic_trade_eligible_partners(active_player):
             options.append(_command_option("trade_broadcast"))
@@ -671,22 +819,26 @@ def apply_game_command(
         raise NetworkActionError("unsupported_command", "未対応のゲーム操作です。")
     command_args = _normalise_args(args)
 
-    actor_index = resolve_active_actor_index(game)
-    if actor_index is None:
-        raise NetworkActionError(
-            "no_active_actor", "現在はプレイヤー操作を受け付けていません。"
-        )
-    if seat_index != actor_index:
-        raise NetworkActionError(
-            "not_active_player", "現在この操作を行える席ではありません。"
-        )
     if getattr(players[seat_index], "is_ai", False):
         raise NetworkActionError(
             "seat_not_controllable", "AIの席をネットワークから操作できません。"
         )
 
+    actor_index = resolve_active_actor_index(game)
+    if actor_index is None:
+        raise NetworkActionError(
+            "no_active_actor", "現在はプレイヤー操作を受け付けていません。"
+        )
+    if seat_index != actor_index and not is_off_turn_game_command_allowed(
+        game,
+        command,
+    ):
+        raise NetworkActionError(
+            "not_active_player", "現在この操作を行える席ではありません。"
+        )
+
     before = _state_fingerprint(game)
-    _dispatch(game, command, command_args)
+    _dispatch(game, command, command_args, seat_index=seat_index)
     after = _state_fingerprint(game)
     if before == after:
         raise NetworkActionError(
@@ -697,7 +849,34 @@ def apply_game_command(
     return True
 
 
-def _dispatch(game: Any, command: str, args: dict[str, Any]) -> None:
+def is_off_turn_game_command_allowed(game: Any, command: Any) -> bool:
+    """Return whether ``command`` may cross the non-active-seat boundary.
+
+    This is intentionally narrower than domain legality.  A permitted command
+    must still be authenticated by the controller, dispatched with that
+    trusted seat, pass its auction and escrow validation, and mutate state.
+    Transient mandatory/UI phases are excluded so an asynchronous cancellation
+    cannot change the hand used by discard or domestic-trade resolution.
+    """
+
+    return bool(
+        type(command) is str
+        and command in OFF_TURN_GAME_COMMANDS
+        and getattr(game, "phase", None) == "main"
+        and getattr(game, "winner", None) is None
+        and getattr(game, "special_phase", None) is None
+        and getattr(game, "action_mode", None) is None
+        and not getattr(game, "has_active_dice_animation", lambda: False)()
+    )
+
+
+def _dispatch(
+    game: Any,
+    command: str,
+    args: dict[str, Any],
+    *,
+    seat_index: int,
+) -> None:
     if command in _EMPTY_ARGS_COMMANDS:
         _expect_fields(args)
 
@@ -723,6 +902,26 @@ def _dispatch(game: Any, command: str, args: dict[str, Any]) -> None:
         _start_bank_trade(game)
     elif command == "start_domestic_trade":
         _start_domestic_trade(game)
+    elif command == "market_create":
+        _market_create(game, args)
+    elif command == "market_fill":
+        _market_fill(game, args)
+    elif command == "market_cancel":
+        _market_cancel(game, args)
+    elif command == "auction_create":
+        _auction_create(game, game.players[seat_index], args)
+    elif command == "auction_bid":
+        _auction_bid(game, game.players[seat_index], args)
+    elif command == "auction_cancel_bid":
+        _auction_cancel_bid(game, game.players[seat_index], args)
+    elif command == "auction_accept":
+        _auction_accept(game, game.players[seat_index], args)
+    elif command == "auction_cancel":
+        _auction_cancel(game, game.players[seat_index], args)
+    elif command == "credit_borrow":
+        _credit_borrow(game, game.players[seat_index], args)
+    elif command == "credit_repay":
+        _credit_repay(game, game.players[seat_index], args)
     elif command == "trade_partner":
         _trade_partner(game, args)
     elif command == "trade_broadcast":
@@ -802,15 +1001,14 @@ def _build(game: Any, args: dict[str, Any]) -> None:
     piece = args["piece"]
     if piece not in ("road", "settlement", "city"):
         raise NetworkActionError("invalid_args", "建設する駒の種類が不正です。")
+    special_phase = getattr(game, "special_phase", None)
     if (
         getattr(game, "phase", None) != "main"
         or getattr(game, "winner", None) is not None
-        or not getattr(game, "dice_rolled", False)
     ):
         _not_allowed("現在は建設できません。")
 
     player = game.get_current_player()
-    special_phase = getattr(game, "special_phase", None)
     if special_phase == "road_building":
         if piece != "road":
             _not_allowed("街道建設カードでは街道だけを配置できます。")
@@ -822,6 +1020,8 @@ def _build(game: Any, args: dict[str, Any]) -> None:
             raise NetworkActionError("invalid_target", "その辺には街道を置けません。")
         game.handle_free_road_build_click(_edge_midpoint(edge))
         return
+    if not getattr(game, "dice_rolled", False):
+        _not_allowed("現在は建設できません。")
     if special_phase is not None:
         _not_allowed("進行中の特殊処理を先に完了してください。")
 
@@ -913,7 +1113,7 @@ def _select_resource(game: Any, args: dict[str, Any]) -> None:
         player = game.get_current_player()
         rates = game.get_trade_rates(player)
         if special_phase == "bank_trade_give":
-            if player.resources[resource] < rates[resource]:
+            if player.available_resource_count(resource) < rates[resource]:
                 raise NetworkActionError(
                     "invalid_target", "その資源は必要枚数を支払えません。"
                 )
@@ -966,13 +1166,110 @@ def _start_domestic_trade(game: Any) -> None:
     game.start_domestic_trade()
 
 
+def _market_create(game: Any, args: dict[str, Any]) -> None:
+    _expect_fields(args, "offer", "wanted")
+    player = game.get_current_player()
+    if not getattr(game, "can_create_trade_market_order", lambda _player: False)(
+        player
+    ):
+        _not_allowed("現在は常設市場へ出品できません。")
+    offer = _market_resource_bundle(args["offer"], label="出品資源")
+    wanted = _market_resource_bundle(args["wanted"], label="希望資源")
+    if not game.create_trade_market_order(player, offer, wanted):
+        _not_allowed("常設市場へ出品できませんでした。")
+
+
+def _market_fill(game: Any, args: dict[str, Any]) -> None:
+    _expect_fields(args, "order_id", "revision")
+    order_id, revision = _market_order_reference(args)
+    player = game.get_current_player()
+    if not game.fill_trade_market_order(player, order_id, revision):
+        _not_allowed("常設市場の注文を購入できませんでした。")
+
+
+def _market_cancel(game: Any, args: dict[str, Any]) -> None:
+    _expect_fields(args, "order_id", "revision")
+    order_id, revision = _market_order_reference(args)
+    player = game.get_current_player()
+    if not game.cancel_trade_market_order(player, order_id, revision):
+        _not_allowed("常設市場の注文を取り消せませんでした。")
+
+
+def _auction_create(game: Any, player: Any, args: dict[str, Any]) -> None:
+    _expect_fields(args, "offer", "minimum_bid_cards")
+    minimum = args["minimum_bid_cards"]
+    if type(minimum) is not int or not 1 <= minimum <= 19:
+        raise NetworkActionError(
+            "invalid_args",
+            "最低入札枚数は1〜19で指定してください。",
+        )
+    offer = _market_resource_bundle(args["offer"], label="競売の出品資源")
+    if not game.create_trade_auction(player, offer, minimum):
+        _not_allowed("公開競売を開始できませんでした。")
+
+
+def _auction_bid(game: Any, player: Any, args: dict[str, Any]) -> None:
+    _expect_fields(args, "auction_id", "revision", "offer")
+    auction_id, revision = _auction_reference(args)
+    offer = _market_resource_bundle(args["offer"], label="入札資源")
+    if not game.bid_trade_auction(player, auction_id, revision, offer):
+        _not_allowed("公開競売へ入札できませんでした。")
+
+
+def _auction_cancel_bid(game: Any, player: Any, args: dict[str, Any]) -> None:
+    _expect_fields(args, "auction_id", "revision")
+    auction_id, revision = _auction_reference(args)
+    if not game.cancel_trade_auction_bid(player, auction_id, revision):
+        _not_allowed("公開競売の入札を取り消せませんでした。")
+
+
+def _auction_accept(game: Any, player: Any, args: dict[str, Any]) -> None:
+    _expect_fields(args, "auction_id", "revision", "bidder_index")
+    auction_id, revision = _auction_reference(args)
+    bidder_index = _validated_target_seat(game, args["bidder_index"])
+    if not game.accept_trade_auction(
+        player,
+        auction_id,
+        revision,
+        bidder_index,
+    ):
+        _not_allowed("公開競売の落札者を決定できませんでした。")
+
+
+def _auction_cancel(game: Any, player: Any, args: dict[str, Any]) -> None:
+    _expect_fields(args, "auction_id", "revision")
+    auction_id, revision = _auction_reference(args)
+    if not game.cancel_trade_auction(player, auction_id, revision):
+        _not_allowed("公開競売を取り消せませんでした。")
+
+
+def _credit_borrow(game: Any, player: Any, args: dict[str, Any]) -> None:
+    _expect_fields(args, "resource")
+    resource = _resource_from_name(args["resource"])
+    if not getattr(game, "can_borrow_resource_credit", lambda *_args: False)(
+        player,
+        resource,
+    ):
+        _not_allowed("現在はその資源を借りられません。")
+    if not game.borrow_resource_credit(player, resource):
+        _not_allowed("資源を借りられませんでした。")
+
+
+def _credit_repay(game: Any, player: Any, args: dict[str, Any]) -> None:
+    _expect_fields(args, "loan_id", "revision", "payment")
+    loan_id, revision = _credit_reference(args)
+    payment = _credit_payment_bundle(args["payment"])
+    if not game.repay_resource_credit(player, loan_id, revision, payment):
+        _not_allowed("ローンを返済できませんでした。")
+
+
 def _trade_partner(game: Any, args: dict[str, Any]) -> None:
     _expect_fields(args, "seat_index")
     _require_phase(game, "domestic_trade_partner")
     target_index = _validated_target_seat(game, args["seat_index"])
     if target_index == resolve_active_actor_index(game):
         raise NetworkActionError("invalid_target", "自分自身とは交易できません。")
-    if game.players[target_index].total_resource_count() <= 0:
+    if game.players[target_index].available_resource_total() <= 0:
         raise NetworkActionError("invalid_target", "その席には交換可能な資源がありません。")
     game.select_domestic_trade_partner(target_index)
 
@@ -1110,6 +1407,61 @@ def _resource_from_name(value: Any) -> ResourceType:
     if resource is ResourceType.DESERT:
         raise NetworkActionError("invalid_args", "砂漠は資源として選べません。")
     return resource
+
+
+def _market_resource_bundle(value: Any, *, label: str) -> dict[ResourceType, int]:
+    if type(value) is not dict or not value:
+        raise NetworkActionError("invalid_args", f"{label}が不正です。")
+    bundle = {}
+    for name, amount in value.items():
+        resource = _resource_from_name(name)
+        if type(amount) is not int or not 1 <= amount <= 19:
+            raise NetworkActionError(
+                "invalid_args",
+                f"{label}の枚数は1〜19で指定してください。",
+            )
+        bundle[resource] = amount
+    return bundle
+
+
+def _credit_payment_bundle(value: Any) -> dict[ResourceType, int]:
+    bundle = _market_resource_bundle(value, label="返済資源")
+    if sum(bundle.values()) > 3:
+        raise NetworkActionError(
+            "invalid_args",
+            "1回の返済は合計3枚以下で指定してください。",
+        )
+    return bundle
+
+
+def _market_order_reference(args: dict[str, Any]) -> tuple[str, int]:
+    order_id = args["order_id"]
+    revision = args["revision"]
+    if type(order_id) is not str or not order_id:
+        raise NetworkActionError("invalid_args", "市場order_idが不正です。")
+    if type(revision) is not int or revision < 1:
+        raise NetworkActionError("invalid_args", "市場revisionが不正です。")
+    return order_id, revision
+
+
+def _auction_reference(args: dict[str, Any]) -> tuple[str, int]:
+    auction_id = args["auction_id"]
+    revision = args["revision"]
+    if type(auction_id) is not str or not auction_id:
+        raise NetworkActionError("invalid_args", "auction_idが不正です。")
+    if type(revision) is not int or revision < 1:
+        raise NetworkActionError("invalid_args", "競売revisionが不正です。")
+    return auction_id, revision
+
+
+def _credit_reference(args: dict[str, Any]) -> tuple[str, int]:
+    loan_id = args["loan_id"]
+    revision = args["revision"]
+    if type(loan_id) is not str or not loan_id:
+        raise NetworkActionError("invalid_args", "loan_idが不正です。")
+    if type(revision) is not int or revision < 1:
+        raise NetworkActionError("invalid_args", "ローンrevisionが不正です。")
+    return loan_id, revision
 
 
 def _validated_target_seat(game: Any, value: Any) -> int:

@@ -12,6 +12,7 @@ from game.network_actions import (
     advance_network_handoffs,
     apply_game_command,
     build_game_command_options,
+    is_off_turn_game_command_allowed,
     resolve_active_actor_index,
 )
 from game.network_protocol import build_board_reference_index
@@ -70,6 +71,57 @@ def test_session_seat_is_the_only_actor_authority(game):
         apply_game_command(game, 0, "roll_dice", {"seat_index": 1})
     assert spoof_error.value.code == "invalid_args"
     assert game.initial_dice_histories[game.players[0].name] == []
+
+
+def test_ai_seat_is_rejected_before_turn_authority_is_considered(game):
+    game.players[1].is_ai = True
+
+    with pytest.raises(NetworkActionError) as error:
+        apply_game_command(game, 1, "roll_dice")
+
+    assert error.value.code == "seat_not_controllable"
+    assert game.initial_dice_histories[game.players[0].name] == []
+
+
+@pytest.mark.parametrize(
+    "command",
+    ("auction_bid", "auction_cancel_bid"),
+)
+def test_only_explicit_auction_commands_cross_idle_main_turn_boundary(
+    game,
+    command,
+):
+    game.phase = "main"
+    game.current_player_index = 0
+
+    assert is_off_turn_game_command_allowed(game, command) is True
+    assert is_off_turn_game_command_allowed(game, "auction_create") is False
+    assert is_off_turn_game_command_allowed(game, "auction_accept") is False
+    assert is_off_turn_game_command_allowed(game, "auction_cancel") is False
+    assert is_off_turn_game_command_allowed(game, "roll_dice") is False
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("phase", "initial"),
+        ("phase", "finished"),
+        ("winner", object()),
+        ("special_phase", "discard"),
+        ("special_phase", "domestic_trade_response"),
+        ("action_mode", "build_road"),
+    ),
+)
+def test_off_turn_auction_commands_are_blocked_during_transient_state(
+    game,
+    field,
+    value,
+):
+    game.phase = "main"
+    game.current_player_index = 0
+    setattr(game, field, value)
+
+    assert is_off_turn_game_command_allowed(game, "auction_bid") is False
 
 
 def test_initial_dice_and_placement_resolve_the_current_actor_and_stable_targets(game):
@@ -487,6 +539,58 @@ def test_road_building_options_require_placing_remaining_legal_roads(game):
     player.roads_remaining = 0
     assert build_game_command_options(game, 0) == [
         {"command": "finish_road_building", "args": {}}
+    ]
+
+
+def test_road_building_before_roll_accepts_both_free_road_targets(game):
+    game.phase = "main"
+    game.current_player_index = 0
+    game.dice_rolled = False
+    player = game.players[0]
+    anchor = game.board.nodes[0]
+    anchor.building = Building(player)
+    player.settlements_remaining -= 1
+    player.development_cards[DevelopmentCardType.ROAD_BUILDING] = 1
+
+    ordinary_edge = game.get_buildable_road_edges(
+        player,
+        require_affordability=False,
+    )[0]
+    with pytest.raises(NetworkActionError) as error:
+        apply_game_command(
+            game,
+            0,
+            "build",
+            {
+                "piece": "road",
+                "target": _target_id(game, ordinary_edge, "edge"),
+            },
+        )
+    assert error.value.code == "action_not_allowed"
+
+    assert apply_game_command(
+        game,
+        0,
+        "use_development",
+        {"card": "road_building"},
+    )
+    assert game.special_phase == "road_building"
+    assert game.dice_rolled is False
+
+    for remaining in (1, 0):
+        road_option = next(
+            option
+            for option in build_game_command_options(game, 0)
+            if option["command"] == "build"
+        )
+        assert apply_game_command(game, 0, "build", road_option["args"])
+        assert game.free_roads_remaining == remaining
+
+    assert game.special_phase is None
+    assert game.dice_rolled is False
+    assert len([road for road in game.board.roads if road.owner is player]) == 2
+    assert build_game_command_options(game, 0) == [
+        {"command": "roll_dice", "args": {}}
     ]
 
 

@@ -8,7 +8,7 @@ import struct
 from game.ai_personality import AI_PERSONALITY_PROFILES, MIXED
 from game.custom_map import CustomMapError, CustomMapSpec
 from game.persistence import serialize_game
-from game.variant import VariantConfig
+from game.variant import TRADE2_VARIANT_KIND, VariantConfig
 from game.variant_state import VariantState
 
 
@@ -495,6 +495,11 @@ def build_state_snapshot(game, *, viewer_player_index=None, revision=0):
     )
 
     for index, player in enumerate(state["players"]):
+        # Reservation IDs and bundles are authority-only until the public
+        # standing-market state is introduced.  The existing resources map
+        # remains the viewer's total owned hand, so live/replay clients retain
+        # their established schema without learning escrow internals.
+        player.pop("resource_ledger", None)
         resources = player["resources"]
         development_cards = player["development_cards"]
         new_development_cards = player["new_development_cards"]
@@ -510,6 +515,12 @@ def build_state_snapshot(game, *, viewer_player_index=None, revision=0):
             # completed match result is the sole reveal boundary.
             player["ai_personality"] = None
         if index == viewer_player_index:
+            if variant_config.has_component(TRADE2_VARIANT_KIND):
+                available = game.players[index].resource_ledger.available_map()
+                player["resources"] = {
+                    resource.name: amount
+                    for resource, amount in available.items()
+                }
             continue
         player["resources"] = None
         player["development_cards"] = None

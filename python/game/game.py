@@ -55,6 +55,7 @@ from game.dice import roll_two_dice
 from game.feedback import FeedbackManager
 from game.forecast_events import (
     BANDIT_RAID_EVENT_ID,
+    CAMPAIGN_FORECAST_CATALOG_ID,
     CONSTRUCTION_BOOM_EVENT_ID,
     EARTHQUAKE_EVENT_ID,
     FORECAST_EVENTS_KIND,
@@ -65,6 +66,7 @@ from game.forecast_events import (
     event_definition,
 )
 from game.frontier import FRONTIER_KIND
+from game.grand_campaign import GrandCampaignError, HarborBlockadePlan
 from game.game_board import GameBoard
 from game.house_rules import HouseRules
 from game.guidance import (
@@ -121,9 +123,39 @@ from game.pre_game_settings_display import (
     hit_test_pre_game_settings,
 )
 from game.resources import BUILD_COSTS, ResourceType
+from game.resource_credit import (
+    BANK_TO_PLAYER,
+    LOAN_ACTIVE,
+    PLAYER_TO_BANK,
+    ResourceCreditError,
+)
 from game.road import Road
-from game.variant import VariantConfig
-from game.variant_state import VariantState
+from game.trade_market import (
+    MAX_OPEN_ORDERS,
+    MAX_OPEN_ORDERS_PER_SELLER,
+    MarketOrder,
+    TradeMarketError,
+)
+from game.trade_auction import (
+    LEDGER_CONSUME,
+    LEDGER_RELEASE,
+    LEDGER_REPLACE,
+    LEDGER_RESERVE,
+    MAX_OPEN_AUCTIONS,
+    MAX_OPEN_AUCTIONS_PER_SELLER,
+    AuctionLot,
+    TradeAuctionError,
+)
+from game.variant import (
+    COMPOSITE_VARIANT_KIND,
+    CREDIT_VARIANT_KIND,
+    TRADE2_AUCTION_CATALOG,
+    TRADE2_VARIANT_KIND,
+    VariantConfig,
+    variant_board_topology,
+    variant_uses_hidden_board,
+)
+from game.variant_state import VariantState, VariantStateError
 from game.replay import (
     DEFAULT_REPLAY_DIR,
     ReplayError,
@@ -231,7 +263,7 @@ class CatanGame:
                 raise ValueError("custom board mode requires a CustomMapSpec")
         elif self.custom_map_spec is not None:
             raise ValueError("custom_map is only valid in custom board mode")
-        if self.variant_config.kind == FRONTIER_KIND and self.board_mode == "custom":
+        if variant_uses_hidden_board(self.variant_config) and self.board_mode == "custom":
             raise ValueError("frontier variant is available only on generated boards")
         self.board = self.create_board_from_settings()
         self.board_rules = BoardRules(
@@ -509,6 +541,9 @@ class CatanGame:
             "イベント予告",
             "イベント発動",
             "発見",
+            "借入",
+            "返済",
+            "延滞",
         )
         is_important = points_changed or any(
             term in str(label) for term in important_terms
@@ -1057,26 +1092,87 @@ class CatanGame:
     def create_board_from_settings(self):
         """Build the board described by the portable pre-game settings."""
 
+        topology_id = variant_board_topology(self.variant_config)
         return GameBoard(
             mode=self.board_mode,
             seed=self.board_seed,
             custom_map=(self.custom_map_spec if self.board_mode == "custom" else None),
+            topology_id=topology_id,
         )
 
     def create_initial_variant_state(self):
         """Bind fresh variant state to the board that owns hidden information."""
 
         robber_axial = None
-        if self.variant_config.kind == FRONTIER_KIND:
+        if variant_uses_hidden_board(self.variant_config):
             if self.board_mode == "custom":
                 raise ValueError("frontier variant is available only on generated boards")
             if self.board.robber_tile is None:
                 raise ValueError("frontier variant requires a robber tile")
             robber_axial = self.board.robber_tile.axial
+        forecast_harbor_ids = None
+        forecast_config = self.variant_config.component_config(
+            FORECAST_EVENTS_KIND
+        )
+        if (
+            forecast_config is not None
+            and forecast_config.options.get("catalog")
+            == CAMPAIGN_FORECAST_CATALOG_ID
+        ):
+            frontier_config = self.variant_config.component_config(FRONTIER_KIND)
+            if frontier_config is None or robber_axial is None:
+                raise ValueError("campaign forecast requires frontier state")
+            initial_frontier = VariantState.initial(
+                frontier_config,
+                frontier_robber_axial=robber_axial,
+            )
+            forecast_harbor_ids = self._public_harbor_ids_for_frontier_state(
+                initial_frontier
+            )
         return VariantState.initial(
             self.variant_config,
             frontier_robber_axial=robber_axial,
+            forecast_harbor_ids=forecast_harbor_ids,
         )
+
+    def _public_harbor_ids_for_frontier_state(self, frontier_state):
+        """Return stable IDs visible in one supplied frontier snapshot."""
+
+        from game.network_protocol import build_board_reference_index
+
+        harbor_references = build_board_reference_index(self)["harbor"]
+        visible = []
+        for harbor_id, harbor in harbor_references.items():
+            adjacent = self.board.get_edge_adjacent_tiles(
+                (harbor.node1, harbor.node2)
+            )
+            if any(
+                frontier_state.is_frontier_tile_revealed(tile.axial)
+                for tile in adjacent
+            ):
+                visible.append(harbor_id)
+        return tuple(visible)
+
+    def get_public_harbor_ids(self):
+        """Return current viewer-safe stable harbor IDs in canonical order."""
+
+        if not self.is_frontier_variant():
+            return None
+        frontier_state = self.get_variant_component_state(FRONTIER_KIND)
+        if frontier_state is None:
+            return None
+        return self._public_harbor_ids_for_frontier_state(frontier_state)
+
+    def get_campaign_forecast_harbor_ids(self):
+        forecast_config = self.get_variant_component_config(FORECAST_EVENTS_KIND)
+        if (
+            forecast_config is None
+            or forecast_config.options.get("catalog")
+            != CAMPAIGN_FORECAST_CATALOG_ID
+        ):
+            return None
+        harbor_ids = self.get_public_harbor_ids()
+        return () if harbor_ids is None else harbor_ids
 
     def get_active_feedback(self):
         return self.feedback.get_active(pygame.time.get_ticks())
@@ -1210,6 +1306,13 @@ class CatanGame:
         variant_label = {
             FORECAST_EVENTS_KIND: "予告イベント",
             FRONTIER_KIND: "フロンティア探索",
+            TRADE2_VARIANT_KIND: (
+                "交易2.0・市場と公開競売"
+                if self.is_trade_auction_variant()
+                else "交易2.0・常設市場"
+            ),
+            CREDIT_VARIANT_KIND: "資源信用所",
+            COMPOSITE_VARIANT_KIND: "複合・予告イベント＋交易2.0＋信用",
         }.get(self.variant_config.kind, "通常")
         return (
             f"{mode_label} / seed {self.board_seed} / AI {self.ai_player_count}人（{ai_label}）/ "
@@ -1268,6 +1371,13 @@ class CatanGame:
                     {
                         FORECAST_EVENTS_KIND: "予告イベント",
                         FRONTIER_KIND: "フロンティア探索",
+                        TRADE2_VARIANT_KIND: (
+                            "交易2.0・市場と公開競売"
+                            if self.is_trade_auction_variant()
+                            else "交易2.0・常設市場"
+                        ),
+                        CREDIT_VARIANT_KIND: "資源信用所",
+                        COMPOSITE_VARIANT_KIND: "複合・イベント経済",
                     }.get(self.variant_config.kind, "通常"),
                 ),
             ],
@@ -1946,22 +2056,73 @@ class CatanGame:
         self.last_dice_pair = None
         self.action_mode = None
         self.development_card_used_this_turn = False
+        # A loan and its repayment are both meaningful economic actions.  One
+        # credit action per turn prevents borrow -> repay -> borrow loops while
+        # still letting the next player use the same public credit book.
+        self.credit_action_taken_this_turn = False
         self.ai_domestic_trade_attempted = False
+        self.ai_market_action_attempted = False
+        self.ai_auction_action_attempted = False
         self.reset_special_phase_state()
 
     def is_forecast_variant(self):
-        return (
-            getattr(getattr(self, "variant_config", None), "kind", None)
-            == FORECAST_EVENTS_KIND
+        config = getattr(self, "variant_config", None)
+        return bool(
+            isinstance(config, VariantConfig)
+            and config.has_component(FORECAST_EVENTS_KIND)
         )
 
     def is_frontier_variant(self):
-        return self.variant_config.kind == FRONTIER_KIND
+        return self.variant_config.has_component(FRONTIER_KIND)
+
+    def is_trade_market_variant(self):
+        return self.variant_config.has_component(TRADE2_VARIANT_KIND)
+
+    def is_trade_auction_variant(self):
+        trade_config = self.get_variant_component_config(TRADE2_VARIANT_KIND)
+        return bool(
+            trade_config is not None
+            and trade_config.options.get("catalog") == TRADE2_AUCTION_CATALOG
+        )
+
+    def is_credit_variant(self):
+        return self.variant_config.has_component(CREDIT_VARIANT_KIND)
+
+    def get_variant_component_config(self, kind):
+        """Return one direct or nested component configuration."""
+
+        return self.variant_config.component_config(kind)
+
+    def get_variant_component_state(self, kind):
+        """Return one direct or nested authority state."""
+
+        variant_state = getattr(self, "variant_state", None)
+        if variant_state is None:
+            return None
+        return variant_state.component_state(kind)
+
+    def replace_variant_component_state(self, kind, component_state):
+        """Publish one same-clock child mutation without touching siblings."""
+
+        self.variant_state = self.variant_state.with_component_state(
+            self.variant_config,
+            kind,
+            component_state,
+        )
+
+    def get_variant_completed_turns(self, kind):
+        component = self.get_variant_component_state(kind)
+        if component is None:
+            return 0
+        return component.public["completed_turns"]
 
     def is_frontier_tile_revealed(self, tile):
         if not self.is_frontier_variant():
             return True
-        return self.variant_state.is_frontier_tile_revealed(tile.axial)
+        frontier_state = self.get_variant_component_state(FRONTIER_KIND)
+        if frontier_state is None:  # pragma: no cover - fixed config invariant.
+            return False
+        return frontier_state.is_frontier_tile_revealed(tile.axial)
 
     def get_public_node_tiles(self, node):
         """Return only terrain an AI or viewer is allowed to evaluate."""
@@ -2008,11 +2169,15 @@ class CatanGame:
         hidden_tiles = self.get_frontier_edge_discovery_tiles((road.node1, road.node2))
         if not hidden_tiles:
             return ()
-        self.variant_state, revealed_axials = self.variant_state.reveal_frontier_tiles(
+        frontier_state = self.get_variant_component_state(FRONTIER_KIND)
+        if frontier_state is None:  # pragma: no cover - guarded by variant check.
+            return ()
+        next_frontier, revealed_axials = frontier_state.reveal_frontier_tiles(
             [tile.axial for tile in hidden_tiles]
         )
         if not revealed_axials:
             return ()
+        self.replace_variant_component_state(FRONTIER_KIND, next_frontier)
         revealed_set = set(revealed_axials)
         revealed_tiles = tuple(
             tile for tile in hidden_tiles if tile.axial in revealed_set
@@ -2034,34 +2199,39 @@ class CatanGame:
         return revealed_tiles
 
     def is_forecast_event_active(self, event_id):
+        forecast_state = self.get_variant_component_state(FORECAST_EVENTS_KIND)
         return bool(
-            self.is_forecast_variant()
-            and event_id in self.variant_state.active_forecast_event_ids()
+            forecast_state is not None
+            and event_id in forecast_state.active_forecast_event_ids()
         )
 
     def get_next_forecast_event_id(self):
-        if not self.is_forecast_variant():
+        forecast_state = self.get_variant_component_state(FORECAST_EVENTS_KIND)
+        if forecast_state is None:
             return None
-        return self.variant_state.next_forecast_event_id()
+        return forecast_state.next_forecast_event_id()
 
     def get_next_forecast_parameters(self):
-        if not self.is_forecast_variant():
+        forecast_state = self.get_variant_component_state(FORECAST_EVENTS_KIND)
+        if forecast_state is None:
             return {}
-        return dict(self.variant_state.next_forecast_parameters())
+        return dict(forecast_state.next_forecast_parameters())
 
     def get_next_forecast_turns_remaining(self):
-        if not self.is_forecast_variant():
+        forecast_state = self.get_variant_component_state(FORECAST_EVENTS_KIND)
+        if forecast_state is None:
             return None
-        public = self.variant_state.public
+        public = forecast_state.public
         return max(
             0,
             public["forecast"]["resolve_turn"] - public["completed_turns"],
         )
 
     def get_active_forecast_effect(self, event_id):
-        if not self.is_forecast_variant():
+        forecast_state = self.get_variant_component_state(FORECAST_EVENTS_KIND)
+        if forecast_state is None:
             return None
-        return self.variant_state.active_forecast_effect(event_id)
+        return forecast_state.active_forecast_effect(event_id)
 
     def get_forecast_event_parameters(self, event_id, *, active=False):
         if active:
@@ -2084,9 +2254,11 @@ class CatanGame:
 
     def describe_forecast_parameters(self, event_id, parameters):
         if event_id == HARBOR_BLOCKADE_EVENT_ID:
-            harbor_id = parameters.get("harbor_id")
+            harbor_id = self._forecast_harbor_id_from_parameters(parameters)
             if isinstance(harbor_id, str) and harbor_id.startswith("harbor-"):
                 return f"対象: 交換所 #{int(harbor_id.split('-')[1]) + 1}"
+            if "campaign_plan" in parameters:
+                return "対象: 公開済み交換所なし（今回は発動なし）"
         if event_id == BANDIT_RAID_EVENT_ID:
             target_number = parameters.get("target_number")
             if isinstance(target_number, int):
@@ -2094,6 +2266,28 @@ class CatanGame:
         if event_id == EARTHQUAKE_EVENT_ID:
             return f"対象: {self.forecast_sector_label(parameters.get('sector'))}"
         return ""
+
+    @staticmethod
+    def _forecast_harbor_id_from_parameters(parameters):
+        harbor_id = parameters.get("harbor_id")
+        if isinstance(harbor_id, str):
+            return harbor_id
+        plan_document = parameters.get("campaign_plan")
+        if plan_document is None:
+            return None
+        try:
+            plan_document = {
+                **dict(plan_document),
+                "eligible_harbor_ids": list(
+                    plan_document["eligible_harbor_ids"]
+                ),
+                "outcome": dict(plan_document["outcome"]),
+            }
+            return HarborBlockadePlan.from_public_document(
+                plan_document
+            ).target_harbor_id
+        except (GrandCampaignError, KeyError, TypeError):
+            return None
 
     def get_forecast_harbor(self, harbor_id):
         if not isinstance(harbor_id, str):
@@ -2107,12 +2301,14 @@ class CatanGame:
         effect = self.get_active_forecast_effect(HARBOR_BLOCKADE_EVENT_ID)
         if effect is None:
             return False
-        harbor_id = effect.get("parameters", {}).get("harbor_id")
+        harbor_id = self._forecast_harbor_id_from_parameters(
+            effect.get("parameters", {})
+        )
         return self.get_forecast_harbor(harbor_id) is harbor
 
     def is_forecast_harbor_announced(self, harbor):
         parameters = self.get_forecast_event_parameters(HARBOR_BLOCKADE_EVENT_ID)
-        harbor_id = parameters.get("harbor_id")
+        harbor_id = self._forecast_harbor_id_from_parameters(parameters)
         return self.get_forecast_harbor(harbor_id) is harbor
 
     def get_forecast_edge_sector(self, edge):
@@ -2145,8 +2341,8 @@ class CatanGame:
         if not self.is_forecast_event_active(CONSTRUCTION_BOOM_EVENT_ID):
             return normal_cost, None
 
-        wood = player.resources.get(ResourceType.WOOD, 0)
-        brick = player.resources.get(ResourceType.BRICK, 0)
+        wood = player.available_resource_count(ResourceType.WOOD)
+        brick = player.available_resource_count(ResourceType.BRICK)
         if wood <= brick:
             waived = ResourceType.WOOD
             cost = {ResourceType.BRICK: 1}
@@ -2162,9 +2358,14 @@ class CatanGame:
         return player.can_afford(cost)
 
     def consume_construction_boom(self):
-        self.variant_state, consumed = self.variant_state.consume_forecast_effect(
+        forecast_state = self.get_variant_component_state(FORECAST_EVENTS_KIND)
+        if forecast_state is None:
+            return False
+        next_state, consumed = forecast_state.consume_forecast_effect(
             CONSTRUCTION_BOOM_EVENT_ID
         )
+        if consumed:
+            self.replace_variant_component_state(FORECAST_EVENTS_KIND, next_state)
         return consumed
 
     def apply_merchant_festival_bonus(self, players):
@@ -2239,9 +2440,13 @@ class CatanGame:
                 f"数字{target_number}のタイルへ移動。捨て札・略奪はありません。"
             )
             self.play_sound("robber")
-        self.variant_state, _consumed = self.variant_state.consume_forecast_effect(
+        forecast_state = self.get_variant_component_state(FORECAST_EVENTS_KIND)
+        if forecast_state is None:  # pragma: no cover - active effect implies it.
+            raise RuntimeError("予告イベントstateがありません。")
+        next_state, _consumed = forecast_state.consume_forecast_effect(
             BANDIT_RAID_EVENT_ID
         )
+        self.replace_variant_component_state(FORECAST_EVENTS_KIND, next_state)
         self.add_log(f"山賊襲来 — {detail}")
         self.record_event(
             "山賊襲来を解決",
@@ -2258,7 +2463,10 @@ class CatanGame:
         if event_id is None:
             return
         definition = event_definition(event_id)
-        public = self.variant_state.public
+        forecast_state = self.get_variant_component_state(FORECAST_EVENTS_KIND)
+        if forecast_state is None:  # pragma: no cover - guarded above.
+            return
+        public = forecast_state.public
         remaining = (
             public["forecast"]["resolve_turn"] - public["completed_turns"]
         )
@@ -2279,11 +2487,21 @@ class CatanGame:
 
     def advance_forecast_event_turn(self):
         if not self.is_forecast_variant():
-            return
-        self.variant_state, update = self.variant_state.advance_forecast_turn(
-            self.variant_config,
+            return None
+        forecast_state = self.get_variant_component_state(FORECAST_EVENTS_KIND)
+        forecast_config = self.get_variant_component_config(FORECAST_EVENTS_KIND)
+        next_state, update = forecast_state.advance_forecast_turn(
+            forecast_config,
             player_count=len(self.turn_order),
+            revealed_harbor_ids=self.get_campaign_forecast_harbor_ids(),
         )
+        self.replace_variant_component_state(FORECAST_EVENTS_KIND, next_state)
+        self._handle_forecast_turn_update(update)
+        return update
+
+    def _handle_forecast_turn_update(self, update):
+        """Emit effects and history for an already-published forecast update."""
+
         for event_id in update.expired_event_ids:
             definition = event_definition(event_id)
             self.add_log(f"イベント終了 — {definition.title}")
@@ -2299,7 +2517,31 @@ class CatanGame:
             return
         activated = event_definition(update.activated_event_id)
         announced = event_definition(update.announced_event_id)
-        interval = self.variant_config.options["event_interval_turns"]
+        forecast_config = self.get_variant_component_config(FORECAST_EVENTS_KIND)
+        interval = forecast_config.options["event_interval_turns"]
+        if update.skipped_event_id is not None:
+            announced_parameter_detail = self.describe_forecast_parameters(
+                update.announced_event_id,
+                self.get_next_forecast_parameters(),
+            )
+            detail = (
+                "予告時点で公開済みの交換所がなかったため、"
+                "港湾封鎖は効果を発生させず終了しました。"
+                f" / 次回予告: {announced.title}（あと{interval}手番）"
+            )
+            if announced_parameter_detail:
+                detail += f" / {announced_parameter_detail}"
+            self.add_log(f"イベント見送り — {activated.title}: {detail}")
+            self.add_log(
+                f"次回イベント予告 — {announced.title}: あと{interval}手番"
+            )
+            self.record_event(
+                f"イベント見送り: {activated.title}",
+                detail,
+                level="info",
+                include_in_turn=False,
+            )
+            return
         refresh_note = (
             "同じ効果が有効なため重複せず、発動時点を更新しました。 / "
             if update.refreshed_event_id is not None
@@ -2341,6 +2583,1081 @@ class CatanGame:
             self.update_longest_road()
         elif update.activated_event_id == BANDIT_RAID_EVENT_ID:
             self.resolve_bandit_raid()
+
+    def get_resource_credit_loans(self):
+        credit_state = self.get_variant_component_state(CREDIT_VARIANT_KIND)
+        if credit_state is None:
+            return ()
+        return credit_state.credit_book().open_loans
+
+    def get_resource_credit_loan(self, player):
+        credit_state = self.get_variant_component_state(CREDIT_VARIANT_KIND)
+        if credit_state is None or player not in self.players:
+            return None
+        return credit_state.credit_book().get_loan_for_borrower(
+            self.players.index(player)
+        )
+
+    def get_credit_vp_modifier(self, player):
+        """Return the public negative score attached to an open loan."""
+
+        credit_state = self.get_variant_component_state(CREDIT_VARIANT_KIND)
+        if credit_state is None or player not in self.players:
+            return 0
+        return credit_state.credit_book().public_vp_modifier(
+            self.players.index(player)
+        )
+
+    def is_resource_credit_action_available(self, player):
+        return bool(
+            self.is_credit_variant()
+            and player in self.players
+            and player is self.get_current_player()
+            and self.phase == "main"
+            and self.winner is None
+            and self.dice_rolled
+            and not self.has_active_dice_animation()
+            and self.special_phase is None
+            and self.action_mode is None
+            and not self.credit_action_taken_this_turn
+        )
+
+    def can_borrow_resource_credit(self, player, resource_type=None):
+        if not self.is_resource_credit_action_available(player):
+            return False
+        if self.get_resource_credit_loan(player) is not None:
+            return False
+        if resource_type is None:
+            return any(self.bank.available(resource) > 0 for resource in RESOURCE_TYPES)
+        return bool(
+            resource_type in RESOURCE_TYPES and self.bank.available(resource_type) > 0
+        )
+
+    def can_repay_resource_credit(self, player, payment=None):
+        if not self.is_resource_credit_action_available(player):
+            return False
+        loan = self.get_resource_credit_loan(player)
+        if loan is None:
+            return False
+        available = player.resource_ledger.available_map()
+        if payment is None:
+            if loan.status == LOAN_ACTIVE:
+                return bool(
+                    available[loan.borrowed_resource] >= 1
+                    and sum(available.values()) >= 2
+                )
+            return sum(available.values()) >= 1
+        try:
+            credit_state = self.get_variant_component_state(CREDIT_VARIANT_KIND)
+            plan = credit_state.credit_book().plan_repay(
+                borrower_index=self.players.index(player),
+                loan_id=loan.loan_id,
+                expected_revision=loan.revision,
+                payment=payment,
+                current_turn=credit_state.public["completed_turns"],
+            )
+        except ResourceCreditError:
+            return False
+        return all(
+            available[resource] >= amount
+            for resource, amount in plan.resource_mutations[0].bundle.items()
+        )
+
+    def choose_resource_credit_repayment(self, player):
+        """Return one deterministic legal payment, primarily for headless AI."""
+
+        if not self.can_repay_resource_credit(player):
+            return None
+        loan = self.get_resource_credit_loan(player)
+        available = player.resource_ledger.available_map()
+        if loan.status == LOAN_ACTIVE:
+            payment = {loan.borrowed_resource: 1}
+            candidates = [
+                resource
+                for resource in RESOURCE_TYPES
+                if available[resource]
+                - (1 if resource is loan.borrowed_resource else 0)
+                > 0
+            ]
+            if not candidates:
+                return None
+            extra = max(
+                candidates,
+                key=lambda resource: (available[resource], -resource.value),
+            )
+            payment[extra] = payment.get(extra, 0) + 1
+            return payment
+
+        remaining = min(loan.remaining_cards, sum(available.values()))
+        payment = {}
+        for resource in sorted(
+            RESOURCE_TYPES,
+            key=lambda item: (-available[item], item.value),
+        ):
+            amount = min(available[resource], remaining)
+            if amount:
+                payment[resource] = amount
+                remaining -= amount
+            if remaining == 0:
+                break
+        return payment or None
+
+    def _commit_resource_credit_plan(self, plan):
+        credit_state = self.get_variant_component_state(CREDIT_VARIANT_KIND)
+        credit_config = self.get_variant_component_config(CREDIT_VARIANT_KIND)
+        next_state, result = credit_state.apply_credit_plan(
+            credit_config,
+            plan,
+        )
+        bank_snapshot = dict(self.bank.resources)
+        player_snapshots = [
+            (dict(player.resources), player.resource_ledger.to_document())
+            for player in self.players
+        ]
+        try:
+            for mutation in result.resource_mutations:
+                player = self.players[mutation.player_index]
+                if mutation.operation == BANK_TO_PLAYER:
+                    if len(mutation.bundle) != 1:
+                        raise RuntimeError("借入資源の移動内容が不正です。")
+                    resource_type, amount = next(iter(mutation.bundle.items()))
+                    if not self.bank.withdraw(resource_type, amount):
+                        raise RuntimeError("銀行に借入対象の資源がありません。")
+                    player.add_resource(resource_type, amount)
+                elif mutation.operation == PLAYER_TO_BANK:
+                    if not player.spend_resources(mutation.bundle):
+                        raise RuntimeError("返済に使える資源が不足しています。")
+                    self.bank.deposit_cost(mutation.bundle)
+                    if any(
+                        self.bank.available(resource) > self.bank.cards_per_resource
+                        for resource in RESOURCE_TYPES
+                    ):
+                        raise RuntimeError("返済後の銀行資源が上限を超えました。")
+                else:  # pragma: no cover - domain rejects unknown operations.
+                    raise RuntimeError("未対応の信用資源操作です。")
+        except Exception:
+            self.bank.resources = bank_snapshot
+            for player, (resources, ledger) in zip(self.players, player_snapshots):
+                player.resources = resources
+                player.restore_resource_ledger(ledger)
+            raise
+        self.replace_variant_component_state(CREDIT_VARIANT_KIND, next_state)
+        return result
+
+    def borrow_resource_credit(self, player, resource_type):
+        if not self.can_borrow_resource_credit(player, resource_type):
+            self.notify_invalid("現在は銀行から資源を借りられません。")
+            return False
+        try:
+            credit_state = self.get_variant_component_state(CREDIT_VARIANT_KIND)
+            plan = credit_state.credit_book().plan_borrow(
+                borrower_index=self.players.index(player),
+                borrowed_resource=resource_type,
+                current_turn=credit_state.public["completed_turns"],
+                player_count=len(self.players),
+            )
+            result = self._commit_resource_credit_plan(plan)
+        except (ResourceCreditError, VariantStateError, RuntimeError, ValueError) as exc:
+            self.notify_invalid(str(exc))
+            return False
+        loan = result.created_loan
+        if loan is None:  # pragma: no cover - domain operation invariant.
+            return False
+        self.credit_action_taken_this_turn = True
+        resource_label = RESOURCE_LABELS[resource_type]
+        self.record_public_gain(player, {resource_type: 1}, "銀行借入")
+        self.add_log(
+            f"{player.name} が銀行から {resource_label} を1枚借りました。"
+            f"期限 {loan.due_turn} / 公開VP -1"
+        )
+        self.record_event(
+            f"{player.name}が資源を借入",
+            f"{resource_label}1枚 / 期限 {loan.due_turn}完了手番 / 公開VP -1",
+            level="warning",
+            actor=player,
+        )
+        return True
+
+    def repay_resource_credit(
+        self,
+        player,
+        loan_id,
+        expected_revision,
+        payment,
+    ):
+        if not self.is_resource_credit_action_available(player):
+            self.notify_invalid("現在はローンを返済できません。")
+            return False
+        try:
+            credit_state = self.get_variant_component_state(CREDIT_VARIANT_KIND)
+            loan = credit_state.credit_book().get_loan(loan_id)
+            if loan is None or loan.borrower_index != self.players.index(player):
+                raise ResourceCreditError("返済できるローンがありません。")
+            plan = credit_state.credit_book().plan_repay(
+                borrower_index=self.players.index(player),
+                loan_id=loan_id,
+                expected_revision=expected_revision,
+                payment=payment,
+                current_turn=credit_state.public["completed_turns"],
+            )
+            if not self.can_repay_resource_credit(player, payment):
+                raise ResourceCreditError("返済条件または利用可能な資源が不足しています。")
+            result = self._commit_resource_credit_plan(plan)
+        except (ResourceCreditError, VariantStateError, RuntimeError, ValueError) as exc:
+            self.notify_invalid(str(exc))
+            return False
+        self.credit_action_taken_this_turn = True
+        paid_text = self.format_resource_bundle(payment)
+        remaining = next(
+            (
+                updated.remaining_cards
+                for updated in result.updated_loans
+                if updated.loan_id == loan_id
+            ),
+            0,
+        )
+        detail = (
+            f"{paid_text}を返済・残り{remaining}枚"
+            if remaining
+            else f"{paid_text}を返済・完済"
+        )
+        self.add_log(f"{player.name} がローンを返済: {detail}。")
+        self.record_event(
+            f"{player.name}がローンを返済",
+            detail,
+            level="success" if not remaining else "info",
+            actor=player,
+        )
+        self.check_for_winner(player)
+        return True
+
+    def advance_resource_credit_turn(self):
+        if not self.is_credit_variant():
+            return ()
+        credit_state = self.get_variant_component_state(CREDIT_VARIANT_KIND)
+        credit_config = self.get_variant_component_config(CREDIT_VARIANT_KIND)
+        next_state, result = credit_state.advance_credit_turn(
+            credit_config
+        )
+        self.replace_variant_component_state(CREDIT_VARIANT_KIND, next_state)
+        self._handle_credit_turn_update(result)
+        return result.updated_loans
+
+    def _handle_credit_turn_update(self, result):
+        """Emit public delinquency effects for an already-published update."""
+
+        for loan in result.updated_loans:
+            player = self.players[loan.borrower_index]
+            self.add_log(
+                f"{player.name} のローンが延滞しました。"
+                f"残債{loan.remaining_cards}枚 / 公開VP -2"
+            )
+            self.record_event(
+                f"{player.name}のローンが延滞",
+                f"残債{loan.remaining_cards}枚 / 公開VP -2",
+                level="warning",
+                actor=player,
+                include_in_turn=False,
+            )
+
+    def get_trade_market_orders(self):
+        """Return the public exact-fill orders for the standing-market mode."""
+
+        if not self.is_trade_market_variant():
+            return ()
+        return self.get_variant_component_state(
+            TRADE2_VARIANT_KIND
+        ).trade_market().open_orders
+
+    def is_trade_market_action_available(self, player):
+        return bool(
+            self.is_trade_market_variant()
+            and self.phase == "main"
+            and self.winner is None
+            and self.special_phase is None
+            and self.dice_rolled
+            and player is self.get_current_player()
+        )
+
+    def can_create_trade_market_order(self, player):
+        if not self.is_trade_market_action_available(player):
+            return False
+        market = self.get_variant_component_state(TRADE2_VARIANT_KIND).trade_market()
+        seller_index = self.players.index(player)
+        return bool(
+            player.available_resource_total() > 0
+            and len(market.open_orders) < MAX_OPEN_ORDERS
+            and sum(
+                order.seller_index == seller_index
+                for order in market.open_orders
+            )
+            < MAX_OPEN_ORDERS_PER_SELLER
+        )
+
+    def can_fill_trade_market_order(self, player, order):
+        if (
+            not self.is_trade_market_action_available(player)
+            or not isinstance(order, MarketOrder)
+        ):
+            return False
+        buyer_index = self.players.index(player)
+        current_turn = self.get_variant_completed_turns(TRADE2_VARIANT_KIND)
+        return bool(
+            order.seller_index != buyer_index
+            and not order.is_expired(current_turn)
+            and player.can_afford(order.wanted)
+        )
+
+    def create_trade_market_order(self, player, offer, wanted):
+        if not self.can_create_trade_market_order(player):
+            self.notify_invalid("現在は常設市場へ出品できません。")
+            return False
+        try:
+            trade_state = self.get_variant_component_state(TRADE2_VARIANT_KIND)
+            trade_config = self.get_variant_component_config(TRADE2_VARIANT_KIND)
+            market = trade_state.trade_market()
+            plan = market.plan_create(
+                seller_index=self.players.index(player),
+                offer=offer,
+                wanted=wanted,
+                current_turn=trade_state.public["completed_turns"],
+                ttl=trade_config.options["order_ttl_turns"],
+            )
+            next_state, result = trade_state.apply_trade_market_plan(
+                trade_config,
+                plan,
+            )
+        except (TradeMarketError, VariantStateError, ValueError) as exc:
+            self.notify_invalid(str(exc))
+            return False
+
+        order = result.created_order
+        if order is None or not player.reserve_resources(
+            order.reservation_id,
+            order.offer,
+        ):
+            self.notify_invalid("出品する資源が不足しているか、すでに予約されています。")
+            return False
+        self.replace_variant_component_state(TRADE2_VARIANT_KIND, next_state)
+        offer_text = self.format_resource_bundle(order.offer)
+        wanted_text = self.format_resource_bundle(order.wanted)
+        self.play_sound("card")
+        self.add_log(
+            f"{player.name} が常設市場へ出品: {offer_text} → {wanted_text}"
+        )
+        self.record_event(
+            f"{player.name}が市場へ出品",
+            f"{offer_text} → {wanted_text}",
+            level="info",
+            actor=player,
+        )
+        return True
+
+    def cancel_trade_market_order(self, player, order_id, expected_revision):
+        if not self.is_trade_market_action_available(player):
+            self.notify_invalid("現在は常設市場の注文を取り消せません。")
+            return False
+        try:
+            trade_state = self.get_variant_component_state(TRADE2_VARIANT_KIND)
+            trade_config = self.get_variant_component_config(TRADE2_VARIANT_KIND)
+            market = trade_state.trade_market()
+            order = market.get_order(order_id)
+            if order is None:
+                raise TradeMarketError("指定した公開注文は存在しません。")
+            plan = market.plan_cancel(
+                requester_index=self.players.index(player),
+                order_id=order_id,
+                expected_revision=expected_revision,
+            )
+            next_state, _result = trade_state.apply_trade_market_plan(
+                trade_config,
+                plan,
+            )
+        except (TradeMarketError, VariantStateError, ValueError) as exc:
+            self.notify_invalid(str(exc))
+            return False
+
+        reservation = player.resource_ledger.reservations_map().get(
+            order.reservation_id
+        )
+        if reservation != dict(order.offer):
+            self.notify_invalid("注文と予約資源が一致しません。")
+            return False
+        released = player.release_reserved_resources(order.reservation_id)
+        if released != dict(order.offer):  # Defensive after the preflight check.
+            raise RuntimeError("常設市場の予約解放に失敗しました。")
+        self.replace_variant_component_state(TRADE2_VARIANT_KIND, next_state)
+        self.add_log(f"{player.name} が常設市場の出品を取り消しました。")
+        self.record_event(
+            f"{player.name}が市場出品を取消",
+            self.format_resource_bundle(order.offer),
+            level="info",
+            actor=player,
+        )
+        return True
+
+    def cancel_all_trade_market_orders(self, player, *, reason):
+        """Atomically cancel one player's public orders before a forced loss."""
+
+        if not self.is_trade_market_variant() or player not in self.players:
+            return 0
+        cancelled_auction_positions = self.cancel_all_trade_auction_positions(
+            player,
+            reason=reason,
+        )
+        seller_index = self.players.index(player)
+        orders = tuple(
+            order
+            for order in self.get_trade_market_orders()
+            if order.seller_index == seller_index
+        )
+        if not orders:
+            return cancelled_auction_positions
+        reservations = player.resource_ledger.reservations_map()
+        if any(
+            reservations.get(order.reservation_id) != dict(order.offer)
+            for order in orders
+        ):
+            raise RuntimeError("常設市場の注文と予約資源が一致しません。")
+
+        next_state = self.get_variant_component_state(TRADE2_VARIANT_KIND)
+        trade_config = self.get_variant_component_config(TRADE2_VARIANT_KIND)
+        for order in orders:
+            market = next_state.trade_market()
+            plan = market.plan_cancel(
+                requester_index=seller_index,
+                order_id=order.order_id,
+                expected_revision=order.revision,
+            )
+            next_state, _result = next_state.apply_trade_market_plan(
+                trade_config,
+                plan,
+            )
+        for order in orders:
+            released = player.release_reserved_resources(order.reservation_id)
+            if released != dict(order.offer):  # pragma: no cover - preflighted.
+                raise RuntimeError("常設市場の予約解放に失敗しました。")
+        self.replace_variant_component_state(TRADE2_VARIANT_KIND, next_state)
+        detail = f"{reason}のため出品{len(orders)}件を自動取消"
+        self.add_log(f"{player.name}: {detail}。")
+        self.record_event(
+            f"{player.name}の市場出品を自動取消",
+            detail,
+            level="warning",
+            actor=player,
+            include_in_turn=False,
+        )
+        return cancelled_auction_positions + len(orders)
+
+    def fill_trade_market_order(self, player, order_id, expected_revision):
+        if not self.is_trade_market_action_available(player):
+            self.notify_invalid("現在は常設市場の注文を購入できません。")
+            return False
+        try:
+            trade_state = self.get_variant_component_state(TRADE2_VARIANT_KIND)
+            trade_config = self.get_variant_component_config(TRADE2_VARIANT_KIND)
+            market = trade_state.trade_market()
+            order = market.get_order(order_id)
+            if order is None:
+                raise TradeMarketError("指定した公開注文は存在しません。")
+            if not self.can_fill_trade_market_order(player, order):
+                raise TradeMarketError("この注文を購入する資源が不足しています。")
+            plan = market.plan_fill(
+                buyer_index=self.players.index(player),
+                order_id=order_id,
+                expected_revision=expected_revision,
+                current_turn=trade_state.public["completed_turns"],
+            )
+            next_state, _result = trade_state.apply_trade_market_plan(
+                trade_config,
+                plan,
+            )
+        except (TradeMarketError, VariantStateError, ValueError) as exc:
+            self.notify_invalid(str(exc))
+            return False
+
+        seller = self.players[order.seller_index]
+        reservation = seller.resource_ledger.reservations_map().get(
+            order.reservation_id
+        )
+        if reservation != dict(order.offer):
+            self.notify_invalid("注文と出品者の予約資源が一致しません。")
+            return False
+        seller_snapshot = (
+            dict(seller.resources),
+            seller.resource_ledger.to_document(),
+        )
+        buyer_snapshot = (
+            dict(player.resources),
+            player.resource_ledger.to_document(),
+        )
+        try:
+            consumed = seller.consume_reserved_resources(order.reservation_id)
+            if consumed != dict(order.offer):
+                raise RuntimeError("出品資源を消費できませんでした。")
+            if not player.spend_resources(order.wanted):
+                raise RuntimeError("購入資源を支払えませんでした。")
+            for resource_type, amount in order.wanted.items():
+                seller.add_resource(resource_type, amount)
+            for resource_type, amount in order.offer.items():
+                player.add_resource(resource_type, amount)
+        except Exception:
+            seller.resources = seller_snapshot[0]
+            seller.restore_resource_ledger(seller_snapshot[1])
+            player.resources = buyer_snapshot[0]
+            player.restore_resource_ledger(buyer_snapshot[1])
+            raise
+
+        self.replace_variant_component_state(TRADE2_VARIANT_KIND, next_state)
+        offer_text = self.format_resource_bundle(order.offer)
+        wanted_text = self.format_resource_bundle(order.wanted)
+        self.record_public_gain(player, order.offer, "常設市場")
+        self.record_public_gain(seller, order.wanted, "常設市場")
+        self.play_sound("card")
+        self.add_log(
+            f"常設市場で取引成立: {player.name} が {seller.name} へ"
+            f" {wanted_text} を渡し、{offer_text} を受け取りました。"
+        )
+        self.record_event(
+            f"{player.name}が市場注文を購入",
+            f"{player.name}: -{wanted_text} / +{offer_text}",
+            level="success",
+            actor=player,
+        )
+        self.match_metrics.record_domestic_trade(
+            self.get_match_metric_player_id(player),
+            self.get_match_metric_player_id(seller),
+        )
+        return True
+
+    def get_trade_auctions(self):
+        """Return every open public auction in deterministic ID order."""
+
+        if not self.is_trade_auction_variant():
+            return ()
+        return self.get_variant_component_state(
+            TRADE2_VARIANT_KIND
+        ).trade_auction().open_auctions
+
+    def is_trade_auction_seller_action_available(self, player):
+        return bool(
+            self.is_trade_auction_variant()
+            and self.phase == "main"
+            and self.winner is None
+            and self.special_phase is None
+            and self.action_mode is None
+            and self.dice_rolled
+            and player is self.get_current_player()
+        )
+
+    def is_trade_auction_bid_action_available(self, player):
+        return bool(
+            self.is_trade_auction_variant()
+            and player in self.players
+            and self.phase == "main"
+            and self.winner is None
+            and self.special_phase is None
+            and self.action_mode is None
+            and self.dice_rolled
+            and not self.has_active_dice_animation()
+        )
+
+    def can_create_trade_auction(self, player):
+        if not self.is_trade_auction_seller_action_available(player):
+            return False
+        house = self.get_variant_component_state(TRADE2_VARIANT_KIND).trade_auction()
+        seller_index = self.players.index(player)
+        return bool(
+            player.available_resource_total() > 0
+            and len(house.open_auctions) < MAX_OPEN_AUCTIONS
+            and sum(
+                auction.seller_index == seller_index
+                for auction in house.open_auctions
+            )
+            < MAX_OPEN_AUCTIONS_PER_SELLER
+        )
+
+    def can_bid_trade_auction(self, player, auction, offer=None):
+        if (
+            not self.is_trade_auction_bid_action_available(player)
+            or not isinstance(auction, AuctionLot)
+        ):
+            return False
+        bidder_index = self.players.index(player)
+        current_turn = self.get_variant_completed_turns(TRADE2_VARIANT_KIND)
+        if auction.seller_index == bidder_index or auction.is_expired(current_turn):
+            return False
+        previous = auction.get_bid(bidder_index)
+        if offer is not None:
+            available = player.resource_ledger.available_map()
+            if previous is not None:
+                for resource_type, amount in previous.offer.items():
+                    available[resource_type] += amount
+            return bool(
+                offer
+                and not set(offer).intersection(auction.offer)
+                and sum(offer.values()) >= auction.minimum_bid_cards
+                and all(
+                    available.get(resource_type, 0) >= amount
+                    for resource_type, amount in offer.items()
+                )
+            )
+        eligible_total = 0
+        previous_offer = previous.offer if previous is not None else {}
+        for resource_type, amount in player.resource_ledger.available_map().items():
+            if resource_type not in auction.offer:
+                eligible_total += amount + previous_offer.get(resource_type, 0)
+        return eligible_total >= auction.minimum_bid_cards
+
+    def can_cancel_trade_auction_bid(self, player, auction):
+        return bool(
+            self.is_trade_auction_bid_action_available(player)
+            and isinstance(auction, AuctionLot)
+            and auction.get_bid(self.players.index(player)) is not None
+            and not auction.is_expired(
+                self.get_variant_completed_turns(TRADE2_VARIANT_KIND)
+            )
+        )
+
+    def can_accept_trade_auction(self, player, auction):
+        return bool(
+            self.is_trade_auction_seller_action_available(player)
+            and isinstance(auction, AuctionLot)
+            and auction.seller_index == self.players.index(player)
+            and auction.bids
+            and not auction.is_expired(
+                self.get_variant_completed_turns(TRADE2_VARIANT_KIND)
+            )
+        )
+
+    def can_cancel_trade_auction(self, player, auction):
+        return bool(
+            self.is_trade_auction_seller_action_available(player)
+            and isinstance(auction, AuctionLot)
+            and auction.seller_index == self.players.index(player)
+            and not auction.is_expired(
+                self.get_variant_completed_turns(TRADE2_VARIANT_KIND)
+            )
+        )
+
+    def _commit_trade_auction_plan(self, plan):
+        trade_state = self.get_variant_component_state(TRADE2_VARIANT_KIND)
+        trade_config = self.get_variant_component_config(TRADE2_VARIANT_KIND)
+        next_state, result = trade_state.apply_trade_auction_plan(
+            trade_config,
+            plan,
+        )
+        snapshots = [
+            (dict(player.resources), player.resource_ledger.to_document())
+            for player in self.players
+        ]
+        try:
+            for mutation in result.ledger_mutations:
+                player = self.players[mutation.player_index]
+                current = player.resource_ledger.reservations_map().get(
+                    mutation.reservation_id
+                )
+                if mutation.operation == LEDGER_RESERVE:
+                    applied = current is None and player.reserve_resources(
+                        mutation.reservation_id,
+                        mutation.bundle,
+                    )
+                elif mutation.operation == LEDGER_REPLACE:
+                    applied = (
+                        current == dict(mutation.previous_bundle)
+                        and player.resource_ledger.replace(
+                            mutation.reservation_id,
+                            mutation.bundle,
+                        )
+                    )
+                elif mutation.operation == LEDGER_RELEASE:
+                    applied = (
+                        current == dict(mutation.bundle)
+                        and player.release_reserved_resources(
+                            mutation.reservation_id
+                        )
+                        == dict(mutation.bundle)
+                    )
+                elif mutation.operation == LEDGER_CONSUME:
+                    applied = (
+                        current == dict(mutation.bundle)
+                        and player.consume_reserved_resources(
+                            mutation.reservation_id
+                        )
+                        == dict(mutation.bundle)
+                    )
+                else:  # pragma: no cover - domain rejects unknown operations.
+                    applied = False
+                if not applied:
+                    raise RuntimeError("公開競売の予約資源を更新できませんでした。")
+            for transfer in result.transfers:
+                receiver = self.players[transfer.to_player_index]
+                for resource_type, amount in transfer.bundle.items():
+                    receiver.add_resource(resource_type, amount)
+        except Exception:
+            for player, (resources, ledger) in zip(self.players, snapshots):
+                player.resources = resources
+                player.restore_resource_ledger(ledger)
+            raise
+        self.replace_variant_component_state(TRADE2_VARIANT_KIND, next_state)
+        return result
+
+    def create_trade_auction(self, player, offer, minimum_bid_cards):
+        if not self.can_create_trade_auction(player):
+            self.notify_invalid("現在は公開競売を開けません。")
+            return False
+        try:
+            trade_state = self.get_variant_component_state(TRADE2_VARIANT_KIND)
+            trade_config = self.get_variant_component_config(TRADE2_VARIANT_KIND)
+            house = trade_state.trade_auction()
+            plan = house.plan_create(
+                seller_index=self.players.index(player),
+                offer=offer,
+                minimum_bid_cards=minimum_bid_cards,
+                current_turn=trade_state.public["completed_turns"],
+                ttl=trade_config.options["auction_ttl_turns"],
+            )
+            result = self._commit_trade_auction_plan(plan)
+        except (TradeAuctionError, VariantStateError, ValueError, RuntimeError) as exc:
+            self.notify_invalid(str(exc))
+            return False
+        auction = result.created_auction
+        if auction is None:  # pragma: no cover - domain operation invariant.
+            return False
+        lot_text = self.format_resource_bundle(auction.offer)
+        self.play_sound("card")
+        self.add_log(
+            f"{player.name} が公開競売を開始: {lot_text} / "
+            f"最低{auction.minimum_bid_cards}枚"
+        )
+        self.record_event(
+            f"{player.name}が公開競売を開始",
+            f"出品 {lot_text} / 最低入札 {auction.minimum_bid_cards}枚",
+            level="info",
+            actor=player,
+        )
+        self._invite_ai_trade_auction_bids(auction.auction_id)
+        return True
+
+    def _invite_ai_trade_auction_bids(self, auction_id):
+        """Let AI seats react once using only the public lot and their hand."""
+
+        for candidate in self.players:
+            if not candidate.is_ai:
+                continue
+            house = self.get_variant_component_state(
+                TRADE2_VARIANT_KIND
+            ).trade_auction()
+            auction = house.get_auction(auction_id)
+            if auction is None or auction.seller_index == self.players.index(candidate):
+                continue
+            offer = self.ai.choose_trade_auction_bid(self, candidate, auction)
+            if offer is None:
+                continue
+            self.set_ai_status(
+                candidate,
+                "公開競売へ入札",
+                "出品資源が建設目標の不足を補うため、余剰資源を提示します",
+            )
+            self.bid_trade_auction(
+                candidate,
+                auction.auction_id,
+                auction.revision,
+                offer,
+            )
+
+    def bid_trade_auction(self, player, auction_id, expected_revision, offer):
+        try:
+            trade_state = self.get_variant_component_state(TRADE2_VARIANT_KIND)
+            house = trade_state.trade_auction()
+            auction = house.get_auction(auction_id)
+            if auction is None or not self.can_bid_trade_auction(
+                player,
+                auction,
+                offer,
+            ):
+                raise TradeAuctionError("この競売へ入札できません。")
+            plan = house.plan_bid(
+                bidder_index=self.players.index(player),
+                auction_id=auction_id,
+                expected_revision=expected_revision,
+                offer=offer,
+                current_turn=trade_state.public["completed_turns"],
+            )
+            result = self._commit_trade_auction_plan(plan)
+        except (TradeAuctionError, VariantStateError, ValueError, RuntimeError) as exc:
+            self.notify_invalid(str(exc))
+            return False
+        bid = result.updated_auction.get_bid(self.players.index(player))
+        bid_text = self.format_resource_bundle(bid.offer)
+        self.play_sound("card")
+        self.add_log(f"{player.name} が公開競売へ入札: {bid_text}")
+        self.record_event(
+            f"{player.name}が競売へ入札",
+            bid_text,
+            level="info",
+            actor=player,
+        )
+        return True
+
+    def cancel_trade_auction_bid(
+        self,
+        player,
+        auction_id,
+        expected_revision,
+    ):
+        try:
+            trade_state = self.get_variant_component_state(TRADE2_VARIANT_KIND)
+            house = trade_state.trade_auction()
+            auction = house.get_auction(auction_id)
+            if auction is None or not self.can_cancel_trade_auction_bid(
+                player,
+                auction,
+            ):
+                raise TradeAuctionError("取り消せる入札がありません。")
+            plan = house.plan_cancel_bid(
+                bidder_index=self.players.index(player),
+                auction_id=auction_id,
+                expected_revision=expected_revision,
+                current_turn=trade_state.public["completed_turns"],
+            )
+            self._commit_trade_auction_plan(plan)
+        except (TradeAuctionError, VariantStateError, ValueError, RuntimeError) as exc:
+            self.notify_invalid(str(exc))
+            return False
+        self.add_log(f"{player.name} が公開競売の入札を取り消しました。")
+        return True
+
+    def accept_trade_auction(
+        self,
+        player,
+        auction_id,
+        expected_revision,
+        bidder_index,
+    ):
+        try:
+            trade_state = self.get_variant_component_state(TRADE2_VARIANT_KIND)
+            house = trade_state.trade_auction()
+            auction = house.get_auction(auction_id)
+            if auction is None or not self.can_accept_trade_auction(player, auction):
+                raise TradeAuctionError("現在はこの競売の落札者を決定できません。")
+            plan = house.plan_accept(
+                seller_index=self.players.index(player),
+                auction_id=auction_id,
+                expected_revision=expected_revision,
+                bidder_index=bidder_index,
+                current_turn=trade_state.public["completed_turns"],
+            )
+            result = self._commit_trade_auction_plan(plan)
+        except (TradeAuctionError, VariantStateError, ValueError, RuntimeError) as exc:
+            self.notify_invalid(str(exc))
+            return False
+        auction = result.removed_auctions[0]
+        winner = self.players[result.accepted_bid.bidder_index]
+        lot_text = self.format_resource_bundle(auction.offer)
+        bid_text = self.format_resource_bundle(result.accepted_bid.offer)
+        self.record_public_gain(winner, auction.offer, "公開競売")
+        self.record_public_gain(player, result.accepted_bid.offer, "公開競売")
+        self.play_sound("victory")
+        self.add_log(
+            f"公開競売成立: {winner.name} が {bid_text} を支払い、"
+            f"{lot_text} を落札しました。"
+        )
+        self.record_event(
+            f"{winner.name}が公開競売で落札",
+            f"-{bid_text} / +{lot_text}",
+            level="success",
+            actor=winner,
+        )
+        self.match_metrics.record_domestic_trade(
+            self.get_match_metric_player_id(player),
+            self.get_match_metric_player_id(winner),
+        )
+        return True
+
+    def cancel_trade_auction(self, player, auction_id, expected_revision):
+        try:
+            trade_state = self.get_variant_component_state(TRADE2_VARIANT_KIND)
+            house = trade_state.trade_auction()
+            auction = house.get_auction(auction_id)
+            if auction is None or not self.can_cancel_trade_auction(player, auction):
+                raise TradeAuctionError("現在はこの競売を取り消せません。")
+            plan = house.plan_cancel(
+                seller_index=self.players.index(player),
+                auction_id=auction_id,
+                expected_revision=expected_revision,
+                current_turn=trade_state.public["completed_turns"],
+            )
+            self._commit_trade_auction_plan(plan)
+        except (TradeAuctionError, VariantStateError, ValueError, RuntimeError) as exc:
+            self.notify_invalid(str(exc))
+            return False
+        self.add_log(f"{player.name} が公開競売を取り消しました。")
+        return True
+
+    def cancel_all_trade_auction_positions(self, player, *, reason):
+        """Cancel every seller lot and bid owned by a forced-loss player."""
+
+        if not self.is_trade_auction_variant() or player not in self.players:
+            return 0
+        player_index = self.players.index(player)
+        cancelled = 0
+        while True:
+            trade_state = self.get_variant_component_state(TRADE2_VARIANT_KIND)
+            house = trade_state.trade_auction()
+            auction = next(
+                (
+                    candidate
+                    for candidate in house.open_auctions
+                    if candidate.seller_index == player_index
+                    or candidate.get_bid(player_index) is not None
+                ),
+                None,
+            )
+            if auction is None:
+                break
+            if auction.seller_index == player_index:
+                plan = house.plan_cancel(
+                    seller_index=player_index,
+                    auction_id=auction.auction_id,
+                    expected_revision=auction.revision,
+                    current_turn=trade_state.public["completed_turns"],
+                )
+            else:
+                plan = house.plan_cancel_bid(
+                    bidder_index=player_index,
+                    auction_id=auction.auction_id,
+                    expected_revision=auction.revision,
+                    current_turn=trade_state.public["completed_turns"],
+                )
+            self._commit_trade_auction_plan(plan)
+            cancelled += 1
+        if cancelled:
+            detail = f"{reason}のため競売・入札{cancelled}件を自動取消"
+            self.add_log(f"{player.name}: {detail}。")
+            self.record_event(
+                f"{player.name}の競売予約を自動取消",
+                detail,
+                level="warning",
+                actor=player,
+                include_in_turn=False,
+            )
+        return cancelled
+
+    def advance_trade_market_turn(self):
+        if not self.is_trade_market_variant():
+            return ()
+        trade_state = self.get_variant_component_state(TRADE2_VARIANT_KIND)
+        trade_config = self.get_variant_component_config(TRADE2_VARIANT_KIND)
+        next_state, expired, auction_result = trade_state.advance_trade2_turn(
+            trade_config
+        )
+        self._apply_trade_expiry_resources(expired, auction_result)
+        self.replace_variant_component_state(TRADE2_VARIANT_KIND, next_state)
+        self._handle_trade_expiry_update(expired, auction_result)
+        return expired
+
+    def _apply_trade_expiry_resources(self, expired, auction_result):
+        """Release all expired escrow as one rollback-safe external commit."""
+
+        reservations_by_player = {
+            index: player.resource_ledger.reservations_map()
+            for index, player in enumerate(self.players)
+        }
+        if any(
+            reservations_by_player[order.seller_index].get(order.reservation_id)
+            != dict(order.offer)
+            for order in expired
+        ):
+            raise RuntimeError("期限切れ注文と予約資源が一致しません。")
+        auction_mutations = (
+            auction_result.ledger_mutations if auction_result is not None else ()
+        )
+        if any(
+            mutation.operation != LEDGER_RELEASE
+            or reservations_by_player[mutation.player_index].get(
+                mutation.reservation_id
+            )
+            != dict(mutation.bundle)
+            for mutation in auction_mutations
+        ):
+            raise RuntimeError("期限切れ競売と予約資源が一致しません。")
+        snapshots = [
+            (dict(player.resources), player.resource_ledger.to_document())
+            for player in self.players
+        ]
+        try:
+            for order in expired:
+                player = self.players[order.seller_index]
+                released = player.release_reserved_resources(order.reservation_id)
+                if released != dict(order.offer):
+                    raise RuntimeError("期限切れ注文の予約解放に失敗しました。")
+            for mutation in auction_mutations:
+                player = self.players[mutation.player_index]
+                released = player.release_reserved_resources(
+                    mutation.reservation_id
+                )
+                if released != dict(mutation.bundle):
+                    raise RuntimeError("期限切れ競売の予約解放に失敗しました。")
+        except Exception:
+            for player, (resources, ledger) in zip(self.players, snapshots):
+                player.resources = resources
+                player.restore_resource_ledger(ledger)
+            raise
+
+    def _handle_trade_expiry_update(self, expired, auction_result):
+        """Emit history for an already-published trade expiry update."""
+
+        if expired:
+            self.add_log(f"常設市場: 出品{len(expired)}件が期限切れになりました。")
+            self.record_event(
+                "市場注文の期限切れ",
+                f"{len(expired)}件の出品を終了",
+                level="info",
+                include_in_turn=False,
+            )
+        expired_auctions = (
+            auction_result.removed_auctions if auction_result is not None else ()
+        )
+        if expired_auctions:
+            self.add_log(
+                f"公開競売: {len(expired_auctions)}件が期限切れになりました。"
+            )
+            self.record_event(
+                "公開競売の期限切れ",
+                f"{len(expired_auctions)}件を終了し、全入札資源を返却",
+                level="info",
+                include_in_turn=False,
+            )
+
+    def advance_variant_turn_boundary(self):
+        """Advance optional rules once, with one clock publication boundary."""
+
+        if self.variant_config.kind != COMPOSITE_VARIANT_KIND:
+            self.advance_forecast_event_turn()
+            self.advance_trade_market_turn()
+            self.advance_resource_credit_turn()
+            return
+
+        next_state, update = self.variant_state.advance_composite_turn(
+            self.variant_config,
+            player_count=len(self.turn_order),
+            revealed_harbor_ids=self.get_campaign_forecast_harbor_ids(),
+        )
+        # Escrow is external to VariantState.  Validate and mutate it before
+        # publishing the parent and its three N+1 child clocks.  The helper
+        # restores every player ledger on any release failure.
+        self._apply_trade_expiry_resources(
+            update.expired_market_orders,
+            update.auction,
+        )
+        self.variant_state = next_state
+        self._handle_forecast_turn_update(update.forecast)
+        self._handle_trade_expiry_update(
+            update.expired_market_orders,
+            update.auction,
+        )
+        self._handle_credit_turn_update(update.credit)
 
     def reset_initial_setup_state(self):
         self.initial_dice_phase = True
@@ -2467,7 +3784,7 @@ class CatanGame:
             points += 2
         if self.largest_army_owner == player:
             points += 2
-        return points
+        return max(0, points + self.get_credit_vp_modifier(player))
 
     def get_player_public_victory_points(self, player):
         return self.get_player_victory_points(player) - player.victory_point_cards
@@ -2575,6 +3892,7 @@ class CatanGame:
             "longest_road": 2 if self.longest_road_owner == player else 0,
             "largest_army": 2 if self.largest_army_owner == player else 0,
             "vp_card": player.victory_point_cards,
+            "debt_penalty": self.get_credit_vp_modifier(player),
         }
 
     def get_all_point_breakdowns(self):
@@ -2585,7 +3903,7 @@ class CatanGame:
     def get_missing_resources(self, player, cost):
         missing = []
         for resource_type, required in cost.items():
-            shortage = required - player.resources.get(resource_type, 0)
+            shortage = required - player.available_resource_count(resource_type)
             if shortage > 0:
                 missing.append(f"{RESOURCE_LABELS[resource_type]}{shortage}")
         return missing
@@ -3113,7 +4431,8 @@ class CatanGame:
             return False
         trade_rates = self.get_trade_rates(player)
         return any(
-            player.resources[give_resource] >= trade_rates[give_resource]
+            player.available_resource_count(give_resource)
+            >= trade_rates[give_resource]
             and any(
                 receive_resource != give_resource
                 and self.bank.available(receive_resource) > 0
@@ -3146,7 +4465,7 @@ class CatanGame:
                     f"domestic_trade_partner_{index}"
                     for index, other in enumerate(self.players)
                     if other is not self.get_current_player()
-                    and other.total_resource_count() > 0
+                    and other.available_resource_total() > 0
                 )
             elif self.special_phase == "domestic_trade_edit":
                 actions.update(
@@ -3176,7 +4495,7 @@ class CatanGame:
         if self.special_phase == "bank_trade_give":
             trade_rates = self.get_trade_rates(player)
             for resource_type, required in trade_rates.items():
-                if player.resources[resource_type] >= required and any(
+                if player.available_resource_count(resource_type) >= required and any(
                     receive_resource != resource_type
                     and self.bank.available(receive_resource) > 0
                     for receive_resource in RESOURCE_TYPES
@@ -3551,7 +4870,8 @@ class CatanGame:
             partners = [
                 (index, player)
                 for index, player in enumerate(self.players)
-                if player is not current_player and player.total_resource_count() > 0
+                if player is not current_player
+                and player.available_resource_total() > 0
             ]
             add_custom(
                 "domestic_trade_broadcast",
@@ -4082,10 +5402,10 @@ class CatanGame:
         )
 
     def has_domestic_trade_option(self, player):
-        if player is None or player.total_resource_count() <= 0:
+        if player is None or player.available_resource_total() <= 0:
             return False
         return any(
-            other is not player and other.total_resource_count() > 0
+            other is not player and other.available_resource_total() > 0
             for other in self.players
         )
 
@@ -4105,7 +5425,7 @@ class CatanGame:
         return [
             player
             for player in ordered_players
-            if player is not active_player and player.total_resource_count() > 0
+            if player is not active_player and player.available_resource_total() > 0
         ]
 
     def start_domestic_trade(self):
@@ -4138,7 +5458,7 @@ class CatanGame:
         if partner is active_player:
             self.notify_invalid("自分自身とは交易できません。")
             return False
-        if partner.total_resource_count() <= 0:
+        if partner.available_resource_total() <= 0:
             self.notify_invalid(f"{partner.name} は交換できる資源を持っていません。")
             return False
         self.domestic_trade_partner = partner
@@ -4189,9 +5509,9 @@ class CatanGame:
         active_player = self.get_current_player()
         editor = self.domestic_trade_editor
         if side == "give" and editor is active_player:
-            return active_player.resources[resource_type]
+            return active_player.available_resource_count(resource_type)
         if side == "receive" and editor is self.domestic_trade_partner:
-            return self.domestic_trade_partner.resources[resource_type]
+            return self.domestic_trade_partner.available_resource_count(resource_type)
         return BANK_RESOURCE_COUNT
 
     def adjust_domestic_trade_resource(self, side, resource_type, delta):
@@ -4217,10 +5537,7 @@ class CatanGame:
         return bundle[resource_type] != current
 
     def player_can_pay_bundle(self, player, bundle):
-        return all(
-            player.resources[resource_type] >= amount
-            for resource_type, amount in bundle.items()
-        )
+        return player.can_afford(bundle)
 
     def get_domestic_trade_receive_branches(self):
         """Return stable, exact receive bundles for the current offer.
@@ -4670,7 +5987,7 @@ class CatanGame:
 
         if self.special_phase == "bank_trade_give":
             required = trade_rates[resource_type]
-            if player.resources[resource_type] < required:
+            if player.available_resource_count(resource_type) < required:
                 self.notify_invalid(
                     f"{RESOURCE_LABELS[resource_type]} が不足しています。必要枚数は {required} 枚です。"
                 )
@@ -4693,7 +6010,7 @@ class CatanGame:
                 return
             give_resource = self.bank_trade_give_resource
             required = trade_rates[give_resource]
-            if player.resources[give_resource] < required:
+            if player.available_resource_count(give_resource) < required:
                 self.notify_invalid("交易に必要な資源が不足しています。")
                 return
             self.bank.withdraw(resource_type)
@@ -5012,7 +6329,16 @@ class CatanGame:
             )
             return
 
-        self.discard_player.remove_resource(resource_type)
+        self.cancel_all_trade_market_orders(
+            self.discard_player,
+            reason="捨て札",
+        )
+        removal = self.discard_player.remove_owned_resource(resource_type)
+        if removal is None:
+            self.notify_invalid(
+                f"{self.discard_player.name} は {resource_type.name} を持っていません。"
+            )
+            return
         self.bank.deposit(resource_type)
         self.discard_remaining -= 1
         self.add_log(
@@ -5110,6 +6436,7 @@ class CatanGame:
 
     def steal_random_resource(self, victim):
         current_player = self.get_current_player()
+        self.cancel_all_trade_market_orders(victim, reason="略奪")
         available_resources = [
             resource
             for resource, amount in victim.resources.items()
@@ -5123,7 +6450,9 @@ class CatanGame:
             return None
 
         stolen_resource = random.choice(available_resources)
-        victim.remove_resource(stolen_resource)
+        removal = victim.remove_owned_resource(stolen_resource)
+        if removal is None:  # Defensive: selection was built from total ownership.
+            return None
         current_player.add_resource(stolen_resource)
         self.play_sound("robber")
         self.add_log(
@@ -5357,10 +6686,16 @@ class CatanGame:
             for other_player in self.players:
                 if other_player == player:
                     continue
+                self.cancel_all_trade_market_orders(
+                    other_player,
+                    reason="独占",
+                )
                 amount = other_player.resources.get(resource_type, 0)
                 if amount <= 0:
                     continue
-                other_player.resources[resource_type] = 0
+                removal = other_player.remove_owned_resource(resource_type, amount)
+                if removal is None:  # Defensive: amount came from total ownership.
+                    continue
                 player.add_resource(resource_type, amount)
                 total_taken += amount
             self.special_phase = None
@@ -5892,7 +7227,7 @@ class CatanGame:
         # Apply them before checking that player's score: an earthquake can
         # suspend or restore Longest Road and therefore change the public VP
         # total at exactly this boundary.
-        self.advance_forecast_event_turn()
+        self.advance_variant_turn_boundary()
         self.check_for_winner(next_player)
         if self.phase == "finished":
             return
@@ -6509,10 +7844,15 @@ class CatanGame:
                     self.add_log(
                         "豊作ボーナスは銀行の麦不足により配布されませんでした。"
                     )
-                self.variant_state, _consumed = (
-                    self.variant_state.consume_forecast_effect(
-                        WHEAT_HARVEST_EVENT_ID
-                    )
+                forecast_state = self.get_variant_component_state(
+                    FORECAST_EVENTS_KIND
+                )
+                next_state, _consumed = forecast_state.consume_forecast_effect(
+                    WHEAT_HARVEST_EVENT_ID
+                )
+                self.replace_variant_component_state(
+                    FORECAST_EVENTS_KIND,
+                    next_state,
                 )
         for player, bundle in gains_by_player.items():
             self.last_resource_distribution[player.name] = dict(bundle)

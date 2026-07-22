@@ -620,6 +620,90 @@ def test_duplicate_command_is_exactly_once_and_conflicts_are_rejected():
     assert rejected["code"] == "sequence_conflict"
 
 
+def test_off_turn_transport_uses_authenticated_seat_and_existing_cas_guards():
+    calls = []
+
+    def auction_applier(game, seat, command, args):
+        calls.append((seat, command, dict(args)))
+        game.add_log(f"seat {seat} auction mutation")
+        return True
+
+    controller = LanServerController(command_applier=auction_applier)
+    room_code, _host_token, _created = create_room(controller)
+    join_player(controller, room_code)
+    controller.handle(
+        "viewer",
+        message(
+            "join_room",
+            room_code=room_code,
+            display_name="Viewer",
+            role="spectator",
+        ),
+    )
+    ready_and_start(controller, room_code)
+    bid = build_game_command(
+        sequence=0,
+        expected_revision=0,
+        command="auction_bid",
+        args={"auction_id": "auction-000000001", "revision": 1, "offer": {"WOOD": 1}},
+    )
+
+    spectator = controller.handle("viewer", bid)[0].message
+    accepted = controller.handle("guest", bid)[0].message
+    duplicate = controller.handle("guest", bid)[0].message
+
+    assert spectator["type"] == "request_error"
+    assert spectator["code"] == "forbidden"
+    assert accepted == {
+        "type": "game_command_result",
+        "protocol_version": NETWORK_PROTOCOL_VERSION,
+        "sequence": 0,
+        "accepted": True,
+        "revision": 1,
+        "code": None,
+        "message": None,
+    }
+    assert duplicate == accepted
+    assert calls == [
+        (
+            1,
+            "auction_bid",
+            {
+                "auction_id": "auction-000000001",
+                "revision": 1,
+                "offer": {"WOOD": 1},
+            },
+        )
+    ]
+
+    stale_host = controller.handle(
+        "host",
+        build_game_command(
+            sequence=0,
+            expected_revision=0,
+            command="auction_bid",
+            args={
+                "auction_id": "auction-000000001",
+                "revision": 1,
+                "offer": {"BRICK": 1},
+            },
+        ),
+    )[0].message
+    assert stale_host["accepted"] is False
+    assert stale_host["code"] == "stale_revision"
+    assert calls == [
+        (
+            1,
+            "auction_bid",
+            {
+                "auction_id": "auction-000000001",
+                "revision": 1,
+                "offer": {"WOOD": 1},
+            },
+        )
+    ]
+
+
 def test_stale_revision_is_cached_and_requires_a_new_sequence():
     controller = LanServerController()
     room_code, _host_token, _created = create_room(controller)

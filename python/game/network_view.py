@@ -78,6 +78,25 @@ VARIANT_CONFIG_VERSION = 1
 MAX_VARIANT_PUBLIC_DEPTH = 12
 MAX_VARIANT_PUBLIC_ITEMS = 2_000
 
+COMPOSITE_EVENTS_ECONOMY_CATALOG = "events_economy_v1"
+COMPOSITE_GRAND_CAMPAIGN_CATALOG = "grand_campaign_v1"
+CAMPAIGN_FORECAST_CATALOG_ID = "campaign_v1"
+HARBOR_BLOCKADE_EVENT_ID = "harbor_blockade_v1"
+_GRAND_CAMPAIGN_PLAN_FORMAT = "catan-grand-campaign-plan"
+_GRAND_CAMPAIGN_PLAN_VERSION = 1
+_GRAND_CAMPAIGN_EVENT_IDS = frozenset(
+    {
+        "wheat_harvest_v1",
+        "sheep_drought_v1",
+        HARBOR_BLOCKADE_EVENT_ID,
+        "construction_boom_v1",
+        "merchant_festival_v1",
+        "bandit_raid_v1",
+        "earthquake_v1",
+    }
+)
+_STABLE_HARBOR_ID_PATTERN = re.compile(r"harbor-(0|[1-9][0-9]?)\Z")
+
 _RESOURCE_KEYS = ("WOOD", "SHEEP", "WHEAT", "BRICK", "ORE")
 _TILE_RESOURCES = frozenset((*_RESOURCE_KEYS, "DESERT", "UNKNOWN"))
 _DEVELOPMENT_KEYS = (
@@ -323,6 +342,7 @@ class PlayerView:
     settlements_remaining: int = MAX_PLAYER_SETTLEMENTS
     cities_remaining: int = MAX_PLAYER_CITIES
     played_knights: int = 0
+    credit_vp_modifier: int = 0
 
 
 @dataclass(frozen=True)
@@ -449,6 +469,13 @@ def parse_network_view(envelope: Any) -> NetworkGameView:
     if state.get("format") != "catan-local-save" or state.get("version") != 1:
         raise NetworkViewError("snapshot.state has an unsupported format/version")
 
+    rules = _mapping(
+        _required(state, "rules", "snapshot.state"),
+        "snapshot.state.rules",
+    )
+    victory_target = _parse_victory_target(rules)
+    variant_kind, variant_config_fingerprint = _parse_variant_config_identity(rules)
+
     raw_players = _list(
         _required(state, "players", "snapshot.state"),
         "snapshot.state.players",
@@ -462,18 +489,18 @@ def parse_network_view(envelope: Any) -> NetworkGameView:
         "snapshot.viewer_player_index",
     )
     parsed_players = tuple(
-        _parse_player(raw, index, viewer_index) for index, raw in enumerate(raw_players)
+        _parse_player(
+            raw,
+            index,
+            viewer_index,
+            allow_reserved_resources=variant_kind in ("trade2", "composite"),
+        )
+        for index, raw in enumerate(raw_players)
     )
     phase = _parse_phase(
         _required(state, "phase", "snapshot.state"),
         player_count,
     )
-    rules = _mapping(
-        _required(state, "rules", "snapshot.state"),
-        "snapshot.state.rules",
-    )
-    victory_target = _parse_victory_target(rules)
-    variant_kind, variant_config_fingerprint = _parse_variant_config_identity(rules)
     has_variant_state = "variant_state" in state
     variant_state = _parse_variant_state(
         state.get("variant_state"),
@@ -481,6 +508,7 @@ def parse_network_view(envelope: Any) -> NetworkGameView:
         expected_kind=variant_kind,
         expected_config_fingerprint=variant_config_fingerprint,
     )
+    credit_vp_modifiers = _credit_vp_modifiers(variant_state, player_count)
     bank_resources = _counts(
         _required(state, "bank", "snapshot.state"),
         _RESOURCE_KEYS,
@@ -555,6 +583,7 @@ def parse_network_view(envelope: Any) -> NetworkGameView:
         expected_seed=seed,
         expected_custom_map_fingerprint=custom_map_fingerprint,
     )
+    _validate_grand_campaign_projection(variant_state, board)
 
     public_points = [0] * player_count
     for node in board.nodes:
@@ -566,6 +595,8 @@ def parse_network_view(envelope: Any) -> NetworkGameView:
         public_points[phase.longest_road_owner] += 2
     if phase.largest_army_owner is not None:
         public_points[phase.largest_army_owner] += 2
+    for index, modifier in enumerate(credit_vp_modifiers):
+        public_points[index] = max(0, public_points[index] + modifier)
 
     players = tuple(
         PlayerView(
@@ -586,6 +617,7 @@ def parse_network_view(envelope: Any) -> NetworkGameView:
             settlements_remaining=parsed.settlements_remaining,
             cities_remaining=parsed.cities_remaining,
             played_knights=parsed.played_knights,
+            credit_vp_modifier=credit_vp_modifiers[index],
         )
         for index, parsed in enumerate(parsed_players)
     )
@@ -632,7 +664,13 @@ def parse_state_snapshot(envelope: Any) -> NetworkGameView:
     return parse_network_view(envelope)
 
 
-def _parse_player(raw: Any, index: int, viewer_index: Optional[int]) -> _ParsedPlayer:
+def _parse_player(
+    raw: Any,
+    index: int,
+    viewer_index: Optional[int],
+    *,
+    allow_reserved_resources: bool = False,
+) -> _ParsedPlayer:
     label = f"snapshot.state.players[{index}]"
     player = _mapping(raw, label)
     name = _text(_required(player, "name", label), f"{label}.name", maximum=64)
@@ -753,7 +791,11 @@ def _parse_player(raw: Any, index: int, viewer_index: Optional[int]) -> _ParsedP
         minimum=0,
         maximum=MAX_COUNT,
     )
-    if sum(resources.values()) != resource_total:
+    available_total = sum(resources.values())
+    if (
+        available_total > resource_total
+        or (not allow_reserved_resources and available_total != resource_total)
+    ):
         raise NetworkViewError(f"{label}.resource_total does not match its private map")
     if (
         sum(development.values()) + sum(new_development.values()) + victory_point_cards
@@ -971,6 +1013,471 @@ def _parse_variant_state(
         config_fingerprint=config_fingerprint,
         public=frozen_public,
     )
+
+
+def _credit_vp_modifiers(
+    variant_state: VariantStateView,
+    player_count: int,
+) -> tuple[int, ...]:
+    """Validate public credit rows and expose their score modifiers safely."""
+
+    modifiers = [0] * player_count
+    if variant_state.kind == "composite":
+        composite = variant_state.public
+        if set(composite) != {"catalog", "completed_turns", "components"}:
+            raise NetworkViewError("composite variant public state has invalid keys")
+        catalog = composite.get("catalog")
+        if catalog not in (
+            COMPOSITE_EVENTS_ECONOMY_CATALOG,
+            COMPOSITE_GRAND_CAMPAIGN_CATALOG,
+        ):
+            raise NetworkViewError("composite variant catalog is unsupported")
+        completed_turns = _integer(
+            composite.get("completed_turns"),
+            "snapshot.state.variant_state.public.completed_turns",
+            minimum=0,
+            maximum=MAX_SAFE_JSON_INTEGER,
+        )
+        components = composite.get("components")
+        expected_components = {"forecast_events", "trade2", "credit"}
+        if catalog == COMPOSITE_GRAND_CAMPAIGN_CATALOG:
+            expected_components.add("frontier")
+        if (
+            not isinstance(components, Mapping)
+            or set(components) != expected_components
+        ):
+            raise NetworkViewError("composite variant components are invalid")
+        public = components.get("credit")
+        if not isinstance(public, Mapping):
+            raise NetworkViewError("composite credit component must be an object")
+        if public.get("completed_turns") != completed_turns:
+            raise NetworkViewError("composite credit component clock is invalid")
+    elif variant_state.kind == "credit":
+        public = variant_state.public
+    else:
+        return tuple(modifiers)
+    if set(public) != {"catalog", "completed_turns", "loans"}:
+        raise NetworkViewError("credit variant public state has invalid keys")
+    if public.get("catalog") != "bank_loan_v1":
+        raise NetworkViewError("credit variant catalog is unsupported")
+    completed_turns = _integer(
+        public.get("completed_turns"),
+        "snapshot.state.variant_state.public.completed_turns",
+        minimum=0,
+        maximum=MAX_SAFE_JSON_INTEGER,
+    )
+    raw_loans = public.get("loans")
+    if not isinstance(raw_loans, tuple):
+        raise NetworkViewError("credit variant loans must be an array")
+    previous_id = None
+    borrowers = set()
+    expected_loan_keys = {
+        "loan_id",
+        "borrower_index",
+        "borrowed_resource",
+        "opened_turn",
+        "due_turn",
+        "status",
+        "remaining_cards",
+        "revision",
+    }
+    for index, raw in enumerate(raw_loans):
+        if not isinstance(raw, Mapping):
+            raise NetworkViewError(f"credit variant loans[{index}] must be an object")
+        if set(raw) != expected_loan_keys:
+            raise NetworkViewError("credit variant loan has invalid keys")
+        loan_id = raw.get("loan_id")
+        if not isinstance(loan_id, str) or re.fullmatch(r"loan-[0-9]{9}", loan_id) is None:
+            raise NetworkViewError("credit variant loan id is invalid")
+        borrower_index = raw.get("borrower_index")
+        if (
+            type(borrower_index) is not int
+            or not 0 <= borrower_index < player_count
+        ):
+            raise NetworkViewError("credit variant borrower is outside the match")
+        if raw.get("borrowed_resource") not in _RESOURCE_KEYS:
+            raise NetworkViewError("credit variant borrowed resource is invalid")
+        opened_turn = _integer(
+            raw.get("opened_turn"),
+            f"credit variant loans[{index}].opened_turn",
+            minimum=0,
+            maximum=MAX_SAFE_JSON_INTEGER,
+        )
+        due_turn = _integer(
+            raw.get("due_turn"),
+            f"credit variant loans[{index}].due_turn",
+            minimum=0,
+            maximum=MAX_SAFE_JSON_INTEGER,
+        )
+        if due_turn - opened_turn != player_count:
+            raise NetworkViewError(
+                "credit variant loan due turn does not match the player count"
+            )
+        if opened_turn > completed_turns:
+            raise NetworkViewError("credit variant loan opens in the future")
+        status = raw.get("status")
+        if status not in ("active", "delinquent"):
+            raise NetworkViewError("credit variant loan status is invalid")
+        if status == "active" and completed_turns > due_turn:
+            raise NetworkViewError("active credit loan is past its due turn")
+        if status == "delinquent" and completed_turns <= due_turn:
+            raise NetworkViewError("delinquent credit loan is not past its due turn")
+        remaining = _integer(
+            raw.get("remaining_cards"),
+            f"credit variant loans[{index}].remaining_cards",
+            minimum=1,
+            maximum=3,
+        )
+        if status == "active" and remaining != 2:
+            raise NetworkViewError("active credit loan must have two repayment cards")
+        _integer(
+            raw.get("revision"),
+            f"credit variant loans[{index}].revision",
+            minimum=1,
+            maximum=MAX_SAFE_JSON_INTEGER,
+        )
+        if previous_id is not None and loan_id <= previous_id:
+            raise NetworkViewError("credit variant loans must use sorted unique ids")
+        if borrower_index in borrowers:
+            raise NetworkViewError("credit variant borrower has duplicate loans")
+        modifiers[borrower_index] = -1 if status == "active" else -2
+        borrowers.add(borrower_index)
+        previous_id = loan_id
+    return tuple(modifiers)
+
+
+def _validate_grand_campaign_projection(
+    variant_state: VariantStateView,
+    board: BoardView,
+) -> None:
+    """Cross-check fogged campaign plans against the same public manifest."""
+
+    if variant_state.kind != "composite":
+        return
+    composite = variant_state.public
+    if composite.get("catalog") != COMPOSITE_GRAND_CAMPAIGN_CATALOG:
+        return
+    if len(board.tiles) != 37 or board.seed != 0:
+        raise NetworkViewError(
+            "grand campaign board must be a masked 37-tile manifest"
+        )
+    components = composite.get("components")
+    if not isinstance(components, Mapping):
+        raise NetworkViewError("grand campaign components are invalid")
+    forecast_public = components.get("forecast_events")
+    frontier_public = components.get("frontier")
+    trade_public = components.get("trade2")
+    if not isinstance(forecast_public, Mapping) or not isinstance(
+        frontier_public, Mapping
+    ) or not isinstance(trade_public, Mapping):
+        raise NetworkViewError("grand campaign public components are invalid")
+    parent_clock = composite.get("completed_turns")
+    if (
+        forecast_public.get("completed_turns") != parent_clock
+        or trade_public.get("completed_turns") != parent_clock
+    ):
+        raise NetworkViewError("grand campaign timed component clock is invalid")
+    thawed_forecast = _thaw_variant_json(forecast_public)
+    _validate_campaign_forecast_public(thawed_forecast)
+    frontier_revealed = _validate_campaign_frontier_public(frontier_public)
+
+    revealed_axials = {
+        f"{tile.axial[0]},{tile.axial[1]}"
+        for tile in board.tiles
+        if tile.revealed
+    }
+    if revealed_axials != set(frontier_revealed):
+        raise NetworkViewError(
+            "grand campaign frontier state does not match public board tiles"
+        )
+    manifest_harbor_ids = {harbor.target_id for harbor in board.harbors}
+    forecast_rows = [thawed_forecast["forecast"]]
+    forecast_rows.extend(thawed_forecast["active_effects"])
+    for row in forecast_rows:
+        if row.get("event_id") != HARBOR_BLOCKADE_EVENT_ID:
+            continue
+        parameters = row.get("parameters")
+        if not isinstance(parameters, Mapping) or set(parameters) != {
+            "campaign_plan"
+        }:
+            raise NetworkViewError("grand campaign blockade plan is invalid")
+        try:
+            eligible_harbor_ids, _target, _resolution = (
+                _parse_campaign_blockade_plan(
+                parameters["campaign_plan"]
+                )
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise NetworkViewError(
+                "grand campaign blockade plan is invalid"
+            ) from exc
+        if not set(eligible_harbor_ids).issubset(manifest_harbor_ids):
+            raise NetworkViewError(
+                "grand campaign blockade plan references a hidden harbor"
+            )
+
+
+def _validate_campaign_forecast_public(public: Any) -> None:
+    label = "grand campaign forecast"
+    if not isinstance(public, Mapping) or set(public) != {
+        "catalog",
+        "completed_turns",
+        "forecast",
+        "active_effects",
+        "resolved_count",
+    }:
+        raise NetworkViewError(f"{label} has invalid keys")
+    if public.get("catalog") != CAMPAIGN_FORECAST_CATALOG_ID:
+        raise NetworkViewError(f"{label} catalog is invalid")
+    completed = _integer(
+        public.get("completed_turns"),
+        f"{label}.completed_turns",
+        minimum=0,
+        maximum=MAX_SAFE_JSON_INTEGER,
+    )
+    resolved = _integer(
+        public.get("resolved_count"),
+        f"{label}.resolved_count",
+        minimum=0,
+        maximum=MAX_SAFE_JSON_INTEGER,
+    )
+    forecast = public.get("forecast")
+    if not isinstance(forecast, Mapping) or set(forecast) != {
+        "event_id",
+        "announced_turn",
+        "resolve_turn",
+        "parameters",
+    }:
+        raise NetworkViewError(f"{label}.forecast has invalid keys")
+    event_id = forecast.get("event_id")
+    if event_id not in _GRAND_CAMPAIGN_EVENT_IDS:
+        raise NetworkViewError(f"{label}.forecast event is invalid")
+    announced = _integer(
+        forecast.get("announced_turn"),
+        f"{label}.forecast.announced_turn",
+        minimum=0,
+        maximum=MAX_SAFE_JSON_INTEGER,
+    )
+    resolves = _integer(
+        forecast.get("resolve_turn"),
+        f"{label}.forecast.resolve_turn",
+        minimum=1,
+        maximum=MAX_SAFE_JSON_INTEGER,
+    )
+    if announced > completed or resolves <= completed or resolves <= announced:
+        raise NetworkViewError(f"{label}.forecast schedule is invalid")
+    expected_announced = 0 if resolved == 0 else 2 + (resolved - 1) * 6
+    expected_resolves = 2 + resolved * 6
+    if announced != expected_announced or resolves != expected_resolves:
+        raise NetworkViewError(f"{label}.forecast fixed schedule is invalid")
+    plan = _validate_campaign_event_parameters(
+        event_id,
+        forecast.get("parameters"),
+    )
+    if plan is not None and plan[2] != resolved:
+        raise NetworkViewError(f"{label}.forecast resolution is invalid")
+
+    active = public.get("active_effects")
+    if not isinstance(active, list) or len(active) > len(_GRAND_CAMPAIGN_EVENT_IDS):
+        raise NetworkViewError(f"{label}.active_effects is invalid")
+    active_ids = []
+    for index, effect in enumerate(active):
+        if not isinstance(effect, Mapping) or set(effect) != {
+            "event_id",
+            "started_turn",
+            "expires_turn",
+            "parameters",
+        }:
+            raise NetworkViewError(f"{label}.active_effects[{index}] is invalid")
+        active_id = effect.get("event_id")
+        if active_id not in _GRAND_CAMPAIGN_EVENT_IDS:
+            raise NetworkViewError(f"{label}.active event is invalid")
+        started = _integer(
+            effect.get("started_turn"),
+            f"{label}.active_effects[{index}].started_turn",
+            minimum=0,
+            maximum=MAX_SAFE_JSON_INTEGER,
+        )
+        if started > completed:
+            raise NetworkViewError(f"{label}.active effect starts in the future")
+        if started < 2 or (started - 2) % 6 != 0:
+            raise NetworkViewError(f"{label}.active effect schedule is invalid")
+        expires = effect.get("expires_turn")
+        if expires is not None:
+            expires = _integer(
+                expires,
+                f"{label}.active_effects[{index}].expires_turn",
+                minimum=1,
+                maximum=MAX_SAFE_JSON_INTEGER,
+            )
+            if expires <= completed:
+                raise NetworkViewError(f"{label}.active effect is expired")
+        effect_plan = _validate_campaign_event_parameters(
+            active_id,
+            effect.get("parameters"),
+        )
+        if effect_plan is not None:
+            _eligible, target, plan_resolution = effect_plan
+            if (
+                target is None
+                or plan_resolution >= resolved
+                or started != 2 + plan_resolution * 6
+            ):
+                raise NetworkViewError(f"{label}.active blockade plan is invalid")
+        active_ids.append(active_id)
+    if len(active_ids) != len(set(active_ids)) or resolved < len(active_ids):
+        raise NetworkViewError(f"{label}.active effects are inconsistent")
+
+
+def _validate_campaign_event_parameters(
+    event_id: str,
+    parameters: Any,
+) -> tuple[tuple[str, ...], str | None, int] | None:
+    if not isinstance(parameters, Mapping):
+        raise NetworkViewError("grand campaign event parameters are invalid")
+    if event_id == HARBOR_BLOCKADE_EVENT_ID:
+        if set(parameters) != {"campaign_plan"}:
+            raise NetworkViewError("grand campaign blockade parameters are invalid")
+        return _parse_campaign_blockade_plan(parameters["campaign_plan"])
+    if event_id == "bandit_raid_v1":
+        if set(parameters) != {"target_number"} or parameters.get(
+            "target_number"
+        ) not in (5, 6, 8, 9):
+            raise NetworkViewError("grand campaign bandit parameters are invalid")
+        return None
+    if event_id == "earthquake_v1":
+        if (
+            set(parameters) != {"sector"}
+            or type(parameters.get("sector")) is not int
+            or not 0 <= parameters["sector"] < 6
+        ):
+            raise NetworkViewError("grand campaign earthquake parameters are invalid")
+        return None
+    if parameters:
+        raise NetworkViewError("grand campaign event parameters must be empty")
+    return None
+
+
+def _parse_campaign_blockade_plan(
+    document: Any,
+) -> tuple[tuple[str, ...], str | None, int]:
+    if not isinstance(document, Mapping) or set(document) != {
+        "format",
+        "version",
+        "catalog",
+        "event_id",
+        "resolution_number",
+        "eligible_harbor_ids",
+        "outcome",
+    }:
+        raise NetworkViewError("grand campaign blockade plan has invalid keys")
+    if (
+        document.get("format") != _GRAND_CAMPAIGN_PLAN_FORMAT
+        or type(document.get("version")) is not int
+        or document.get("version") != _GRAND_CAMPAIGN_PLAN_VERSION
+        or document.get("catalog") != COMPOSITE_GRAND_CAMPAIGN_CATALOG
+        or document.get("event_id") != HARBOR_BLOCKADE_EVENT_ID
+    ):
+        raise NetworkViewError("grand campaign blockade plan identity is invalid")
+    resolution = _integer(
+        document.get("resolution_number"),
+        "grand campaign blockade resolution_number",
+        minimum=0,
+        maximum=MAX_SAFE_JSON_INTEGER,
+    )
+    raw_eligible = document.get("eligible_harbor_ids")
+    if not isinstance(raw_eligible, list) or len(raw_eligible) > MAX_HARBORS:
+        raise NetworkViewError("grand campaign eligible harbors are invalid")
+    eligible = tuple(
+        _campaign_stable_harbor_id(value) for value in raw_eligible
+    )
+    canonical = tuple(sorted(eligible, key=_campaign_harbor_index))
+    if eligible != canonical or len(eligible) != len(set(eligible)):
+        raise NetworkViewError("grand campaign eligible harbors are not canonical")
+    outcome = document.get("outcome")
+    if not isinstance(outcome, Mapping):
+        raise NetworkViewError("grand campaign blockade outcome is invalid")
+    if outcome.get("kind") == "target":
+        if set(outcome) != {"kind", "harbor_id"}:
+            raise NetworkViewError("grand campaign target outcome is invalid")
+        target = _campaign_stable_harbor_id(outcome.get("harbor_id"))
+        if target not in eligible:
+            raise NetworkViewError("grand campaign target is not eligible")
+    elif outcome.get("kind") == "skip":
+        if set(outcome) != {"kind", "reason"} or outcome.get("reason") != (
+            "no_revealed_harbors"
+        ):
+            raise NetworkViewError("grand campaign skip outcome is invalid")
+        if eligible:
+            raise NetworkViewError("grand campaign skip has eligible harbors")
+        target = None
+    else:
+        raise NetworkViewError("grand campaign blockade outcome kind is invalid")
+    if not eligible and target is not None:
+        raise NetworkViewError("grand campaign target has no eligible harbors")
+    return eligible, target, resolution
+
+
+def _campaign_stable_harbor_id(value: Any) -> str:
+    if type(value) is not str or _STABLE_HARBOR_ID_PATTERN.fullmatch(value) is None:
+        raise NetworkViewError("grand campaign stable harbor ID is invalid")
+    if _campaign_harbor_index(value) >= MAX_HARBORS:
+        raise NetworkViewError("grand campaign stable harbor ID exceeds limit")
+    return value
+
+
+def _campaign_harbor_index(value: str) -> int:
+    return int(value.removeprefix("harbor-"))
+
+
+def _validate_campaign_frontier_public(public: Any) -> tuple[str, ...]:
+    if not isinstance(public, Mapping) or set(public) != {
+        "catalog",
+        "revealed_tiles",
+        "discovery_count",
+    }:
+        raise NetworkViewError("grand campaign frontier state has invalid keys")
+    if public.get("catalog") != "outer_ring_37_v1":
+        raise NetworkViewError("grand campaign frontier catalog is invalid")
+    raw_revealed = public.get("revealed_tiles")
+    if not isinstance(raw_revealed, tuple) or len(raw_revealed) > 37:
+        raise NetworkViewError("grand campaign revealed tiles are invalid")
+    parsed = []
+    for value in raw_revealed:
+        if type(value) is not str:
+            raise NetworkViewError("grand campaign revealed tile key is invalid")
+        pieces = value.split(",")
+        if len(pieces) != 2:
+            raise NetworkViewError("grand campaign revealed tile key is invalid")
+        try:
+            q, r = int(pieces[0]), int(pieces[1])
+        except ValueError as exc:
+            raise NetworkViewError(
+                "grand campaign revealed tile key is invalid"
+            ) from exc
+        if value != f"{q},{r}" or max(abs(q), abs(r), abs(q + r)) > 3:
+            raise NetworkViewError("grand campaign revealed tile is out of range")
+        parsed.append((q, r))
+    canonical = sorted(set(parsed), key=lambda axial: (axial[1], axial[0]))
+    if parsed != canonical:
+        raise NetworkViewError("grand campaign revealed tiles are not canonical")
+    initial_core = {
+        (q, r)
+        for q in range(-1, 2)
+        for r in range(-1, 2)
+        if max(abs(q), abs(r), abs(q + r)) <= 1
+    }
+    if not initial_core.issubset(parsed):
+        raise NetworkViewError("grand campaign initial frontier core is missing")
+    discovery_count = _integer(
+        public.get("discovery_count"),
+        "grand campaign frontier discovery_count",
+        minimum=0,
+        maximum=37,
+    )
+    if discovery_count != len(parsed) - len(initial_core):
+        raise NetworkViewError("grand campaign frontier discovery count is invalid")
+    return tuple(f"{q},{r}" for q, r in parsed)
 
 
 def _parse_victory_target(raw: Any) -> int:

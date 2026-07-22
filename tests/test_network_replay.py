@@ -10,6 +10,10 @@ import pytest
 
 import game.network_protocol as network_protocol
 from game.network_replay import (
+    MAX_NETWORK_REPLAY_LABEL_LENGTH,
+    MAX_NETWORK_REPLAY_REVISION,
+    NETWORK_REPLAY_AUTHORITY_FORMAT,
+    NETWORK_REPLAY_AUTHORITY_VERSION,
     NETWORK_REPLAY_FORMAT,
     NetworkReplayError,
     NetworkReplayStore,
@@ -137,7 +141,13 @@ def result_document():
                     "cities": {"count": 1, "points": 2},
                     "longest_road": {"awarded": False, "points": 0},
                     "largest_army": {"awarded": False, "points": 0},
-                    "victory_point_cards": {"count": 1, "points": 1},
+                    "debt_penalty": {
+                        "count": 1,
+                        "status": "active",
+                        "points": -1,
+                        "private_note": "strip",
+                    },
+                    "victory_point_cards": {"count": 2, "points": 2},
                     "total": 5,
                     "private_note": "do not expose",
                 },
@@ -250,6 +260,51 @@ def test_capture_game_builds_every_seat_and_spectator_without_private_leaks():
     }
 
 
+def test_restored_capture_marks_missing_history_without_false_event_links():
+    def build_snapshot(game, *, viewer_player_index, revision):
+        return snapshot(
+            revision,
+            viewer_player_index,
+            title="Aliceの勝利",
+            finished=True,
+        )
+
+    game = SimpleNamespace(
+        players=[object(), object()],
+        phase="finished",
+        match_metrics=metrics(
+            events=((0, "Aliceが開拓地を建設"), (1, "Aliceの勝利")),
+            checkpoints=((0, "開拓地"), (1, "勝利")),
+        ),
+        match_result=result_document(),
+    )
+    store = NetworkReplayStore(
+        snapshot_builder=build_snapshot,
+        result_builder=lambda current_game: current_game.match_result,
+    )
+
+    store.capture_restored_game("REST01", game, revision=7)
+    payload = store.result_payload("REST01", viewer_player_index=0)
+
+    assert payload["replay"] == {
+        "available": True,
+        "frame_count": 1,
+        "truncated": True,
+        "first_revision": 7,
+        "last_revision": 7,
+        "initial_frame_index": 0,
+        "final_frame_index": 0,
+    }
+    assert all(
+        event["replay_frame_index"] is None
+        for event in payload["result"]["important_events"]
+    )
+    assert all(
+        point["replay_frame_index"] is None
+        for point in payload["result"]["vp_progression"]
+    )
+
+
 def test_default_capture_reuses_network_snapshot_privacy():
     from game.game import CatanGame
 
@@ -300,9 +355,7 @@ def test_replay_frames_never_archive_authority_private_variant_state(monkeypatch
         headless=True,
     )
     authoritative = network_protocol.serialize_game(game)
-    authoritative["variant_state"]["private"] = {
-        "future_events": [private_sentinel]
-    }
+    authoritative["variant_state"]["private"] = {"future_events": [private_sentinel]}
     monkeypatch.setattr(
         network_protocol,
         "serialize_game",
@@ -347,6 +400,20 @@ def test_replay_rejects_an_already_filtered_snapshot_with_variant_private_data()
 
     with pytest.raises(NetworkReplayError) as error:
         NetworkReplayStore().record_snapshot("VAR002", leaked)
+
+    assert error.value.code == "private_state_leak"
+
+
+def test_replay_rejects_authority_resource_ledger_even_for_own_viewer():
+    leaked = snapshot(0, 0)
+    leaked["state"]["players"][0]["resource_ledger"] = {
+        "format": "catan-resource-ledger",
+        "version": 1,
+        "reservations": [{"id": "market:market-000000000", "bundle": {"WOOD": 1}}],
+    }
+
+    with pytest.raises(NetworkReplayError) as error:
+        NetworkReplayStore().record_snapshot("LEDGER1", leaked)
 
     assert error.value.code == "private_state_leak"
 
@@ -475,7 +542,8 @@ def test_bounded_history_relinks_events_and_vp_progression_to_retained_frames():
         "cities": {"count": 1, "points": 2},
         "longest_road": {"awarded": False, "points": 0},
         "largest_army": {"awarded": False, "points": 0},
-        "victory_point_cards": {"count": 1, "points": 1},
+        "debt_penalty": {"count": 1, "status": "active", "points": -1},
+        "victory_point_cards": {"count": 2, "points": 2},
         "total": 5,
     }
     assert source_result == source_before
@@ -581,3 +649,291 @@ def test_transport_independent_module_import_does_not_load_pygame():
     )
 
     assert completed.returncode == 0, completed.stderr
+
+
+def populated_authority_store(*, clock=None):
+    store = NetworkReplayStore(max_frames=4, clock=clock or Clock())
+    for revision in range(2):
+        store.record_revision(
+            "AUTH01",
+            revision=revision,
+            snapshots={
+                viewer: snapshot(
+                    revision,
+                    viewer,
+                    title=("対局開始" if revision == 0 else "Aliceの勝利"),
+                    finished=revision == 1,
+                )
+                for viewer in (None, 0, 1)
+            },
+            label="初期配置" if revision == 0 else "勝利判定",
+            metrics=metrics(
+                events=tuple(
+                    (index, "建設" if index == 0 else "勝利")
+                    for index in range(revision + 1)
+                ),
+                checkpoints=tuple(
+                    (index, "開拓地" if index == 0 else "勝利")
+                    for index in range(revision + 1)
+                ),
+            ),
+            result=result_document() if revision == 1 else None,
+        )
+    return store
+
+
+def test_authority_round_trip_is_exact_detached_and_keeps_every_viewer_private():
+    source = populated_authority_store()
+
+    authority = source.export_room_authority("AUTH01")
+
+    assert set(authority) == {
+        "format",
+        "version",
+        "room_code",
+        "truncated",
+        "frames",
+        "event_revisions",
+        "checkpoint_revisions",
+        "final_result",
+    }
+    assert authority["format"] == NETWORK_REPLAY_AUTHORITY_FORMAT
+    assert authority["version"] == NETWORK_REPLAY_AUTHORITY_VERSION
+    assert authority["room_code"] == "AUTH01"
+    assert authority["truncated"] is False
+    assert [frame["revision"] for frame in authority["frames"]] == [0, 1]
+    assert [
+        item["viewer_player_index"] for item in authority["frames"][0]["snapshots"]
+    ] == [None, 0, 1]
+    assert authority["event_revisions"] == [
+        {"sequence": 0, "revision": 0},
+        {"sequence": 1, "revision": 1},
+    ]
+    assert authority["checkpoint_revisions"] == [
+        {"sequence": 0, "revision": 0},
+        {"sequence": 1, "revision": 1},
+    ]
+    assert "private_resources" not in authority["final_result"]
+    assert authority["final_result"]["replay"] == {
+        "available": True,
+        "frame_count": 2,
+    }
+    assert all(
+        row["replay_frame_index"] is None and row["elapsed_ms"] is None
+        for field in ("important_events", "vp_progression")
+        for row in authority["final_result"][field]
+    )
+
+    restored = NetworkReplayStore(max_frames=4)
+    restored.import_room_authority(authority)
+    assert restored.latest_revision("AUTH01") == 1
+    assert restored.export_room_authority("AUTH01") == authority
+    for viewer in (None, 0, 1):
+        assert restored.frame_payload(
+            "AUTH01", viewer_player_index=viewer, frame_index=1
+        ) == source.frame_payload("AUTH01", viewer_player_index=viewer, frame_index=1)
+    assert restored.result_payload(
+        "AUTH01", viewer_player_index=0
+    ) == source.result_payload("AUTH01", viewer_player_index=0)
+
+    authority["frames"][0]["snapshots"][1]["snapshot"]["state"]["players"][0][
+        "resources"
+    ]["WOOD"] = 999
+    assert restored.frame_payload("AUTH01", viewer_player_index=0, frame_index=0)[
+        "snapshot"
+    ]["state"]["players"][0]["resources"] == {"WOOD": 2}
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        lambda document: document.update({"unexpected": True}),
+        lambda document: document.update({"version": 999}),
+        lambda document: document["frames"].reverse(),
+        lambda document: document["frames"][0].update({"elapsed_ms": -1}),
+        lambda document: document["frames"][0].update({"label": "  非正規  label  "}),
+        lambda document: document["frames"][0]["snapshots"].reverse(),
+        lambda document: document["frames"][0]["snapshots"][0]["snapshot"].update(
+            {"server_secret": "must reject"}
+        ),
+        lambda document: document["event_revisions"].reverse(),
+        lambda document: document["event_revisions"][0].update({"revision": 99}),
+        lambda document: document["final_result"].update(
+            {"private_resources": {"Alice": {"WOOD": 99}}}
+        ),
+        lambda document: document["final_result"]["replay"].update({"frame_count": 99}),
+        lambda document: document["final_result"].update({"board": "secret"}),
+        lambda document: document["final_result"].update(
+            {"standings": "not-a-public-table"}
+        ),
+    ),
+)
+def test_authority_import_rejects_schema_order_and_noncanonical_tampering(mutation):
+    target = populated_authority_store()
+    before = target.export_room_authority("AUTH01")
+    tampered = copy.deepcopy(before)
+    mutation(tampered)
+
+    with pytest.raises(NetworkReplayError):
+        target.import_room_authority(tampered)
+
+    # Failed replacement is atomic; the original room remains untouched.
+    assert target.export_room_authority("AUTH01") == before
+
+
+def test_authority_import_rechecks_snapshot_privacy_and_public_consistency():
+    authority = populated_authority_store().export_room_authority("AUTH01")
+    spectator = authority["frames"][0]["snapshots"][0]["snapshot"]
+    spectator["state"]["players"][1]["resources"] = {"WOOD": 99}
+
+    with pytest.raises(NetworkReplayError) as leaked:
+        NetworkReplayStore(max_frames=4).import_room_authority(authority)
+    assert leaked.value.code == "private_state_leak"
+
+    authority = populated_authority_store().export_room_authority("AUTH01")
+    authority["frames"][0]["snapshots"][0]["snapshot"]["state"]["players"][0][
+        "resource_total"
+    ] = 999
+    with pytest.raises(NetworkReplayError) as inconsistent:
+        NetworkReplayStore(max_frames=4).import_room_authority(authority)
+    assert inconsistent.value.code == "invalid_snapshot"
+
+
+def test_authority_import_enforces_configured_frame_and_global_value_limits():
+    authority = populated_authority_store().export_room_authority("AUTH01")
+    with pytest.raises(NetworkReplayError) as frames:
+        NetworkReplayStore(max_frames=1).import_room_authority(authority)
+    assert frames.value.code == "invalid_authority"
+
+    too_long = copy.deepcopy(authority)
+    too_long["frames"][0]["label"] = "x" * (MAX_NETWORK_REPLAY_LABEL_LENGTH + 1)
+    with pytest.raises(NetworkReplayError) as label:
+        NetworkReplayStore(max_frames=4).import_room_authority(too_long)
+    assert label.value.code == "invalid_label"
+
+    huge_revision = copy.deepcopy(authority)
+    huge_revision["frames"][1]["revision"] = MAX_NETWORK_REPLAY_REVISION + 1
+    for entry in huge_revision["frames"][1]["snapshots"]:
+        entry["snapshot"]["revision"] = MAX_NETWORK_REPLAY_REVISION + 1
+    with pytest.raises(NetworkReplayError) as revision:
+        NetworkReplayStore(max_frames=4).import_room_authority(huge_revision)
+    assert revision.value.code == "invalid_revision"
+
+
+def test_authority_import_requires_honest_truncation_for_missing_revisions():
+    authority = populated_authority_store().export_room_authority("AUTH01")
+    authority["frames"] = authority["frames"][1:]
+    authority["final_result"]["replay"]["frame_count"] = 1
+
+    with pytest.raises(NetworkReplayError) as error:
+        NetworkReplayStore(max_frames=4).import_room_authority(authority)
+    assert error.value.code == "invalid_authority"
+
+    authority["truncated"] = True
+    restored = NetworkReplayStore(max_frames=4)
+    restored.import_room_authority(authority)
+    assert (
+        restored.result_payload("AUTH01", viewer_player_index=0)["replay"]["truncated"]
+        is True
+    )
+
+
+def restored_game_stub():
+    return SimpleNamespace(
+        players=[object(), object()],
+        phase="main",
+        match_metrics=metrics(),
+    )
+
+
+def restored_snapshot_builder(game, *, viewer_player_index, revision):
+    return snapshot(
+        revision,
+        viewer_player_index,
+        title="復元した現在状態",
+    )
+
+
+def test_equal_restart_revision_preserves_full_history_elapsed_and_labels():
+    authority = populated_authority_store().export_room_authority("AUTH01")
+    authority["final_result"] = None
+    for entry in authority["frames"][-1]["snapshots"]:
+        entry["snapshot"]["state"]["phase"]["name"] = "main"
+    restored = NetworkReplayStore(
+        max_frames=4,
+        snapshot_builder=restored_snapshot_builder,
+    )
+    restored.import_room_authority(authority)
+    before = restored.export_room_authority("AUTH01")
+
+    restored.capture_restored_game("AUTH01", restored_game_stub(), revision=1)
+
+    after = restored.export_room_authority("AUTH01")
+    assert restored.latest_revision("MISSING") is None
+    assert [frame["revision"] for frame in after["frames"]] == [0, 1]
+    assert [frame["elapsed_ms"] for frame in after["frames"]] == [
+        frame["elapsed_ms"] for frame in before["frames"]
+    ]
+    assert [frame["label"] for frame in after["frames"]] == [
+        "初期配置",
+        "勝利判定",
+    ]
+    assert after["truncated"] is False
+
+
+def test_authority_ahead_restart_adds_boundary_and_marks_history_truncated():
+    authority = populated_authority_store().export_room_authority("AUTH01")
+    authority["final_result"] = None
+    for entry in authority["frames"][-1]["snapshots"]:
+        entry["snapshot"]["state"]["phase"]["name"] = "main"
+    restored = NetworkReplayStore(
+        max_frames=4,
+        snapshot_builder=restored_snapshot_builder,
+    )
+    restored.import_room_authority(authority)
+
+    restored.capture_restored_game("AUTH01", restored_game_stub(), revision=3)
+
+    after = restored.export_room_authority("AUTH01")
+    assert [frame["revision"] for frame in after["frames"]] == [0, 1, 3]
+    assert after["frames"][-1]["label"] == "サーバー再起動から再開"
+    assert after["truncated"] is True
+
+
+def test_runtime_revision_gap_is_immediately_reported_as_truncated():
+    store = NetworkReplayStore(max_frames=4)
+    store.record_snapshot("GAP001", snapshot(0, 0))
+    store.record_snapshot(
+        "GAP001",
+        snapshot(2, 0, finished=True),
+        result=result_document(),
+    )
+
+    payload = store.result_payload("GAP001", viewer_player_index=0)
+    assert payload["replay"]["truncated"] is True
+    assert [
+        store.frame_payload("GAP001", viewer_player_index=0, frame_index=index)[
+            "controls"
+        ]["revision"]
+        for index in range(2)
+    ] == [0, 2]
+
+
+def test_replay_ahead_of_restored_authority_fails_without_mutation():
+    restored = NetworkReplayStore(
+        max_frames=4,
+        snapshot_builder=restored_snapshot_builder,
+    )
+    restored.record_revision(
+        "AHEAD1",
+        revision=3,
+        snapshots={viewer: snapshot(3, viewer) for viewer in (None, 0, 1)},
+        label="保存済みrevision 3",
+    )
+    before = restored.export_room_authority("AHEAD1")
+
+    with pytest.raises(NetworkReplayError) as error:
+        restored.capture_restored_game("AHEAD1", restored_game_stub(), revision=2)
+
+    assert error.value.code == "replay_ahead"
+    assert restored.export_room_authority("AHEAD1") == before

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import deque
+import ipaddress
 import threading
 import time
 from typing import Any, Mapping
@@ -25,6 +26,17 @@ from game.network_protocol import (
     build_game_command,
 )
 from game.variant import VariantConfig
+
+
+def _peer_is_loopback(peer: tuple[str, int] | None) -> bool:
+    """Trust only an actual socket peer address, never a client-supplied host."""
+
+    if not isinstance(peer, tuple) or len(peer) != 2 or type(peer[0]) is not str:
+        return False
+    try:
+        return ipaddress.ip_address(peer[0]).is_loopback
+    except ValueError:
+        return False
 
 
 class LanServerRuntime:
@@ -62,6 +74,7 @@ class LanServerRuntime:
                 outbound = self.controller.handle(
                     event.connection_id,
                     event.message or {},
+                    protected_room_access_allowed=_peer_is_loopback(event.peer),
                 )
                 self._send_all(outbound)
             elif event.kind == "disconnected" and event.connection_id is not None:
@@ -172,7 +185,9 @@ class LanClientSession:
         custom_map: CustomMapSpec | Mapping[str, Any] | None = None,
         house_rules: HouseRules | Mapping[str, Any] | None = None,
         variant: VariantConfig | Mapping[str, Any] | None = None,
+        passphrase: str | None = None,
     ) -> None:
+        self._require_loopback_for_passphrase(passphrase)
         include_ai_settings = (
             ai_player_count is not None or ai_personality_mode is not None
         )
@@ -196,11 +211,13 @@ class LanClientSession:
             # Older callers omit the field; the authority restores standard.
             settings.pop("variant", None)
         self._begin_session_sync()
-        self._send(
-            "create_room",
-            display_name=display_name,
-            settings=settings,
-        )
+        payload: dict[str, Any] = {
+            "display_name": display_name,
+            "settings": settings,
+        }
+        if passphrase is not None:
+            payload["passphrase"] = passphrase
+        self._send("create_room", **payload)
 
     def join_room(
         self,
@@ -208,14 +225,18 @@ class LanClientSession:
         display_name: str,
         *,
         spectator: bool = False,
+        passphrase: str | None = None,
     ) -> None:
+        self._require_loopback_for_passphrase(passphrase)
         self._begin_session_sync()
-        self._send(
-            "join_room",
-            room_code=room_code,
-            display_name=display_name,
-            role="spectator" if spectator else "player",
-        )
+        payload: dict[str, Any] = {
+            "room_code": room_code,
+            "display_name": display_name,
+            "role": "spectator" if spectator else "player",
+        }
+        if passphrase is not None:
+            payload["passphrase"] = passphrase
+        self._send("join_room", **payload)
 
     def reconnect_room(
         self,
@@ -232,6 +253,15 @@ class LanClientSession:
         self.reconnect_token = token
         self._begin_session_sync()
         self._send("reconnect_room", room_code=code, reconnect_token=token)
+
+    def _require_loopback_for_passphrase(self, passphrase: str | None) -> None:
+        if passphrase is None:
+            return
+        if not _peer_is_loopback(getattr(self.transport, "peer", None)):
+            raise LanTransportError(
+                "room passphrases require a loopback LAN connection; "
+                "use the HTTPS/WSS Web transport for remote peers"
+            )
 
     def set_ready(self, ready: bool = True) -> None:
         if not isinstance(ready, bool):

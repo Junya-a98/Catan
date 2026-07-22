@@ -386,6 +386,13 @@ class LanClientTransport:
         with self._state_lock:
             return self._running.is_set() and self._socket is not None
 
+    @property
+    def peer(self) -> tuple[str, int] | None:
+        """Return the actual connected socket peer, never submitted host text."""
+
+        with self._state_lock:
+            return self._peer
+
     def connect(self, host: str, port: int, *, timeout: float = 5.0) -> None:
         host, port = _validated_endpoint(host, port)
         if port == 0:
@@ -453,6 +460,7 @@ class LanClientTransport:
             self._running.clear()
             sock, self._socket = self._socket, None
             thread, self._receive_thread = self._receive_thread, None
+            self._peer = None
         if sock is not None:
             _close_socket(sock)
         if thread is not None and thread is not threading.current_thread():

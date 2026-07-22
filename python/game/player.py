@@ -1,5 +1,6 @@
 from game.ai_personality import normalize_ai_personality
 from game.development_cards import DevelopmentCardType
+from game.resource_ledger import ResourceLedger
 from game.resources import ResourceType
 
 class Player:
@@ -44,29 +45,77 @@ class Player:
             ResourceType.BRICK: 0,
             ResourceType.ORE: 0
         }
+
+    @property
+    def resources(self):
+        """Total owned resource cards, including logically reserved cards."""
+
+        return self._resources
+
+    @resources.setter
+    def resources(self, values):
+        # Persistence replaces the complete map when restoring an older save.
+        # Rebinding here keeps the sidecar ledger attached to that same public,
+        # backwards-compatible dictionary instead of retaining stale totals.
+        self._resources = values
+        self.resource_ledger = ResourceLedger(self._resources)
     
     def add_resource(self, resource_type, amount=1):
         if resource_type in self.resources:
             self.resources[resource_type] += amount
 
     def remove_resource(self, resource_type, amount=1):
-        if self.resources.get(resource_type, 0) < amount:
+        if amount <= 0:
             return False
-        self.resources[resource_type] -= amount
-        return True
+        return self.resource_ledger.spend_available({resource_type: amount})
 
     def can_afford(self, cost):
-        return all(self.resources.get(resource, 0) >= amount for resource, amount in cost.items())
+        return all(
+            self.available_resource_count(resource) >= amount
+            for resource, amount in cost.items()
+        )
 
     def spend_resources(self, cost):
         if not self.can_afford(cost):
             return False
-        for resource, amount in cost.items():
-            self.resources[resource] -= amount
-        return True
+        if not cost:
+            return True
+        return self.resource_ledger.spend_available(cost)
 
     def total_resource_count(self):
         return sum(self.resources.values())
+
+    def available_resource_count(self, resource_type):
+        return self.resource_ledger.available_count(resource_type)
+
+    def available_resource_total(self):
+        return sum(self.resource_ledger.available_map().values())
+
+    def reserved_resource_count(self, resource_type):
+        return self.resource_ledger.reserved_count(resource_type)
+
+    def reserved_resource_total(self):
+        return sum(self.resource_ledger.reserved_map().values())
+
+    def reserve_resources(self, reservation_id, bundle):
+        return self.resource_ledger.reserve(reservation_id, bundle)
+
+    def release_reserved_resources(self, reservation_id):
+        return self.resource_ledger.release(reservation_id)
+
+    def consume_reserved_resources(self, reservation_id):
+        return self.resource_ledger.consume(reservation_id)
+
+    def remove_owned_resource(self, resource_type, amount=1):
+        """Apply a compulsory loss, cancelling funded reservations if needed."""
+
+        return self.resource_ledger.remove_owned(resource_type, amount)
+
+    def restore_resource_ledger(self, document):
+        self.resource_ledger = ResourceLedger.from_document(
+            self.resources,
+            document,
+        )
 
     def add_development_card(self, card_type, available=False):
         if card_type == DevelopmentCardType.VICTORY_POINT:

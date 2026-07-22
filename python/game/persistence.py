@@ -18,7 +18,9 @@ from game.constants import (
 )
 from game.custom_map import CustomMapError, CustomMapSpec
 from game.development_cards import DevelopmentCardType
+from game.forecast_events import HARBOR_BLOCKADE_EVENT_ID
 from game.game_board import GameBoard
+from game.grand_campaign import GrandCampaignError, HarborBlockadePlan
 from game.house_rules import HouseRules
 from game.match_metrics import (
     MatchMetrics,
@@ -27,10 +29,17 @@ from game.match_metrics import (
     serialize_match_metrics,
 )
 from game.resources import ResourceType
+from game.resource_ledger import ResourceLedgerError
 from game.road import Road
-from game.variant import STANDARD_VARIANT_KIND, VariantConfig
+from game.variant import (
+    COMPOSITE_GRAND_CAMPAIGN_CATALOG,
+    CREDIT_VARIANT_KIND,
+    STANDARD_VARIANT_KIND,
+    VariantConfig,
+    variant_board_topology,
+    variant_uses_hidden_board,
+)
 from game.variant_state import VariantState, VariantStateError
-from game.frontier import FRONTIER_KIND
 
 
 SAVE_FORMAT = "catan-local-save"
@@ -79,6 +88,17 @@ def _resource_map_from_json(values, *, label):
             raise SaveGameError(f"{label} の {resource_type.name} が不正です。")
         result[resource_type] = value
     return result
+
+
+def _optional_resource_ledger_document(player):
+    ledger = player.resource_ledger
+    if not ledger.has_reservations:
+        return {}
+    try:
+        document = ledger.to_document()
+    except ResourceLedgerError as exc:
+        raise SaveGameError(f"{player.name} の資源予約が不正です。") from exc
+    return {"resource_ledger": document}
 
 
 def _card_map_to_json(values):
@@ -189,6 +209,10 @@ def _variant_state_for_game(game, variant_config):
     return variant_state
 
 
+def _board_topology_for_variant(variant_config):
+    return variant_board_topology(variant_config)
+
+
 def _custom_map_for_game(game):
     if getattr(game, "board_mode", None) != "custom":
         return None
@@ -271,6 +295,12 @@ def serialize_game(game):
     house_rules = _house_rules_for_game(game)
     variant_config = _variant_config_for_game(game)
     variant_state = _variant_state_for_game(game, variant_config)
+    _validate_restored_trade_market(game)
+    _validate_restored_resource_credit(game)
+    _validate_restored_grand_campaign(game)
+    expected_topology = _board_topology_for_variant(variant_config)
+    if getattr(game.board, "topology_id", "standard_19_v1") != expected_topology:
+        raise SaveGameError("盤面topologyとvariant設定が一致しません。")
     rules_document = {
         "victory_point_target": int(game.victory_point_target),
         "variant": variant_config.to_document(),
@@ -308,6 +338,7 @@ def serialize_game(game):
                 "piece_pattern": int(player.piece_pattern),
                 "marker": player.marker,
                 "resources": _resource_map_to_json(player.resources),
+                **_optional_resource_ledger_document(player),
                 "roads_remaining": int(player.roads_remaining),
                 "settlements_remaining": int(player.settlements_remaining),
                 "cities_remaining": int(player.cities_remaining),
@@ -332,6 +363,9 @@ def serialize_game(game):
             ),
             "action_mode": game.action_mode,
             "development_card_used_this_turn": bool(game.development_card_used_this_turn),
+            "credit_action_taken_this_turn": bool(
+                getattr(game, "credit_action_taken_this_turn", False)
+            ),
             "special_phase": game.special_phase,
             "winner": _optional_index(game.winner, players, label="勝者"),
             "longest_road_owner": _optional_index(
@@ -432,6 +466,12 @@ def serialize_game(game):
             "paused": bool(game.ai_paused),
             "status": dict(game.ai_status),
             "domestic_trade_attempted": bool(game.ai_domestic_trade_attempted),
+            "market_action_attempted": bool(
+                getattr(game, "ai_market_action_attempted", False)
+            ),
+            "auction_action_attempted": bool(
+                getattr(game, "ai_auction_action_attempted", False)
+            ),
         },
         "ui": {
             "show_help_panel": bool(game.show_help_panel),
@@ -482,7 +522,7 @@ def restore_game(game, data, *, runtime_side_effects=True):
         variant_config = VariantConfig.from_document(rules_data.get("variant"))
     except (TypeError, ValueError) as exc:
         raise SaveGameError("variant設定が不正です。") from exc
-    if variant_config.kind == FRONTIER_KIND and custom_map is not None:
+    if variant_uses_hidden_board(variant_config) and custom_map is not None:
         raise SaveGameError("frontier variantは生成盤面でのみ利用できます。")
     try:
         variant_state = VariantState.from_document(
@@ -509,13 +549,19 @@ def restore_game(game, data, *, runtime_side_effects=True):
     game.board_seed = board_data["seed"]
     game.board_seed_text = str(game.board_seed)
     game.custom_map_spec = custom_map
+    topology_id = _board_topology_for_variant(variant_config)
     if custom_map is None:
-        game.board = GameBoard(mode=game.board_mode, seed=game.board_seed)
+        game.board = GameBoard(
+            mode=game.board_mode,
+            seed=game.board_seed,
+            topology_id=topology_id,
+        )
     else:
         game.board = GameBoard(
             mode=game.board_mode,
             seed=game.board_seed,
             custom_map=custom_map,
+            topology_id=topology_id,
         )
     game.get_board_rules().set_board(game.board)
 
@@ -563,6 +609,13 @@ def restore_game(game, data, *, runtime_side_effects=True):
             saved_player.get("resources"),
             label=player.name,
         )
+        if "resource_ledger" in saved_player:
+            try:
+                player.restore_resource_ledger(saved_player["resource_ledger"])
+            except ResourceLedgerError as exc:
+                raise SaveGameError(
+                    f"{player.name} の資源予約データが不正です。"
+                ) from exc
         for field in (
             "roads_remaining",
             "settlements_remaining",
@@ -623,7 +676,7 @@ def restore_game(game, data, *, runtime_side_effects=True):
         allow_none=False,
     )
     if (
-        game.variant_config.kind == FRONTIER_KIND
+        variant_uses_hidden_board(game.variant_config)
         and not game.is_frontier_tile_revealed(game.board.robber_tile)
     ):
         raise SaveGameError("frontier stateで盗賊タイルが未公開です。")
@@ -668,6 +721,9 @@ def restore_game(game, data, *, runtime_side_effects=True):
         raise SaveGameError("建設選択状態が不正です。")
     game.development_card_used_this_turn = bool(
         phase_data.get("development_card_used_this_turn", False)
+    )
+    game.credit_action_taken_this_turn = bool(
+        phase_data.get("credit_action_taken_this_turn", False)
     )
     game.special_phase = phase_data.get("special_phase")
     if game.special_phase not in SUPPORTED_SPECIAL_PHASES:
@@ -855,6 +911,12 @@ def restore_game(game, data, *, runtime_side_effects=True):
     game.ai_domestic_trade_attempted = bool(
         ai_data.get("domestic_trade_attempted", False)
     )
+    game.ai_market_action_attempted = bool(
+        ai_data.get("market_action_attempted", False)
+    )
+    game.ai_auction_action_attempted = bool(
+        ai_data.get("auction_action_attempted", False)
+    )
 
     game.show_help_panel = bool(ui_data.get("show_help_panel", False))
     game.show_log_panel = bool(ui_data.get("show_log_panel", False))
@@ -899,6 +961,12 @@ def _validate_restored_game(game):
             )
 
     for player in game.players:
+        try:
+            player.resource_ledger.to_document()
+        except ResourceLedgerError as exc:
+            raise SaveGameError(
+                f"{player.name} の資源予約データが不正です。"
+            ) from exc
         road_count = sum(road.owner is player for road in game.board.roads)
         settlement_count = sum(
             node.building is not None
@@ -918,6 +986,122 @@ def _validate_restored_game(game):
             raise SaveGameError(f"{player.name} の開拓地コマ数が不正です。")
         if player.cities_remaining + city_count != 4:
             raise SaveGameError(f"{player.name} の都市コマ数が不正です。")
+    _validate_restored_trade_market(game)
+    _validate_restored_resource_credit(game)
+    _validate_restored_grand_campaign(game)
+
+
+def _validate_restored_trade_market(game):
+    """Require every public market/auction position to match private escrow."""
+
+    is_market = getattr(game, "is_trade_market_variant", lambda: False)()
+    orders = tuple(
+        getattr(game, "get_trade_market_orders", lambda: ())()
+        if is_market
+        else ()
+    )
+    expected_by_player = {index: {} for index in range(len(game.players))}
+    for order in orders:
+        if not 0 <= order.seller_index < len(game.players):
+            raise SaveGameError("常設市場の出品者が存在しません。")
+        expected_by_player[order.seller_index][order.reservation_id] = dict(
+            order.offer
+        )
+    auctions = tuple(
+        getattr(game, "get_trade_auctions", lambda: ())()
+        if getattr(game, "is_trade_auction_variant", lambda: False)()
+        else ()
+    )
+    for auction in auctions:
+        if not 0 <= auction.seller_index < len(game.players):
+            raise SaveGameError("公開競売の出品者が存在しません。")
+        expected_by_player[auction.seller_index][
+            auction.seller_reservation_id
+        ] = dict(auction.offer)
+        for bid in auction.bids:
+            if not 0 <= bid.bidder_index < len(game.players):
+                raise SaveGameError("公開競売の入札者が存在しません。")
+            expected_by_player[bid.bidder_index][
+                auction.bid_reservation_id(bid.bidder_index)
+            ] = dict(bid.offer)
+
+    for index, player in enumerate(game.players):
+        try:
+            reservations = player.resource_ledger.reservations_map()
+        except ResourceLedgerError as exc:
+            raise SaveGameError(
+                f"{player.name} の資源予約データが不正です。"
+            ) from exc
+        trade_reservations = {
+            reservation_id: bundle
+            for reservation_id, bundle in reservations.items()
+            if reservation_id.startswith(("market:", "auction:"))
+        }
+        if trade_reservations != expected_by_player[index]:
+            raise SaveGameError(
+                f"{player.name} の市場注文と予約資源、または公開競売の"
+                "予約資源が一致しません。"
+            )
+
+
+def _validate_restored_resource_credit(game):
+    """Bind every public credit liability to this match's actual seats."""
+
+    variant_config = getattr(game, "variant_config", None)
+    if (
+        not isinstance(variant_config, VariantConfig)
+        or not variant_config.has_component(CREDIT_VARIANT_KIND)
+    ):
+        return
+    variant_state = getattr(game, "variant_state", None)
+    if not isinstance(variant_state, VariantState):
+        raise SaveGameError("credit variant stateがありません。")
+    try:
+        credit_state = variant_state.component_state(CREDIT_VARIANT_KIND)
+        if credit_state is None:
+            raise VariantStateError("credit component stateがありません。")
+        credit_state.validate_credit_player_count(len(game.players))
+    except VariantStateError as exc:
+        raise SaveGameError("信用台帳と参加席、または返済期限が一致しません。") from exc
+
+
+def _validate_restored_grand_campaign(game):
+    """Reject any saved forecast plan that names a still-hidden harbor."""
+
+    variant_config = getattr(game, "variant_config", None)
+    if (
+        not isinstance(variant_config, VariantConfig)
+        or variant_config.options.get("catalog")
+        != COMPOSITE_GRAND_CAMPAIGN_CATALOG
+    ):
+        return
+    forecast_state = game.get_variant_component_state("forecast_events")
+    if forecast_state is None:
+        raise SaveGameError("grand campaign forecast stateがありません。")
+    public_harbors = set(game.get_public_harbor_ids() or ())
+    rows = [forecast_state.public["forecast"]]
+    rows.extend(forecast_state.public["active_effects"])
+    for row in rows:
+        if row.get("event_id") != HARBOR_BLOCKADE_EVENT_ID:
+            continue
+        parameters = row.get("parameters", {})
+        try:
+            plan_document = parameters["campaign_plan"]
+            plan = HarborBlockadePlan.from_public_document(
+                {
+                    **dict(plan_document),
+                    "eligible_harbor_ids": list(
+                        plan_document["eligible_harbor_ids"]
+                    ),
+                    "outcome": dict(plan_document["outcome"]),
+                }
+            )
+        except (GrandCampaignError, KeyError, TypeError) as exc:
+            raise SaveGameError("grand campaign港湾封鎖計画が不正です。") from exc
+        if not set(plan.eligible_harbor_ids).issubset(public_harbors):
+            raise SaveGameError(
+                "grand campaign港湾封鎖計画に未公開交換所が含まれています。"
+            )
 
 
 def _validate_restored_domestic_trade(game):

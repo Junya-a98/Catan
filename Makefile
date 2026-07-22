@@ -1,7 +1,7 @@
 PYTHON ?= .venv/bin/python
 PYTEST_ENV = PYTHONPATH=python SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy PYGAME_HIDE_SUPPORT_PROMPT=1
 
-.PHONY: venv install-dev run web simulate test
+.PHONY: venv install-dev run web simulate test test-web test-all
 
 venv:
 	python3 -m venv .venv
@@ -21,3 +21,8 @@ simulate:
 
 test:
 	$(PYTEST_ENV) $(PYTHON) -m pytest tests
+
+test-web:
+	node --test tests/web_board_animations.test.mjs
+
+test-all: test test-web

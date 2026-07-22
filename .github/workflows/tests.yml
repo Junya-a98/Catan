@@ -26,3 +26,15 @@ jobs:
 
       - name: Run tests
         run: python -m pytest tests
+
+  web:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Run browser module tests
+        run: node --test tests/web_board_animations.test.mjs

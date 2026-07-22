@@ -74,6 +74,32 @@
               表示名
               <input name="display_name" value="Host" maxlength="32" required autocomplete="nickname">
             </label>
+            <fieldset class="room-protection" id="create-room-protection">
+              <legend>入室方法</legend>
+              <div class="room-access-mode-options">
+                <label class="radio-card room-access-mode-card" for="invite-only-room">
+                  <input id="invite-only-room" name="room_access_mode" type="radio" value="invite_only" checked aria-controls="create-passphrase-fields">
+                  <span><strong>期限付き招待リンクのみ（推奨）</strong><small>ホストが発行する1時間・1回限りのリンクで参加します</small></span>
+                </label>
+                <label class="radio-card room-access-mode-card" for="open-room">
+                  <input id="open-room" name="room_access_mode" type="radio" value="open" aria-controls="create-passphrase-fields">
+                  <span><strong>参加コード</strong><small>従来どおり6文字のコードを知っている人が参加できます</small></span>
+                </label>
+                <label class="radio-card room-access-mode-card" for="protect-room">
+                  <input id="protect-room" name="room_access_mode" type="radio" value="passphrase" aria-controls="create-passphrase-fields">
+                  <span><strong>参加コード＋パスフレーズ</strong><small>参加・観戦するときに共通パスフレーズを入力します</small></span>
+                </label>
+              </div>
+              <div class="passphrase-fields" id="create-passphrase-fields" hidden>
+                <label for="create-room-passphrase">部屋パスフレーズ</label>
+                <div class="password-input-row">
+                  <input id="create-room-passphrase" name="room_passphrase" type="password" minlength="15" data-max-characters="64" autocomplete="new-password" aria-describedby="create-passphrase-note">
+                  <button class="password-visibility-button" id="create-passphrase-toggle" type="button" aria-pressed="false" aria-controls="create-room-passphrase" aria-label="部屋パスフレーズを表示">表示</button>
+                </div>
+                <p class="field-note" id="create-passphrase-note">15〜64文字。日本語・空白・記号を使用でき、参加者へ別経路で伝えます。</p>
+              </div>
+              <p class="field-note room-protection-transport-note" id="room-protection-transport-note" role="status"></p>
+            </fieldset>
             <div class="field-row">
               <label>
                 人数
@@ -118,13 +144,18 @@
             </label>
             <label>
               ゲームモード
-              <select name="variant_kind">
+              <select name="variant_kind" aria-describedby="variant-kind-note">
                 <option value="standard" selected>通常ルール</option>
                 <option value="forecast_events">予告イベント</option>
-                <option value="frontier">フロンティア探索</option>
+                <option value="trade2">交易2.0・市場と公開競売</option>
+                <option value="credit">資源信用・借入と返済</option>
+                <option value="composite">イベント＆経済（複合）</option>
+                <option value="grand_campaign">グランドキャンペーン（全部入り）</option>
+                <option value="frontier">フロンティア探索・拡張37タイル</option>
+                <option value="frontier_legacy">フロンティア探索・標準19タイル</option>
               </select>
             </label>
-            <p class="field-note">予告イベントは全体効果を事前公開。フロンティア探索は街道で外周の霧を開きます。</p>
+            <p class="field-note" id="variant-kind-note">予告イベントは全体効果を事前公開。交易2.0は常設市場と公開競売、資源信用は期限付きの借入を追加します。「イベント＆経済（複合）」ではこの3機能を同時に遊べます。「グランドキャンペーン（全部入り）」は37タイル探索に、予告イベント・常設市場・公開競売・借金をすべて加えた別モードです。フロンティア探索は街道で外周の霧を開きます。</p>
             <label>
               Seed
               <div class="input-action-row">
@@ -143,22 +174,23 @@
                 <p>ホストから6文字のコードを受け取ります。</p>
               </div>
             </div>
+            <p class="invite-prefill-note" id="invite-prefill-note" role="status" hidden>招待コードを入力しました。表示名と参加方法を確認してから参加してください。</p>
             <label>
               表示名
               <input name="display_name" value="Player" maxlength="32" required autocomplete="nickname">
             </label>
             <label>
               参加コード
-              <input class="room-code-input" name="room_code" maxlength="6" placeholder="ABC234" required autocomplete="off" autocapitalize="characters">
+              <input class="room-code-input" id="join-room-code" name="room_code" maxlength="6" placeholder="ABC234" required autocomplete="off" autocapitalize="characters">
             </label>
             <fieldset>
               <legend>参加方法</legend>
               <label class="radio-card">
-                <input type="radio" name="role" value="player" checked>
+                <input id="join-player-role" type="radio" name="role" value="player" checked>
                 <span><strong>プレイヤー</strong><small>席に座って対局します</small></span>
               </label>
               <label class="radio-card">
-                <input type="radio" name="role" value="spectator">
+                <input id="join-spectator-role" type="radio" name="role" value="spectator">
                 <span><strong>観戦</strong><small>公開情報だけを見ます</small></span>
               </label>
             </fieldset>
@@ -176,9 +208,34 @@
           <div class="room-code-card">
             <span>参加コード</span>
             <strong id="lobby-room-code">------</strong>
-            <button id="copy-room-code" type="button">コピー</button>
+            <div class="room-code-actions">
+              <button id="copy-room-code" type="button">コピー</button>
+              <button id="copy-player-invite-link" type="button">プレイヤー招待</button>
+              <button id="copy-spectator-invite-link" type="button">観戦招待</button>
+            </div>
+            <p class="invitation-guidance" id="invitation-guidance" hidden>招待リンクは1時間有効・1回限りです。相手ごとに新しいリンクを発行してください。</p>
+            <div class="invite-link-fallback" id="invite-link-fallback" role="status" hidden>
+              <label for="invite-link-value">コピーできない場合は、このリンクを手動でコピーしてください。</label>
+              <input id="invite-link-value" type="text" readonly aria-label="招待リンク">
+            </div>
           </div>
         </div>
+
+        <section class="panel invitation-manager" id="invitation-manager" aria-labelledby="invitation-manager-title" hidden>
+          <div class="section-heading invitation-manager-heading">
+            <div>
+              <p class="eyebrow">FRIEND INVITES</p>
+              <h2 id="invitation-manager-title">未使用の招待</h2>
+              <p id="invitation-manager-status" role="status" aria-live="polite">招待を確認しています。</p>
+            </div>
+            <span class="phase-badge" id="invitation-count">0件</span>
+          </div>
+          <ul class="invitation-list" id="invitation-list" aria-label="有効な未使用招待"></ul>
+          <div class="invitation-manager-actions">
+            <button class="ghost-button" id="refresh-invitations" type="button" aria-controls="invitation-list">更新</button>
+            <button class="danger-button" id="revoke-all-invitations" type="button" aria-controls="invitation-list">すべて取り消す</button>
+          </div>
+        </section>
 
         <div class="lobby-grid">
           <section class="panel member-panel">
@@ -242,6 +299,49 @@
               <p class="context-hint" id="action-hint">手番になると行動が表示されます。</p>
             </section>
 
+            <section class="panel market-panel" id="market-panel" aria-labelledby="market-panel-title" hidden>
+              <div class="section-heading compact">
+                <div>
+                  <p class="eyebrow">STANDING MARKET</p>
+                  <h2 id="market-panel-title">常設市場</h2>
+                </div>
+                <span class="phase-badge" id="market-order-count">0 / 16</span>
+              </div>
+              <p class="market-intro">公開注文は期限まで残ります。資源は出品中だけ手札から取り置かれます。</p>
+              <div class="market-order-list" id="market-order-list" aria-live="polite"></div>
+              <button class="secondary-button market-create-button" id="market-create-button" type="button">新しい注文を出す</button>
+              <p class="context-hint" id="market-hint"></p>
+            </section>
+
+            <section class="panel auction-panel" id="auction-panel" aria-labelledby="auction-panel-title" hidden>
+              <div class="section-heading compact">
+                <div>
+                  <p class="eyebrow">PUBLIC AUCTION</p>
+                  <h2 id="auction-panel-title">公開競売</h2>
+                </div>
+                <span class="phase-badge" id="auction-count">0 / 8</span>
+              </div>
+              <p class="auction-intro">出品者が資源を公開し、ほかのプレイヤーが好きな資源の組み合わせで入札します。</p>
+              <div class="auction-list" id="auction-list" aria-live="polite"></div>
+              <button class="secondary-button auction-create-button" id="auction-create-button" type="button">新しい競売を開く</button>
+              <p class="context-hint" id="auction-hint"></p>
+            </section>
+
+            <section class="panel credit-panel" id="credit-panel" aria-labelledby="credit-panel-title" hidden>
+              <div class="section-heading compact">
+                <div>
+                  <p class="eyebrow">RESOURCE CREDIT</p>
+                  <h2 id="credit-panel-title">資源信用所</h2>
+                </div>
+                <span class="phase-badge" id="credit-loan-count">債務 0件</span>
+              </div>
+              <p class="credit-intro">銀行から指定資源を1枚借りられます。返済中の債務とVP減点は全員に公開されます。</p>
+              <p class="credit-availability" id="credit-availability">借入可能な資源は自分の行動手番に確認できます。</p>
+              <div class="credit-loan-list" id="credit-loan-list" aria-live="polite"></div>
+              <button class="secondary-button credit-open-button" id="credit-open-button" type="button">資源を借りる</button>
+              <p class="context-hint" id="credit-hint"></p>
+            </section>
+
             <section class="panel players-panel">
               <div class="section-heading compact">
                 <h2>プレイヤー</h2>
@@ -261,12 +361,12 @@
                 <ul class="forecast-active-list" id="forecast-active-list"></ul>
               </section>
               <p class="visually-hidden" id="forecast-live-status" role="status" aria-live="polite" aria-atomic="true"></p>
-              <div class="frontier-status-card" id="frontier-status-card" hidden>
+              <div class="frontier-status-card" id="frontier-status-card" aria-labelledby="frontier-status-title" hidden>
                 <div class="frontier-status-heading">
                   <span>FRONTIER MAP</span>
-                  <strong id="frontier-status-count">7 / 19 公開</strong>
+                  <strong id="frontier-status-count">7 / 37 公開</strong>
                 </div>
-                <h2>未知領域を探索</h2>
+                <h2 id="frontier-status-title">未知領域を探索</h2>
                 <p id="frontier-status-detail">霧に接する街道から探索できます。</p>
               </div>
               <p class="eyebrow">LATEST EVENT</p>
@@ -361,7 +461,7 @@
           <div>
             <p class="eyebrow">QUICK RULES</p>
             <h2 id="rules-title">ルール・建設コスト</h2>
-            <p>必要なときだけ開ける早見表です。権威サーバーが実際の合法性を最終確認します。</p>
+            <p>必要なときだけ開ける早見表です。実際に選べる建設先は盤面の光る候補で確認できます。</p>
           </div>
           <button class="modal-close" id="rules-close" type="button" aria-label="ルールを閉じる">×</button>
         </div>
@@ -394,6 +494,10 @@
         </div>
 
         <div class="rules-grid">
+          <article id="rules-campaign-note" hidden>
+            <h3>グランドキャンペーン（全部入り）</h3>
+            <p>37タイルの探索、予告イベント、常設市場、公開競売、資源信用を同時に使います。港湾封鎖は予告時点で公開済みの交換所だけを対象とし、公開済みの交換所がなければその回は発動しません。</p>
+          </article>
           <article>
             <h3>手番の流れ</h3>
             <ol><li>ダイスを振る</li><li>建設・交易・発展カード</li><li>手番終了</li></ol>
@@ -409,6 +513,22 @@
           <article>
             <h3>銀行・港</h3>
             <p>通常は同じ資源4枚を任意の1枚へ交換。開拓地・都市が接続する港に応じて3:1または指定資源2:1になります。</p>
+          </article>
+          <article id="rules-forecast-note" hidden>
+            <h3>予告イベント</h3>
+            <p>全員へ影響する次回イベントと対象を事前公開します。発動までの残り手番と現在有効な効果を確認し、建設・交易・生産への影響を見越して行動してください。</p>
+          </article>
+          <article id="rules-frontier-note" hidden>
+            <h3>37タイル・フロンティア探索</h3>
+            <p>開始時は中央7タイルだけが見えています。霧に接する街道を建設すると未知タイルと港が公開され、未公開の資源・数字・港は生産や交易に使えません。</p>
+          </article>
+          <article id="rules-market-note" hidden>
+            <h3>常設市場と公開競売</h3>
+            <p>常設市場では、渡す資源と希望する資源を指定して注文を出します。公開競売では、出品者が品物と最低入札枚数を示し、ほかのプレイヤーは好きな資源の組み合わせで入札できます。出品・入札中の資源は取り置かれ、取消・期限切れでは手札へ戻ります。</p>
+          </article>
+          <article id="rules-credit-note" hidden>
+            <h3>資源信用</h3>
+            <p>銀行から指定資源1枚を借り、期限までに同じ資源1枚と任意資源1枚をまとめて返済します。返済期限を過ぎると任意資源3枚の延滞債務へ変わり、分割返済できます。未返済中は公開VPが通常−1、延滞中は−2されます。</p>
           </article>
         </div>
       </section>
@@ -428,6 +548,92 @@
         <div class="trade-prompt-actions" id="trade-prompt-actions"></div>
         <p class="modal-footnote">閉じても、右の「選べる行動」から回答できます。</p>
       </section>
+    </div>
+
+    <div class="modal-backdrop market-editor-backdrop" id="market-editor" role="dialog" aria-modal="true" aria-labelledby="market-editor-title" hidden>
+      <section class="market-editor-card" tabindex="-1">
+        <div class="modal-heading">
+          <div>
+            <p class="eyebrow">CREATE MARKET ORDER</p>
+            <h2 id="market-editor-title">常設市場へ注文を出す</h2>
+            <p>赤の「出品する」は取り置かれる資源、緑の「希望する」は購入者から受け取る資源です。</p>
+          </div>
+          <button class="modal-close" id="market-editor-close" type="button" aria-label="注文編集を閉じる">×</button>
+        </div>
+        <p class="market-editor-summary" id="market-editor-summary">出品と希望を1枚以上ずつ選んでください。</p>
+        <div class="market-editor-grid" id="market-editor-grid"></div>
+        <div class="market-editor-actions">
+          <button class="primary-button" id="market-editor-submit" type="button" disabled>この条件で出品</button>
+          <button class="ghost-button" id="market-editor-cancel" type="button">やめる</button>
+        </div>
+        <p class="modal-footnote">同じ資源を出品側と希望側の両方には指定できません。希望は各資源19枚までです。</p>
+      </section>
+    </div>
+
+    <div class="modal-backdrop auction-editor-backdrop" id="auction-editor" role="dialog" aria-modal="true" aria-labelledby="auction-editor-title" hidden>
+      <section class="auction-editor-card" tabindex="-1">
+        <div class="modal-heading">
+          <div>
+            <p class="eyebrow" id="auction-editor-kicker">CREATE AUCTION</p>
+            <h2 id="auction-editor-title">公開競売を開く</h2>
+            <p id="auction-editor-description">出品する資源と、受け付ける最低入札枚数を指定します。</p>
+          </div>
+          <button class="modal-close" id="auction-editor-close" type="button" aria-label="競売編集を閉じる">×</button>
+        </div>
+        <p class="auction-editor-summary" id="auction-editor-summary" aria-live="polite">出品する資源を1枚以上選んでください。</p>
+        <div class="auction-editor-body" id="auction-editor-body"></div>
+        <div class="auction-editor-actions">
+          <button class="primary-button" id="auction-editor-submit" type="button" disabled>この内容で競売を開く</button>
+          <button class="ghost-button" id="auction-editor-cancel" type="button">やめる</button>
+        </div>
+        <p class="modal-footnote" id="auction-editor-footnote">出品資源と入札資源は、競売が終わるまで使用できない状態で取り置かれます。</p>
+      </section>
+    </div>
+
+    <div class="modal-backdrop credit-editor-backdrop" id="credit-editor" role="dialog" aria-modal="true" aria-labelledby="credit-editor-title" aria-describedby="credit-editor-description" hidden>
+      <section class="credit-editor-card" tabindex="-1">
+        <div class="modal-heading">
+          <div>
+            <p class="eyebrow" id="credit-editor-kicker">RESOURCE CREDIT</p>
+            <h2 id="credit-editor-title">資源を借りる</h2>
+            <p id="credit-editor-description">受け取る資源を1種類選んでください。</p>
+          </div>
+          <button class="modal-close" id="credit-editor-close" type="button" aria-label="資源信用の編集を閉じる">×</button>
+        </div>
+        <p class="credit-editor-summary" id="credit-editor-summary" role="status" aria-live="polite" aria-atomic="true">借りる資源を選んでください。</p>
+        <div class="credit-editor-body" id="credit-editor-body"></div>
+        <div class="credit-editor-actions">
+          <button class="primary-button" id="credit-editor-submit" type="button" disabled>この資源を借りる</button>
+          <button class="ghost-button" id="credit-editor-cancel" type="button">やめる</button>
+        </div>
+        <p class="modal-footnote" id="credit-editor-footnote">借入中の債務とVP減点は、全プレイヤーへ公開されます。</p>
+      </section>
+    </div>
+
+    <div class="modal-backdrop room-access-backdrop" id="room-access-prompt" role="dialog" aria-modal="true" aria-labelledby="room-access-title" aria-describedby="room-access-description" hidden>
+      <form class="room-access-card" id="room-access-form" tabindex="-1">
+        <div class="modal-heading">
+          <div>
+            <p class="eyebrow">PROTECTED ROOM</p>
+            <h2 id="room-access-title">入室保護を解除</h2>
+            <p id="room-access-description">この部屋への参加にはパスフレーズが必要です。</p>
+          </div>
+          <button class="modal-close" id="room-access-close" type="button" aria-label="入室保護の入力を閉じる">×</button>
+        </div>
+        <p class="room-access-target" id="room-access-target">部屋 ------ に参加</p>
+        <label for="join-room-passphrase">部屋パスフレーズ</label>
+        <div class="password-input-row">
+          <input id="join-room-passphrase" name="room_passphrase" type="password" minlength="15" data-max-characters="64" autocomplete="current-password" required aria-describedby="room-access-note room-access-error">
+          <button class="password-visibility-button" id="join-passphrase-toggle" type="button" aria-pressed="false" aria-controls="join-room-passphrase" aria-label="部屋パスフレーズを表示">表示</button>
+        </div>
+        <p class="field-note" id="room-access-note">ホストから安全な別経路で受け取った15〜64文字を入力してください。</p>
+        <p class="room-access-error" id="room-access-error" role="alert" aria-live="assertive" hidden></p>
+        <div class="room-access-actions">
+          <button class="primary-button" id="room-access-submit" type="submit">入室する</button>
+          <button class="ghost-button" id="room-access-cancel" type="button">やめる</button>
+        </div>
+        <p class="modal-footnote">パスフレーズは招待リンクやこのブラウザの保存領域には記録されません。</p>
+      </form>
     </div>
 
     <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>

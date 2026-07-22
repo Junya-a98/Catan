@@ -1179,6 +1179,7 @@ def _validate_lobby_snapshot(snapshot: Mapping[str, Any]) -> None:
         "members",
     }
     allowed = required | {
+        "access",
         "full",
         "player_members",
         "spectators",
@@ -1197,6 +1198,13 @@ def _validate_lobby_snapshot(snapshot: Mapping[str, Any]) -> None:
     if not isinstance(settings, Mapping):
         raise ValueError("lobby settings are invalid")
     validated_settings = _validated_room_settings(settings)
+    access = snapshot.get("access")
+    if access is not None and (
+        not isinstance(access, Mapping)
+        or set(access) != {"passphrase_required"}
+        or type(access["passphrase_required"]) is not bool
+    ):
+        raise ValueError("lobby access policy is invalid")
     if type(snapshot["can_start"]) is not bool:
         raise ValueError("lobby can_start is invalid")
     if "full" in snapshot and type(snapshot["full"]) is not bool:

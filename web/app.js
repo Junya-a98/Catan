@@ -59,6 +59,64 @@ const DEFAULT_FRONTIER_OPTIONS = {
   initial_radius: 1,
   reveal_rule: "road_adjacent_v1",
 };
+const EXPANDED_FRONTIER_OPTIONS = {
+  catalog: "outer_ring_37_v1",
+  initial_radius: 1,
+  reveal_rule: "road_adjacent_v1",
+};
+const DEFAULT_TRADE2_OPTIONS = {
+  catalog: "market_auction_v1",
+  order_ttl_turns: 4,
+  auction_ttl_turns: 4,
+};
+const DEFAULT_CREDIT_OPTIONS = Object.freeze({ catalog: "bank_loan_v1" });
+const COMPOSITE_EVENTS_ECONOMY_CATALOG = "events_economy_v1";
+const COMPOSITE_GRAND_CAMPAIGN_CATALOG = "grand_campaign_v1";
+const CAMPAIGN_FORECAST_CATALOG = "campaign_v1";
+const COMPOSITE_COMPONENTS = Object.freeze({
+  [COMPOSITE_EVENTS_ECONOMY_CATALOG]: Object.freeze([
+    "forecast_events",
+    "trade2",
+    "credit",
+  ]),
+  [COMPOSITE_GRAND_CAMPAIGN_CATALOG]: Object.freeze([
+    "forecast_events",
+    "frontier",
+    "trade2",
+    "credit",
+  ]),
+});
+const COMPOSITE_COMPONENT_CATALOGS = Object.freeze({
+  [COMPOSITE_EVENTS_ECONOMY_CATALOG]: Object.freeze({
+    forecast_events: "core_v2",
+    trade2: "market_auction_v1",
+    credit: "bank_loan_v1",
+  }),
+  [COMPOSITE_GRAND_CAMPAIGN_CATALOG]: Object.freeze({
+    forecast_events: CAMPAIGN_FORECAST_CATALOG,
+    frontier: "outer_ring_37_v1",
+    trade2: "market_auction_v1",
+    credit: "bank_loan_v1",
+  }),
+});
+const CAMPAIGN_BLOCKADE_SKIP_LABEL = "公開済み交換所なし・今回は発動なし";
+const MARKET_RESOURCE_LIMIT = 19;
+const INVITATION_ROOM_CODE_PATTERN = /^[A-Z0-9]{6}$/;
+const INVITATION_TOKEN_PATTERN = /^[A-Za-z0-9_-]{43}$/;
+const INVITATION_ID_PATTERN = /^[A-Za-z0-9_-]{22}$/;
+const INVITATION_ROLES = new Set(["player", "spectator"]);
+const ROOM_ACCESS_AUTHENTICATION_ERROR = "authentication_failed";
+const ROOM_ACCESS_SECURE_TRANSPORT_ERROR = "secure_transport_required";
+const HTTP_ONLY_ROOM_MESSAGE_TYPES = new Set([
+  "create_room",
+  "join_room",
+  "leave_room",
+  "reconnect_room",
+]);
+const ROOM_RESUME_COOKIE_MESSAGE_TYPES = new Set([
+  "create_room",
+  "join_room",
+]);
 const FORECAST_EVENT_PRESENTATION = {
   wheat_harvest_v1: {
     title: "豊作",
@@ -134,6 +192,25 @@ const state = {
   tradePromptNotified: new Set(),
   developmentInventoryOpen: null,
   forecastActiveSignature: null,
+  marketEditorOpen: false,
+  marketDraft: null,
+  auctionEditorOpen: false,
+  auctionDraft: null,
+  creditEditorOpen: false,
+  creditDraft: null,
+  pendingRoomAccessAttempt: null,
+  roomAccessPromptOpen: false,
+  roomAccessCooldownUntil: null,
+  roomAccessCooldownTimer: null,
+  claimedInvitation: null,
+  invitationCopyPending: false,
+  activeInvitations: [],
+  invitationListRoomCode: null,
+  invitationListSignature: null,
+  invitationListLoading: false,
+  invitationListError: null,
+  invitationListRequestId: 0,
+  invitationMutationPending: false,
 };
 
 const elements = Object.fromEntries(
@@ -144,17 +221,42 @@ const elements = Object.fromEntries(
     "rules-drawer",
     "rules-close",
     "rules-variant-note",
+    "rules-campaign-note",
+    "rules-forecast-note",
+    "rules-frontier-note",
+    "rules-market-note",
+    "rules-credit-note",
     "audio-volume",
     "home-view",
     "lobby-view",
     "game-view",
     "create-form",
     "join-form",
+    "invite-prefill-note",
+    "create-room-protection",
+    "invite-only-room",
+    "open-room",
+    "protect-room",
+    "create-passphrase-fields",
+    "create-room-passphrase",
+    "create-passphrase-toggle",
+    "room-protection-transport-note",
     "random-seed",
     "ai-player-count",
     "ai-personality-mode",
     "lobby-room-code",
     "copy-room-code",
+    "copy-player-invite-link",
+    "copy-spectator-invite-link",
+    "invitation-guidance",
+    "invite-link-fallback",
+    "invite-link-value",
+    "invitation-manager",
+    "invitation-manager-status",
+    "invitation-count",
+    "invitation-list",
+    "refresh-invitations",
+    "revoke-all-invitations",
     "lobby-status-text",
     "lobby-phase",
     "member-list",
@@ -174,6 +276,60 @@ const elements = Object.fromEntries(
     "revision-badge",
     "action-list",
     "action-hint",
+    "market-panel",
+    "market-order-count",
+    "market-order-list",
+    "market-create-button",
+    "market-hint",
+    "auction-panel",
+    "auction-count",
+    "auction-list",
+    "auction-create-button",
+    "auction-hint",
+    "auction-editor",
+    "auction-editor-kicker",
+    "auction-editor-title",
+    "auction-editor-description",
+    "auction-editor-summary",
+    "auction-editor-body",
+    "auction-editor-submit",
+    "auction-editor-cancel",
+    "auction-editor-close",
+    "auction-editor-footnote",
+    "credit-panel",
+    "credit-loan-count",
+    "credit-availability",
+    "credit-loan-list",
+    "credit-open-button",
+    "credit-hint",
+    "credit-editor",
+    "credit-editor-kicker",
+    "credit-editor-title",
+    "credit-editor-description",
+    "credit-editor-summary",
+    "credit-editor-body",
+    "credit-editor-submit",
+    "credit-editor-cancel",
+    "credit-editor-close",
+    "credit-editor-footnote",
+    "room-access-prompt",
+    "room-access-form",
+    "room-access-close",
+    "room-access-target",
+    "join-room-passphrase",
+    "join-passphrase-toggle",
+    "room-access-error",
+    "room-access-submit",
+    "room-access-cancel",
+    "join-room-code",
+    "join-player-role",
+    "join-spectator-role",
+    "market-editor",
+    "market-editor-grid",
+    "market-editor-summary",
+    "market-editor-submit",
+    "market-editor-cancel",
+    "market-editor-close",
     "trade-prompt",
     "trade-prompt-kicker",
     "trade-prompt-title",
@@ -225,6 +381,958 @@ function wireMessage(type, payload = {}) {
   return { type, protocol_version: PROTOCOL_VERSION, ...payload };
 }
 
+function browserHostname(location = window.location) {
+  if (typeof location?.hostname === "string" && location.hostname) {
+    return location.hostname.toLowerCase().replace(/\.$/, "");
+  }
+  const host = typeof location?.host === "string" ? location.host : "";
+  if (host.startsWith("[")) {
+    const closing = host.indexOf("]");
+    return closing > 0 ? host.slice(1, closing).toLowerCase() : "";
+  }
+  return host.split(":", 1)[0].toLowerCase().replace(/\.$/, "");
+}
+
+function isLoopbackBrowserLocation(location = window.location) {
+  const hostname = browserHostname(location);
+  return hostname === "localhost"
+    || hostname === "::1"
+    || /^127(?:\.[0-9]{1,3}){3}$/.test(hostname);
+}
+
+function roomAccessTransportAllowed(location = window.location) {
+  return location?.protocol === "https:" || isLoopbackBrowserLocation(location);
+}
+
+function setPasswordVisibility(input, button, visible) {
+  if (!input || !button) return;
+  input.type = visible ? "text" : "password";
+  button.textContent = visible ? "隠す" : "表示";
+  button.setAttribute("aria-pressed", visible ? "true" : "false");
+  button.setAttribute(
+    "aria-label",
+    visible ? "部屋パスフレーズを隠す" : "部屋パスフレーズを表示",
+  );
+}
+
+function togglePasswordVisibility(input, button) {
+  setPasswordVisibility(input, button, input?.type === "password");
+}
+
+function clearPassphraseInput(input, button = null) {
+  if (input) input.value = "";
+  if (input && button) setPasswordVisibility(input, button, false);
+}
+
+function syncCreateRoomProtection() {
+  const inviteOnly = elements["invite-only-room"];
+  const openRoom = elements["open-room"];
+  const passphraseRoom = elements["protect-room"];
+  const fieldset = elements["create-room-protection"];
+  const fields = elements["create-passphrase-fields"];
+  const input = elements["create-room-passphrase"];
+  const note = elements["room-protection-transport-note"];
+  if (
+    !inviteOnly
+    || !openRoom
+    || !passphraseRoom
+    || !fieldset
+    || !fields
+    || !input
+    || !note
+  ) return;
+  const transportAllowed = roomAccessTransportAllowed();
+  inviteOnly.disabled = !transportAllowed;
+  passphraseRoom.disabled = !transportAllowed;
+  if (!transportAllowed && (inviteOnly.checked || passphraseRoom.checked)) {
+    openRoom.checked = true;
+    inviteOnly.checked = false;
+    passphraseRoom.checked = false;
+  }
+  fieldset.classList.toggle("transport-blocked", !transportAllowed);
+  const passphraseEnabled = transportAllowed && passphraseRoom.checked;
+  fields.hidden = !passphraseEnabled;
+  input.required = passphraseEnabled;
+  note.textContent = !transportAllowed
+    ? "期限付き招待とパスフレーズは平文HTTPでは利用できません。HTTPS/WSSで接続してください。"
+    : inviteOnly.checked
+      ? "入室にはホストが発行する期限付き・1回限りの招待リンクが必要です。"
+      : passphraseEnabled
+        ? "パスフレーズは作成時だけ送信し、このアプリには保存しません。"
+        : "参加コードを知っている人は、追加の認証なしで参加できます。";
+  if (!passphraseEnabled) {
+    clearPassphraseInput(input, elements["create-passphrase-toggle"]);
+  }
+}
+
+function roomAccessAttempt(document, claimedInvitation = null) {
+  const roomCode = normalizeInvitationRoomCode(claimedInvitation?.room_code)
+    || String(document.get("room_code") || "").trim().toUpperCase();
+  const attempt = {
+    room_code: roomCode,
+    display_name: String(document.get("display_name") || "").trim(),
+  };
+  // A claimed invitation owns its role on the server.  Omitting the role from
+  // this wire payload prevents a modified DOM from overriding the claim.
+  if (!claimedInvitation) {
+    attempt.role = document.get("role") === "spectator" ? "spectator" : "player";
+  }
+  return Object.freeze(attempt);
+}
+
+function roomAccessAttemptLabel(attempt) {
+  const role = attempt?.role === "spectator" ? "観戦" : "参加";
+  const code = normalizeInvitationRoomCode(attempt?.room_code) || "------";
+  return `部屋 ${code} に${role}`;
+}
+
+function roomPassphraseClientError(value) {
+  if (typeof value !== "string") return "パスフレーズを入力してください。";
+  let normalized;
+  try {
+    normalized = value.normalize("NFC");
+  } catch (_error) {
+    return "パスフレーズを確認してください。";
+  }
+  const characterCount = Array.from(normalized).length;
+  if (characterCount < 15 || characterCount > 64) {
+    return "パスフレーズは15〜64文字で入力してください。";
+  }
+  if (!normalized.trim()) return "空白だけのパスフレーズは使用できません。";
+  if (/[\u0000-\u001f\u007f-\u009f]/u.test(normalized)) {
+    return "制御文字を含むパスフレーズは使用できません。";
+  }
+  if (typeof TextEncoder === "function" && new TextEncoder().encode(normalized).length > 256) {
+    return "パスフレーズの文字数を減らしてください。";
+  }
+  return null;
+}
+
+function setRoomAccessError(message = "", retryAfterSeconds = null) {
+  const error = elements["room-access-error"];
+  const submit = elements["room-access-submit"];
+  if (!error || !submit) return;
+  window.clearInterval(state.roomAccessCooldownTimer);
+  state.roomAccessCooldownTimer = null;
+  state.roomAccessCooldownUntil = null;
+  error.textContent = String(message || "");
+  error.hidden = !message;
+  submit.disabled = false;
+  submit.textContent = "入室する";
+  if (!Number.isInteger(retryAfterSeconds) || retryAfterSeconds <= 0) return;
+  state.roomAccessCooldownUntil = Date.now() + retryAfterSeconds * 1000;
+  const update = () => {
+    const remaining = Math.max(
+      0,
+      Math.ceil((state.roomAccessCooldownUntil - Date.now()) / 1000),
+    );
+    submit.disabled = remaining > 0;
+    submit.textContent = remaining > 0 ? `再試行まで ${remaining}秒` : "入室する";
+    if (remaining === 0) {
+      window.clearInterval(state.roomAccessCooldownTimer);
+      state.roomAccessCooldownTimer = null;
+      state.roomAccessCooldownUntil = null;
+    }
+  };
+  update();
+  state.roomAccessCooldownTimer = window.setInterval(update, 250);
+}
+
+function openRoomAccessPrompt(attempt, message = "") {
+  if (!attempt || !elements["room-access-prompt"]) return;
+  state.pendingRoomAccessAttempt = attempt;
+  state.roomAccessPromptOpen = true;
+  elements["room-access-target"].textContent = roomAccessAttemptLabel(attempt);
+  clearPassphraseInput(
+    elements["join-room-passphrase"],
+    elements["join-passphrase-toggle"],
+  );
+  setRoomAccessError(message);
+  elements["room-access-prompt"].hidden = false;
+  document.body?.classList?.add("modal-open");
+  window.requestAnimationFrame(() => elements["join-room-passphrase"].focus?.());
+}
+
+function closeRoomAccessPrompt({ clearAttempt = true, restoreFocus = true } = {}) {
+  const wasOpen = state.roomAccessPromptOpen;
+  state.roomAccessPromptOpen = false;
+  window.clearInterval(state.roomAccessCooldownTimer);
+  state.roomAccessCooldownTimer = null;
+  state.roomAccessCooldownUntil = null;
+  if (elements["room-access-prompt"]) elements["room-access-prompt"].hidden = true;
+  clearPassphraseInput(
+    elements["join-room-passphrase"],
+    elements["join-passphrase-toggle"],
+  );
+  if (elements["room-access-error"]) {
+    elements["room-access-error"].textContent = "";
+    elements["room-access-error"].hidden = true;
+  }
+  if (elements["room-access-submit"]) {
+    elements["room-access-submit"].disabled = false;
+    elements["room-access-submit"].textContent = "入室する";
+  }
+  if (clearAttempt) state.pendingRoomAccessAttempt = null;
+  if (!document.querySelector?.('.modal-backdrop:not([hidden])')) {
+    document.body?.classList?.remove("modal-open");
+  }
+  if (wasOpen && restoreFocus) {
+    elements["join-form"]?.elements?.room_code?.focus?.();
+  }
+}
+
+function sendEphemeralPassphraseMessage(message, input = null, button = null) {
+  let request;
+  try {
+    request = sendMessage(message);
+  } finally {
+    if (Object.prototype.hasOwnProperty.call(message, "passphrase")) {
+      delete message.passphrase;
+    }
+    clearPassphraseInput(input, button);
+  }
+  return request;
+}
+
+function submitRoomAccessAttempt(attempt, passphrase = null) {
+  const message = wireMessage("join_room", { ...attempt });
+  if (typeof passphrase === "string" && passphrase) message.passphrase = passphrase;
+  return sendEphemeralPassphraseMessage(
+    message,
+    elements["join-room-passphrase"],
+    elements["join-passphrase-toggle"],
+  );
+}
+
+function retryAfterSecondsFromEvent(event) {
+  const value = event?.retry_after_seconds;
+  return Number.isInteger(value) && value > 0 && value <= 3600 ? value : null;
+}
+
+function handleRoomAccessRequestError(event) {
+  if (!state.pendingRoomAccessAttempt) return false;
+  if (event.code === ROOM_ACCESS_AUTHENTICATION_ERROR) {
+    if (state.claimedInvitation) {
+      clearClaimedInvitation({ preserveRoomCode: true });
+      closeRoomAccessPrompt({ restoreFocus: false });
+      return false;
+    }
+    openRoomAccessPrompt(
+      state.pendingRoomAccessAttempt,
+      event.message || "パスフレーズを確認してください。",
+    );
+    return true;
+  }
+  if (event.code === ROOM_ACCESS_SECURE_TRANSPORT_ERROR) {
+    closeRoomAccessPrompt({ restoreFocus: false });
+    return false;
+  }
+  if (state.roomAccessPromptOpen && /_rate_limited$/.test(event.code || "")) {
+    setRoomAccessError(
+      event.message || "試行回数が多すぎます。しばらく待ってください。",
+      retryAfterSecondsFromEvent(event),
+    );
+    return true;
+  }
+  closeRoomAccessPrompt({ restoreFocus: false });
+  return false;
+}
+
+function handleRoomAccessThrownError(error) {
+  if (!state.pendingRoomAccessAttempt) return false;
+  if (error?.code === ROOM_ACCESS_AUTHENTICATION_ERROR) {
+    if (state.claimedInvitation) {
+      clearClaimedInvitation({ preserveRoomCode: true });
+      closeRoomAccessPrompt({ restoreFocus: false });
+      return false;
+    }
+    openRoomAccessPrompt(state.pendingRoomAccessAttempt, error.message);
+    return true;
+  }
+  if (error?.code === ROOM_ACCESS_SECURE_TRANSPORT_ERROR) {
+    closeRoomAccessPrompt({ restoreFocus: false });
+    return false;
+  }
+  if (state.roomAccessPromptOpen && /_rate_limited$/.test(error?.code || "")) {
+    setRoomAccessError(error.message, error.retryAfterSeconds);
+    return true;
+  }
+  closeRoomAccessPrompt({ restoreFocus: false });
+  return false;
+}
+
+function normalizeInvitationRoomCode(value) {
+  if (typeof value !== "string") return null;
+  if (!/^[A-Za-z0-9]{6}$/.test(value)) return null;
+  const normalized = value.toUpperCase();
+  return INVITATION_ROOM_CODE_PATTERN.test(normalized) ? normalized : null;
+}
+
+function parseInvitationRoomQuery(search) {
+  const params = new URLSearchParams(typeof search === "string" ? search : "");
+  const values = params.getAll("room");
+  if (!values.length) return { present: false, code: null, canonicalSearch: null };
+  if (values.length !== 1) return { present: true, code: null, canonicalSearch: null };
+  const code = normalizeInvitationRoomCode(values[0]);
+  return {
+    present: true,
+    code,
+    canonicalSearch: code ? `?room=${code}` : null,
+  };
+}
+
+function parseInvitationTokenFragment(hash) {
+  if (typeof hash !== "string" || !hash) {
+    return { present: false, token: null };
+  }
+  const match = /^#invite=([A-Za-z0-9_-]{43})$/.exec(hash);
+  return {
+    present: true,
+    token: match && INVITATION_TOKEN_PATTERN.test(match[1]) ? match[1] : null,
+  };
+}
+
+function currentBrowserOrigin(location = window.location) {
+  if (
+    typeof location?.origin === "string"
+    && /^https?:\/\/[^/?#]+$/i.test(location.origin)
+  ) return location.origin;
+  const fallback = `${location?.protocol || ""}//${location?.host || ""}`;
+  return /^https?:\/\/[^/?#]+$/i.test(fallback) ? fallback : null;
+}
+
+function invitationURL(origin, roomCode) {
+  const code = normalizeInvitationRoomCode(roomCode);
+  if (!code || typeof origin !== "string" || !/^https?:\/\/[^/?#]+$/i.test(origin)) {
+    return null;
+  }
+  return `${origin}/?room=${code}`;
+}
+
+function invitationGrantURL(origin, roomCode, token) {
+  const base = invitationURL(origin, roomCode);
+  if (!base || typeof token !== "string" || !INVITATION_TOKEN_PATTERN.test(token)) {
+    return null;
+  }
+  return `${base}#invite=${token}`;
+}
+
+function replaceInvitationLocation(location, history, search = "") {
+  if (typeof history?.replaceState !== "function") return;
+  const pathname = typeof location?.pathname === "string" && location.pathname.startsWith("/")
+    ? location.pathname
+    : "/";
+  history.replaceState(null, "", `${pathname}${search}`);
+}
+
+function captureInvitationTokenFromLocation(
+  location = window.location,
+  history = window.history,
+) {
+  const parsedFragment = parseInvitationTokenFragment(location?.hash);
+  if (!parsedFragment.present) {
+    return { present: false, room_code: null, token: null };
+  }
+  const parsedRoom = parseInvitationRoomQuery(location?.search);
+  const roomCode = parsedRoom.code;
+  // Remove every fragment, including malformed credentials, before starting a
+  // browser session or issuing any request.  A valid non-secret room query is
+  // retained so an expired link can gracefully fall back to manual entry.
+  replaceInvitationLocation(
+    location,
+    history,
+    roomCode ? parsedRoom.canonicalSearch : "",
+  );
+  return {
+    present: true,
+    room_code: roomCode,
+    token: roomCode ? parsedFragment.token : null,
+  };
+}
+
+function applyInvitationFromLocation(
+  location = window.location,
+  history = window.history,
+) {
+  const parsed = parseInvitationRoomQuery(location?.search);
+  if (!parsed.present) return null;
+  const form = elements["join-form"];
+  const note = elements["invite-prefill-note"];
+  if (!parsed.code) {
+    replaceInvitationLocation(location, history);
+    if (note) note.hidden = true;
+    form?.classList?.remove("invitation-target");
+    return null;
+  }
+  if (location?.search !== parsed.canonicalSearch || location?.hash) {
+    replaceInvitationLocation(location, history, parsed.canonicalSearch);
+  }
+  if (!form) return parsed.code;
+  form.elements.room_code.value = parsed.code;
+  form.classList?.add("invitation-target");
+  if (note) note.hidden = false;
+  window.requestAnimationFrame(() => {
+    form.scrollIntoView?.({ behavior: "auto", block: "center" });
+    form.elements.display_name.focus?.({ preventScroll: true });
+  });
+  return parsed.code;
+}
+
+function hideInvitationFallback() {
+  if (elements["invite-link-fallback"]) {
+    elements["invite-link-fallback"].hidden = true;
+  }
+  if (elements["invite-link-value"]) elements["invite-link-value"].value = "";
+}
+
+function showInvitationFallback(url) {
+  const container = elements["invite-link-fallback"];
+  const input = elements["invite-link-value"];
+  if (!container || !input || typeof url !== "string") return;
+  input.value = url;
+  container.hidden = false;
+  input.focus?.();
+  input.select?.();
+}
+
+function currentInvitationURL() {
+  return invitationURL(
+    currentBrowserOrigin(),
+    state.lobby?.room_code,
+  );
+}
+
+async function copyInvitationLink() {
+  const url = currentInvitationURL();
+  if (!url) return false;
+  try {
+    await navigator.clipboard.writeText(url);
+    hideInvitationFallback();
+    showToast("招待リンクをコピーしました。");
+    return true;
+  } catch (_error) {
+    showInvitationFallback(url);
+    showToast("招待リンクを表示しました。手動でコピーしてください。", true);
+    return false;
+  }
+}
+
+function normalizeInvitationExpiry(value) {
+  return Number.isSafeInteger(value) && value > 0 ? value : null;
+}
+
+function invitationPublicMetadata(
+  value,
+  { requireToken = false, requireInvitationId = false } = {},
+) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const roomCode = normalizeInvitationRoomCode(value.room_code);
+  const role = INVITATION_ROLES.has(value.role) ? value.role : null;
+  const expiresAtMs = normalizeInvitationExpiry(value.expires_at_ms);
+  const token = typeof value.token === "string" && INVITATION_TOKEN_PATTERN.test(value.token)
+    ? value.token
+    : null;
+  const invitationId = normalizeInvitationId(value.invitation_id);
+  if (
+    !roomCode
+    || !role
+    || !expiresAtMs
+    || (requireToken && !token)
+    || (requireInvitationId && !invitationId)
+  ) return null;
+  return {
+    room_code: roomCode,
+    role,
+    expires_at_ms: expiresAtMs,
+    ...(requireInvitationId ? { invitation_id: invitationId } : {}),
+    ...(requireToken ? { token } : {}),
+  };
+}
+
+function invitationExpiryLabel(expiresAtMs) {
+  const timestamp = normalizeInvitationExpiry(expiresAtMs);
+  if (!timestamp) return "1時間・1回限り";
+  try {
+    const formatted = new Intl.DateTimeFormat("ja-JP", {
+      hour: "2-digit",
+      minute: "2-digit",
+    }).format(new Date(timestamp));
+    return `${formatted}まで・1回限り`;
+  } catch (_error) {
+    return "1時間・1回限り";
+  }
+}
+
+function normalizeInvitationId(value) {
+  return typeof value === "string" && INVITATION_ID_PATTERN.test(value) ? value : null;
+}
+
+function activeInvitationMetadata(value, roomCode) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const allowedKeys = new Set([
+    "invitation_id",
+    "room_code",
+    "role",
+    "issued_at_ms",
+    "expires_at_ms",
+  ]);
+  if (!Object.keys(value).every((key) => allowedKeys.has(key))) return null;
+  const invitationId = normalizeInvitationId(value.invitation_id);
+  const normalizedRoomCode = normalizeInvitationRoomCode(value.room_code);
+  const normalizedExpectedRoomCode = normalizeInvitationRoomCode(roomCode);
+  const role = INVITATION_ROLES.has(value.role) ? value.role : null;
+  const issuedAtMs = normalizeInvitationExpiry(value.issued_at_ms);
+  const expiresAtMs = normalizeInvitationExpiry(value.expires_at_ms);
+  if (
+    !invitationId
+    || !normalizedRoomCode
+    || normalizedRoomCode !== normalizedExpectedRoomCode
+    || !role
+    || !issuedAtMs
+    || !expiresAtMs
+    || expiresAtMs <= issuedAtMs
+  ) return null;
+  // The active-list state deliberately keeps only non-secret fields needed by
+  // the controls.  Tokens and digests are never accepted by this adapter.
+  return Object.freeze({
+    invitation_id: invitationId,
+    role,
+    expires_at_ms: expiresAtMs,
+  });
+}
+
+function activeInvitationList(document, roomCode) {
+  if (!document || typeof document !== "object" || Array.isArray(document)) return null;
+  const allowedKeys = new Set(["api_version", "revoked_count", "invitations"]);
+  if (
+    !Object.keys(document).every((key) => allowedKeys.has(key))
+    || document.api_version !== 1
+    || (
+      Object.prototype.hasOwnProperty.call(document, "revoked_count")
+      && (!Number.isSafeInteger(document.revoked_count) || document.revoked_count < 0)
+    )
+  ) return null;
+  if (!Array.isArray(document.invitations) || document.invitations.length > 32) return null;
+  const invitations = [];
+  const invitationIds = new Set();
+  for (const value of document.invitations) {
+    const invitation = activeInvitationMetadata(value, roomCode);
+    if (!invitation || invitationIds.has(invitation.invitation_id)) return null;
+    invitationIds.add(invitation.invitation_id);
+    invitations.push(invitation);
+  }
+  return Object.freeze(invitations.sort((left, right) => (
+    left.expires_at_ms - right.expires_at_ms
+    || left.invitation_id.localeCompare(right.invitation_id)
+  )));
+}
+
+function activeInvitationExpiryLabel(expiresAtMs) {
+  const timestamp = normalizeInvitationExpiry(expiresAtMs);
+  if (!timestamp) return "有効期限不明";
+  try {
+    const formatted = new Intl.DateTimeFormat("ja-JP", {
+      month: "numeric",
+      day: "numeric",
+      hour: "2-digit",
+      minute: "2-digit",
+    }).format(new Date(timestamp));
+    return `${formatted}まで`;
+  } catch (_error) {
+    return "有効期限不明";
+  }
+}
+
+function currentInvitationListSignature(lobby = state.lobby) {
+  const roomCode = normalizeInvitationRoomCode(lobby?.room_code);
+  if (!roomCode) return null;
+  return [
+    roomCode,
+    lobby?.phase || "unknown",
+    Number.isInteger(lobby?.player_members) ? lobby.player_members : "?",
+    Number.isInteger(lobby?.spectators) ? lobby.spectators : "?",
+  ].join(":");
+}
+
+function clearActiveInvitationState({ roomCode = null } = {}) {
+  state.invitationListRequestId += 1;
+  state.activeInvitations = [];
+  state.invitationListRoomCode = normalizeInvitationRoomCode(roomCode);
+  state.invitationListSignature = null;
+  state.invitationListLoading = false;
+  state.invitationListError = null;
+  state.invitationMutationPending = false;
+}
+
+function renderActiveInvitationManager() {
+  const manager = elements["invitation-manager"];
+  const list = elements["invitation-list"];
+  const status = elements["invitation-manager-status"];
+  const count = elements["invitation-count"];
+  const refreshButton = elements["refresh-invitations"];
+  const revokeAllButton = elements["revoke-all-invitations"];
+  if (!manager || !list || !status || !count || !refreshButton || !revokeAllButton) return;
+  const isHost = state.welcome?.role === "host";
+  const canManage = isHost && roomAccessTransportAllowed();
+  manager.hidden = !canManage;
+  if (!canManage) {
+    list.replaceChildren();
+    return;
+  }
+  const canIssue = Boolean(
+    normalizeInvitationRoomCode(state.lobby?.room_code)
+    && state.lobby?.phase === "waiting"
+    && !state.invitationListLoading
+    && !state.invitationMutationPending
+    && !state.invitationCopyPending
+  );
+  elements["copy-player-invite-link"].disabled = !canIssue || Boolean(state.lobby?.full);
+  elements["copy-spectator-invite-link"].disabled = !canIssue;
+
+  list.replaceChildren();
+  for (const invitation of state.activeInvitations) {
+    const item = document.createElement("li");
+    item.className = "invitation-list-item";
+    const summary = document.createElement("div");
+    summary.className = "invitation-list-summary";
+    const role = document.createElement("strong");
+    const isSpectator = invitation.role === "spectator";
+    role.textContent = isSpectator ? "観戦者用" : "プレイヤー用";
+    const expiry = document.createElement("span");
+    const expiryLabel = activeInvitationExpiryLabel(invitation.expires_at_ms);
+    expiry.textContent = `未使用・${expiryLabel}`;
+    summary.append(role, expiry);
+    const revokeButton = document.createElement("button");
+    revokeButton.type = "button";
+    revokeButton.textContent = "取り消す";
+    revokeButton.setAttribute(
+      "aria-label",
+      `${isSpectator ? "観戦者" : "プレイヤー"}用招待（${expiryLabel}）を取り消す`,
+    );
+    revokeButton.disabled = (
+      state.invitationListLoading
+      || state.invitationMutationPending
+      || state.invitationCopyPending
+    );
+    revokeButton.addEventListener("click", () => {
+      revokeActiveInvitations({ invitationId: invitation.invitation_id });
+    });
+    item.append(summary, revokeButton);
+    list.append(item);
+  }
+
+  count.textContent = `${state.activeInvitations.length}件`;
+  if (state.invitationListLoading) {
+    status.textContent = "未使用の招待を更新しています。";
+  } else if (state.invitationListError) {
+    status.textContent = state.invitationListError;
+  } else if (state.activeInvitations.length) {
+    status.textContent = "共有前のリンクや不要になった招待は、ここから無効にできます。";
+  } else {
+    status.textContent = "有効な未使用招待はありません。";
+  }
+  manager.setAttribute("aria-busy", state.invitationListLoading ? "true" : "false");
+  refreshButton.disabled = state.invitationListLoading || state.invitationMutationPending;
+  revokeAllButton.disabled = (
+    state.activeInvitations.length === 0
+    || state.invitationListLoading
+    || state.invitationMutationPending
+  );
+}
+
+async function loadActiveInvitations({ request = api, force = false, signature = null } = {}) {
+  const roomCode = normalizeInvitationRoomCode(state.lobby?.room_code);
+  const isHost = state.welcome?.role === "host";
+  if (!roomCode || !isHost) return false;
+  const currentSignature = signature || currentInvitationListSignature();
+  if (
+    !force
+    && (state.invitationListLoading || state.invitationListSignature === currentSignature)
+  ) return false;
+  const requestId = state.invitationListRequestId + 1;
+  state.invitationListRequestId = requestId;
+  state.invitationListLoading = true;
+  state.invitationListError = null;
+  renderActiveInvitationManager();
+  try {
+    const response = await request("/api/invitations/list", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "{}",
+    });
+    const invitations = activeInvitationList(response, roomCode);
+    if (!invitations) throw new Error("invalid invitation list response");
+    if (
+      requestId !== state.invitationListRequestId
+      || roomCode !== normalizeInvitationRoomCode(state.lobby?.room_code)
+      || state.welcome?.role !== "host"
+    ) return false;
+    state.activeInvitations = invitations;
+    state.invitationListSignature = currentSignature;
+    state.invitationListError = null;
+    return true;
+  } catch (_error) {
+    if (requestId !== state.invitationListRequestId) return false;
+    state.invitationListSignature = currentSignature;
+    state.invitationListError = "招待一覧を更新できませんでした。「更新」でもう一度お試しください。";
+    return false;
+  } finally {
+    if (requestId === state.invitationListRequestId) {
+      state.invitationListLoading = false;
+      renderActiveInvitationManager();
+    }
+  }
+}
+
+function ensureActiveInvitationList() {
+  const roomCode = normalizeInvitationRoomCode(state.lobby?.room_code);
+  if (state.welcome?.role !== "host" || !roomCode || !roomAccessTransportAllowed()) {
+    if (state.invitationListRoomCode !== null || state.activeInvitations.length) {
+      clearActiveInvitationState();
+    }
+    renderActiveInvitationManager();
+    return;
+  }
+  if (state.invitationListRoomCode !== roomCode) {
+    clearActiveInvitationState({ roomCode });
+  }
+  renderActiveInvitationManager();
+  const signature = currentInvitationListSignature();
+  if (!state.invitationListLoading && state.invitationListSignature !== signature) {
+    void loadActiveInvitations({ signature });
+  }
+}
+
+async function revokeActiveInvitations({
+  invitationId = null,
+  all = false,
+  request = api,
+  announce = true,
+} = {}) {
+  const normalizedId = normalizeInvitationId(invitationId);
+  if ((all && invitationId !== null) || (!all && !normalizedId)) return false;
+  if (state.invitationListLoading || state.invitationMutationPending) return false;
+  state.invitationMutationPending = true;
+  renderActiveInvitationManager();
+  let response = null;
+  try {
+    response = await request("/api/invitations", {
+      method: "DELETE",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(all ? { all: true } : { invitation_id: normalizedId }),
+    });
+    const roomCode = normalizeInvitationRoomCode(state.lobby?.room_code);
+    const invitations = roomCode ? activeInvitationList(response, roomCode) : null;
+    if (roomCode && !invitations) throw new Error("invalid invitation revoke response");
+    if (invitations) state.activeInvitations = invitations;
+    state.invitationListSignature = currentInvitationListSignature();
+    state.invitationListError = null;
+    if (announce) {
+      const count = Number.isSafeInteger(response?.revoked_count) ? response.revoked_count : 0;
+      showToast(count > 0 ? `${count}件の招待を取り消しました。` : "招待はすでに使用済みか期限切れです。");
+    }
+    return true;
+  } catch (_error) {
+    if (announce) showToast("招待を取り消せませんでした。更新して状態を確認してください。", true);
+    state.invitationListError = "取り消し結果を確認できませんでした。「更新」でもう一度お試しください。";
+    return false;
+  } finally {
+    response = null;
+    state.invitationMutationPending = false;
+    renderActiveInvitationManager();
+  }
+}
+
+function syncClaimedInvitationForm() {
+  const form = elements["join-form"];
+  const roomCodeInput = elements["join-room-code"];
+  const playerRole = elements["join-player-role"];
+  const spectatorRole = elements["join-spectator-role"];
+  const note = elements["invite-prefill-note"];
+  if (!form || !roomCodeInput || !playerRole || !spectatorRole || !note) return;
+  const invitation = state.claimedInvitation;
+  const claimed = Boolean(invitation);
+  roomCodeInput.readOnly = claimed;
+  playerRole.disabled = claimed;
+  spectatorRole.disabled = claimed;
+  form.classList.toggle("invitation-claimed", claimed);
+  if (!claimed) return;
+  roomCodeInput.value = invitation.room_code;
+  playerRole.checked = invitation.role === "player";
+  spectatorRole.checked = invitation.role === "spectator";
+  const roleLabel = invitation.role === "spectator" ? "観戦者" : "プレイヤー";
+  note.textContent = `${roleLabel}用の期限付き招待を確認しました（${invitationExpiryLabel(invitation.expires_at_ms)}）。表示名を確認して参加してください。`;
+  note.hidden = false;
+  form.classList.add("invitation-target");
+}
+
+function applyClaimedInvitation(value) {
+  const invitation = invitationPublicMetadata(value);
+  if (!invitation) return false;
+  state.claimedInvitation = Object.freeze(invitation);
+  syncClaimedInvitationForm();
+  window.requestAnimationFrame(() => {
+    elements["join-form"]?.scrollIntoView?.({ behavior: "auto", block: "center" });
+    elements["join-form"]?.elements?.display_name?.focus?.({ preventScroll: true });
+  });
+  return true;
+}
+
+function clearClaimedInvitation({ preserveRoomCode = true } = {}) {
+  const previous = state.claimedInvitation;
+  state.claimedInvitation = null;
+  const form = elements["join-form"];
+  const roomCodeInput = elements["join-room-code"];
+  const playerRole = elements["join-player-role"];
+  const spectatorRole = elements["join-spectator-role"];
+  const note = elements["invite-prefill-note"];
+  if (roomCodeInput) {
+    roomCodeInput.readOnly = false;
+    if (!preserveRoomCode && previous?.room_code === roomCodeInput.value) {
+      roomCodeInput.value = "";
+    }
+  }
+  if (playerRole) playerRole.disabled = false;
+  if (spectatorRole) spectatorRole.disabled = false;
+  form?.classList?.remove("invitation-claimed");
+  if (note && previous) {
+    note.textContent = "招待コードを入力しました。表示名と参加方法を確認してから参加してください。";
+    note.hidden = !normalizeInvitationRoomCode(roomCodeInput?.value);
+  }
+}
+
+async function claimCapturedInvitation(captured, request = api) {
+  if (
+    !captured
+    || !normalizeInvitationRoomCode(captured.room_code)
+    || typeof captured.token !== "string"
+    || !INVITATION_TOKEN_PATTERN.test(captured.token)
+  ) return null;
+  let token = captured.token;
+  let body = JSON.stringify({ room_code: captured.room_code, token });
+  // The captured object is the only caller-owned reference.  Clear it before
+  // awaiting network I/O; the request body is discarded in finally below.
+  captured.token = null;
+  try {
+    const document = await request("/api/invitations/claim", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body,
+    });
+    return invitationPublicMetadata(document?.invitation);
+  } finally {
+    token = null;
+    body = null;
+  }
+}
+
+async function deliverInvitationURL(url, navigatorObject = navigator) {
+  if (typeof url !== "string") return null;
+  if (typeof navigatorObject?.clipboard?.writeText === "function") {
+    try {
+      await navigatorObject.clipboard.writeText(url);
+      return "clipboard";
+    } catch (_error) {
+      // Web Share is the safe fallback: unlike a manual field, it does not
+      // leave the bearer URL rendered in the document.
+    }
+  }
+  if (typeof navigatorObject?.share !== "function") return null;
+  let sharePayload = {
+    title: "カタン風ゲームへの招待",
+    text: "1回限りの期限付き招待です。",
+    url,
+  };
+  try {
+    await navigatorObject.share(sharePayload);
+    return "share";
+  } catch (_error) {
+    // User cancellation is intentionally treated like every other failed
+    // hand-off so the freshly issued bearer is revoked immediately.
+    return null;
+  } finally {
+    sharePayload = null;
+  }
+}
+
+async function copyRoleInvitationLink(role, request = api) {
+  if (
+    !INVITATION_ROLES.has(role)
+    || state.invitationCopyPending
+    || state.invitationListLoading
+    || state.invitationMutationPending
+  ) return false;
+  if (!roomAccessTransportAllowed()) {
+    showToast("期限付き招待はHTTPS/WSSで接続して発行してください。", true);
+    return false;
+  }
+  state.invitationCopyPending = true;
+  let document = null;
+  let invitationId = null;
+  let token = null;
+  let url = null;
+  let delivery = null;
+  try {
+    document = await request("/api/invitations", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ role }),
+    });
+    invitationId = normalizeInvitationId(document?.invitation?.invitation_id);
+    const invitation = invitationPublicMetadata(document?.invitation, {
+      requireToken: true,
+      requireInvitationId: true,
+    });
+    if (!invitation || invitation.role !== role) {
+      throw new Error("招待リンクを安全に発行できませんでした。");
+    }
+    token = invitation.token;
+    url = invitationGrantURL(currentBrowserOrigin(), invitation.room_code, token);
+    if (!url) throw new Error("招待リンクを安全に作成できませんでした。");
+    delivery = await deliverInvitationURL(url);
+    if (!delivery) {
+      const revoked = await revokeActiveInvitations({
+        invitationId,
+        request,
+        announce: false,
+      });
+      hideInvitationFallback();
+      showToast(
+        revoked
+          ? "共有できなかったため、発行した招待を自動で取り消しました。"
+          : "共有できませんでした。招待一覧を更新し、発行された招待を取り消してください。",
+        true,
+      );
+      return false;
+    }
+    hideInvitationFallback();
+    const label = role === "spectator" ? "観戦招待" : "プレイヤー招待";
+    showToast(
+      `${label}を${delivery === "share" ? "共有しました" : "コピーしました"}（${invitationExpiryLabel(invitation.expires_at_ms)}）。`,
+    );
+    await loadActiveInvitations({ request, force: true });
+    return true;
+  } catch (_error) {
+    if (invitationId && !delivery) {
+      await revokeActiveInvitations({ invitationId, request, announce: false });
+    }
+    hideInvitationFallback();
+    showToast("招待リンクを発行またはコピーできませんでした。もう一度お試しください。", true);
+    return false;
+  } finally {
+    if (document?.invitation && Object.prototype.hasOwnProperty.call(document.invitation, "token")) {
+      document.invitation.token = null;
+    }
+    invitationId = null;
+    token = null;
+    url = null;
+    delivery = null;
+    document = null;
+    state.invitationCopyPending = false;
+    renderActiveInvitationManager();
+  }
+}
+
 function variantConfigDocument(kind) {
   if (kind === "forecast_events") {
     return {
@@ -236,8 +1344,43 @@ function variantConfigDocument(kind) {
   if (kind === "frontier") {
     return {
       version: 1,
-      kind,
+      kind: "frontier",
+      options: { ...EXPANDED_FRONTIER_OPTIONS },
+    };
+  }
+  if (kind === "frontier_legacy") {
+    return {
+      version: 1,
+      kind: "frontier",
       options: { ...DEFAULT_FRONTIER_OPTIONS },
+    };
+  }
+  if (kind === "trade2") {
+    return {
+      version: 1,
+      kind: "trade2",
+      options: { ...DEFAULT_TRADE2_OPTIONS },
+    };
+  }
+  if (kind === "credit") {
+    return {
+      version: 1,
+      kind: "credit",
+      options: { ...DEFAULT_CREDIT_OPTIONS },
+    };
+  }
+  if (kind === "composite") {
+    return {
+      version: 1,
+      kind: "composite",
+      options: { catalog: COMPOSITE_EVENTS_ECONOMY_CATALOG },
+    };
+  }
+  if (kind === "grand_campaign") {
+    return {
+      version: 1,
+      kind: "composite",
+      options: { catalog: COMPOSITE_GRAND_CAMPAIGN_CATALOG },
     };
   }
   return { version: 1, kind: "standard", options: {} };
@@ -245,31 +1388,186 @@ function variantConfigDocument(kind) {
 
 function variantLabel(variant) {
   if (variant?.kind === "forecast_events") return "予告イベント";
-  if (variant?.kind === "frontier") return "フロンティア探索";
+  if (variant?.kind === "trade2") {
+    return variant.options?.catalog === "market_auction_v1"
+      ? "交易2.0・市場と公開競売"
+      : "交易2.0・常設市場";
+  }
+  if (variant?.kind === "credit") return "資源信用・借入と返済";
+  if (variant?.kind === "composite") {
+    const catalog = variant.options?.catalog ?? variant.public?.catalog;
+    if (catalog === COMPOSITE_GRAND_CAMPAIGN_CATALOG) {
+      return "グランドキャンペーン（全部入り）";
+    }
+    return catalog === COMPOSITE_EVENTS_ECONOMY_CATALOG
+      ? "イベント＆経済（複合）"
+      : "複合モード";
+  }
+  if (variant?.kind === "frontier") {
+    if (variant.options?.catalog === "outer_ring_37_v1") {
+      return "フロンティア探索・37タイル";
+    }
+    if (variant.options && !("catalog" in variant.options)) {
+      return "フロンティア探索・19タイル";
+    }
+    return "フロンティア探索";
+  }
   return "通常ルール";
 }
 
-function frontierPresentation(variantState) {
-  if (variantState?.kind !== "frontier") return { visible: false };
-  const publicState = variantState.public || {};
+function variantIncludesComponent(variant, kind) {
+  if (!variant || typeof variant !== "object" || typeof kind !== "string") return false;
+  if (variant.kind === kind) return true;
+  if (variant.kind !== "composite") return false;
+  const catalog = variant.public?.catalog ?? variant.options?.catalog;
+  return COMPOSITE_COMPONENTS[catalog]?.includes(kind) === true;
+}
+
+function isCoreV2ForecastPublicState(component) {
+  if (!component || typeof component !== "object" || Array.isArray(component)) return false;
+  if (Object.prototype.hasOwnProperty.call(component, "catalog")) return false;
+  const keys = Object.keys(component).sort();
+  if (
+    keys.length !== 4
+    || keys[0] !== "active_effects"
+    || keys[1] !== "completed_turns"
+    || keys[2] !== "forecast"
+    || keys[3] !== "resolved_count"
+  ) return false;
+  const forecast = component.forecast;
+  return Boolean(
+    forecast
+    && typeof forecast === "object"
+    && !Array.isArray(forecast)
+    && Object.prototype.hasOwnProperty.call(forecast, "parameters"),
+  );
+}
+
+function variantComponentPublic(variantState, kind) {
+  if (!variantIncludesComponent(variantState, kind)) return null;
+  const publicState = variantState?.public;
+  if (!publicState || typeof publicState !== "object" || Array.isArray(publicState)) return null;
+  if (variantState.kind === kind) return publicState;
+  const catalog = publicState.catalog;
+  const expectedCatalog = COMPOSITE_COMPONENT_CATALOGS[catalog]?.[kind];
+  if (!expectedCatalog) return null;
+  const component = publicState.components?.[kind];
+  if (!component || typeof component !== "object" || Array.isArray(component)) return null;
+  // core_v2 intentionally has no root catalog field; its forecast document
+  // shape is the catalog discriminator.  Other composite children publish an
+  // explicit catalog and continue to require an exact match.
+  if (expectedCatalog === "core_v2") {
+    return isCoreV2ForecastPublicState(component) ? component : null;
+  }
+  return component.catalog === expectedCatalog ? component : null;
+}
+
+function frontierPresentation(variantState, totalTiles = null) {
+  const publicState = variantComponentPublic(variantState, "frontier");
+  if (!publicState) return { visible: false };
   const revealed = Array.isArray(publicState.revealed_tiles)
     ? publicState.revealed_tiles.length
     : 0;
   const discoveries = Number.isInteger(publicState.discovery_count)
     ? publicState.discovery_count
     : 0;
+  const catalogTotal = publicState.catalog === "outer_ring_37_v1" ? 37 : 19;
+  const total = Number.isInteger(totalTiles) && totalTiles >= revealed
+    ? totalTiles
+    : Math.max(catalogTotal, revealed);
   return {
     visible: true,
-    count: `${revealed} / 19 公開`,
+    count: `${revealed} / ${total} 公開`,
     detail: discoveries > 0
       ? `街道から${discoveries}タイルを発見。霧に接する街道で探索を続けられます。`
       : "外周は未探索です。霧に接する街道を建設すると資源・数字・港が公開されます。",
   };
 }
 
-function forecastParameterLabel(eventId, parameters = {}) {
-  if (eventId === "harbor_blockade_v1" && /^harbor-[0-8]$/.test(parameters.harbor_id || "")) {
-    return `対象: 交換所 #${Number(parameters.harbor_id.split("-")[1]) + 1}`;
+function campaignHarborBlockadePublicPlan(parameters) {
+  const plan = parameters?.campaign_plan;
+  if (
+    !plan
+    || typeof plan !== "object"
+    || Array.isArray(plan)
+    || plan.format !== "catan-grand-campaign-plan"
+    || plan.version !== 1
+    || plan.catalog !== COMPOSITE_GRAND_CAMPAIGN_CATALOG
+    || plan.event_id !== "harbor_blockade_v1"
+    || !Number.isInteger(plan.resolution_number)
+    || plan.resolution_number < 0
+    || !Array.isArray(plan.eligible_harbor_ids)
+  ) return null;
+  const eligible = plan.eligible_harbor_ids;
+  if (!eligible.every((harborId) => /^harbor-(0|[1-9][0-9]?)$/.test(harborId))) {
+    return null;
+  }
+  const outcome = plan.outcome;
+  if (!outcome || typeof outcome !== "object" || Array.isArray(outcome)) return null;
+  return { eligible, outcome };
+}
+
+function campaignHarborBlockadeTargetId(parameters) {
+  const plan = campaignHarborBlockadePublicPlan(parameters);
+  if (!plan) return null;
+  const { eligible, outcome } = plan;
+  if (
+    outcome.kind === "target"
+    && /^harbor-(0|[1-9][0-9]?)$/.test(outcome.harbor_id || "")
+    && eligible.includes(outcome.harbor_id)
+  ) {
+    return outcome.harbor_id;
+  }
+  return null;
+}
+
+function campaignHarborBlockadeLabel(parameters) {
+  const targetId = campaignHarborBlockadeTargetId(parameters);
+  if (targetId) {
+    return `対象: 交換所 #${Number(targetId.split("-")[1]) + 1}`;
+  }
+  const plan = campaignHarborBlockadePublicPlan(parameters);
+  if (!plan) return "";
+  const { eligible, outcome } = plan;
+  if (
+    outcome.kind === "skip"
+    && outcome.reason === "no_revealed_harbors"
+    && eligible.length === 0
+  ) return CAMPAIGN_BLOCKADE_SKIP_LABEL;
+  return "";
+}
+
+function forecastHarborTargetId(eventId, parameters = {}, catalog = null) {
+  if (eventId !== "harbor_blockade_v1") return null;
+  if (catalog === CAMPAIGN_FORECAST_CATALOG) {
+    return campaignHarborBlockadeTargetId(parameters);
+  }
+  if (catalog !== null) return null;
+  return /^harbor-[0-8]$/.test(parameters?.harbor_id || "")
+    ? parameters.harbor_id
+    : null;
+}
+
+function forecastAnnouncedHarborId(variantState) {
+  const publicState = variantComponentPublic(variantState, "forecast_events");
+  const forecast = publicState?.forecast;
+  if (!forecast || typeof forecast !== "object" || Array.isArray(forecast)) return null;
+  return forecastHarborTargetId(
+    forecast.event_id,
+    forecast.parameters,
+    publicState.catalog || null,
+  );
+}
+
+function forecastParameterLabel(eventId, parameters = {}, catalog = null) {
+  if (eventId === "harbor_blockade_v1") {
+    if (catalog === CAMPAIGN_FORECAST_CATALOG) {
+      return campaignHarborBlockadeLabel(parameters);
+    }
+    const targetId = forecastHarborTargetId(eventId, parameters, catalog);
+    if (targetId) {
+      return `対象: 交換所 #${Number(targetId.split("-")[1]) + 1}`;
+    }
   }
   if (eventId === "bandit_raid_v1" && Number.isInteger(parameters.target_number)) {
     return `対象数字: ${parameters.target_number}`;
@@ -290,8 +1588,9 @@ function forecastActiveTiming(effect, completed) {
 }
 
 function forecastEventPresentation(variantState) {
-  if (variantState?.kind !== "forecast_events") return { visible: false };
-  const publicState = variantState.public || {};
+  const publicState = variantComponentPublic(variantState, "forecast_events");
+  if (!publicState) return { visible: false };
+  const catalog = publicState.catalog || null;
   const forecast = publicState.forecast || {};
   const event = FORECAST_EVENT_PRESENTATION[forecast.event_id] || {
     title: "未対応イベント",
@@ -305,12 +1604,16 @@ function forecastEventPresentation(variantState) {
     ? forecast.resolve_turn
     : completed;
   const remaining = Math.max(0, resolveTurn - completed);
-  const parameterLabel = forecastParameterLabel(forecast.event_id, forecast.parameters);
+  const parameterLabel = forecastParameterLabel(
+    forecast.event_id,
+    forecast.parameters,
+    catalog,
+  );
   const active = Array.isArray(publicState.active_effects)
     ? publicState.active_effects.map((effect) => {
       const definition = FORECAST_EVENT_PRESENTATION[effect?.event_id];
       const parts = [definition?.active || "未対応イベント"];
-      const target = forecastParameterLabel(effect?.event_id, effect?.parameters);
+      const target = forecastParameterLabel(effect?.event_id, effect?.parameters, catalog);
       if (target) parts.push(target);
       parts.push(forecastActiveTiming(effect, completed));
       return parts.join("・");
@@ -319,7 +1622,9 @@ function forecastEventPresentation(variantState) {
   return {
     visible: true,
     title: event.title,
-    description: parameterLabel
+    description: parameterLabel === CAMPAIGN_BLOCKADE_SKIP_LABEL
+      ? `${parameterLabel}。`
+      : parameterLabel
       ? `${parameterLabel}。${event.description}`
       : event.description,
     countdown: remaining === 0 ? "発動処理中" : `あと${remaining}手番`,
@@ -343,23 +1648,68 @@ async function api(path, options = {}) {
     const error = new Error(document.error?.message || `HTTP ${response.status}`);
     error.code = document.error?.code || "http_error";
     error.status = response.status;
+    error.retryAfterSeconds = retryAfterSecondsFromEvent(document.error);
     throw error;
   }
   return document;
 }
 
-async function startBrowserSession() {
+function hasSessionWelcome(document) {
+  return Array.isArray(document?.events)
+    && document.events.some((event) => event?.type === "session_welcome");
+}
+
+let resumeConfirmationInFlight = null;
+
+async function confirmRoomResumeAfterWelcome(document, request = api) {
+  if (!hasSessionWelcome(document)) return false;
+  if (resumeConfirmationInFlight) return resumeConfirmationInFlight;
+
+  const confirmation = (async () => {
+    try {
+      const result = await request("/api/resume/confirm", { method: "POST" });
+      processEvents(result?.events || [], { animateLive: false });
+      return result?.confirmed === true;
+    } catch (_error) {
+      // The replacement cookie has already been applied to the response that
+      // delivered session_welcome. Confirmation is best-effort: retaining a
+      // restored game is safer than resetting it after a transient failure.
+      return false;
+    }
+  })();
+  resumeConfirmationInFlight = confirmation;
+  try {
+    return await confirmation;
+  } finally {
+    if (resumeConfirmationInFlight === confirmation) {
+      resumeConfirmationInFlight = null;
+    }
+  }
+}
+
+async function startBrowserSession({
+  allowRoomResume = true,
+  resetStaleRoom = false,
+} = {}) {
+  if (resetStaleRoom) resetRoomState(false);
   const document = await api("/api/session", { method: "POST" });
   processEvents(document.events || [], { animateLive: false });
-  if (!state.welcome) {
-    await reconnectFromStorage();
+  await confirmRoomResumeAfterWelcome(document);
+  if (!state.welcome && allowRoomResume) {
+    await resumeRoomFromCookie();
   }
   connectWebSocket();
   setConnection("online", "ローカルサーバー接続中");
 }
 
+function messageRequiresHttpTransport(message) {
+  return HTTP_ONLY_ROOM_MESSAGE_TYPES.has(message?.type);
+}
+
 async function sendMessage(message) {
-  if (state.socketReady) return sendSocketMessage(message);
+  if (state.socketReady && !messageRequiresHttpTransport(message)) {
+    return sendSocketMessage(message);
+  }
   const document = await api("/api/message", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -368,6 +1718,9 @@ async function sendMessage(message) {
   processEvents(document.events || [], {
     animateLive: message.type !== "reconnect_room",
   });
+  if (ROOM_RESUME_COOKIE_MESSAGE_TYPES.has(message.type)) {
+    await confirmRoomResumeAfterWelcome(document);
+  }
   return document;
 }
 
@@ -401,12 +1754,13 @@ function connectWebSocket() {
     processEvents(document.events || [], {
       animateLive: document.kind !== "bootstrap",
     });
-    const pending = document.kind === "bootstrap"
-      ? null
-      : state.socketRequests.shift();
+    const pending = document.kind === "response"
+      ? state.socketRequests.shift()
+      : null;
     if (document.error) {
       const error = new Error(document.error.message || "WebSocket操作に失敗しました。");
       error.code = document.error.code || "socket_error";
+      error.retryAfterSeconds = retryAfterSecondsFromEvent(document.error);
       if (pending) pending.reject(error);
       else showToast(error.message, true);
     } else if (pending) {
@@ -484,7 +1838,7 @@ async function pollEvents() {
     if (error.status === 401 && !state.reconnecting) {
       state.reconnecting = true;
       try {
-        await startBrowserSession();
+        await startBrowserSession({ resetStaleRoom: true });
       } finally {
         state.reconnecting = false;
       }
@@ -503,18 +1857,14 @@ function processEvents(events, { animateLive = true } = {}) {
     if (!event || typeof event !== "object") continue;
     switch (event.type) {
       case "session_welcome":
-        state.welcome = event;
+        state.welcome = { ...event };
+        delete state.welcome.reconnect_token;
+        clearClaimedInvitation({ preserveRoomCode: true });
         state.nextSequence = Number.isInteger(event.next_sequence)
           ? event.next_sequence
           : 0;
-        if (event.reconnect_token) {
-          sessionStorage.setItem(
-            "catan-reconnect",
-            JSON.stringify({
-              roomCode: event.room_code,
-              token: event.reconnect_token,
-            }),
-          );
+        if (state.pendingRoomAccessAttempt || state.roomAccessPromptOpen) {
+          closeRoomAccessPrompt({ restoreFocus: false });
         }
         dirty = true;
         break;
@@ -613,7 +1963,9 @@ function processEvents(events, { animateLive = true } = {}) {
         break;
       case "request_error":
         state.commandPending = false;
-        showToast(event.message || "操作を処理できませんでした。", true);
+        if (!handleRoomAccessRequestError(event)) {
+          showToast(event.message || "操作を処理できませんでした。", true);
+        }
         dirty = true;
         break;
       case "room_closed":
@@ -865,23 +2217,15 @@ function deterministicDicePair(total, revision = 0) {
   return pairs[index];
 }
 
-async function reconnectFromStorage() {
-  const raw = sessionStorage.getItem("catan-reconnect");
-  if (!raw) return;
+async function resumeRoomFromCookie() {
   try {
-    const saved = JSON.parse(raw);
-    if (!saved.roomCode || !saved.token) return;
-    const document = await sendMessage(
-      wireMessage("reconnect_room", {
-        room_code: saved.roomCode,
-        reconnect_token: saved.token,
-      }),
-    );
-    if (!(document.events || []).some((event) => event.type === "session_welcome")) {
-      sessionStorage.removeItem("catan-reconnect");
-    }
+    const document = await api("/api/resume", { method: "POST" });
+    const events = document.events || [];
+    processEvents(events, { animateLive: false });
+    await confirmRoomResumeAfterWelcome(document);
+    return events.some((event) => event.type === "session_welcome");
   } catch (_error) {
-    sessionStorage.removeItem("catan-reconnect");
+    return false;
   }
 }
 
@@ -936,9 +2280,17 @@ function resetRoomState(renderNow = true) {
   state.tradePromptNotified.clear();
   state.developmentInventoryOpen = null;
   state.forecastActiveSignature = null;
+  state.marketDraft = null;
+  state.auctionDraft = null;
+  state.creditDraft = null;
+  clearActiveInvitationState();
+  clearClaimedInvitation({ preserveRoomCode: false });
   hideTradePrompt();
+  closeMarketEditor({ restoreFocus: false });
+  closeAuctionEditor({ restoreFocus: false });
+  closeCreditEditor({ restoreFocus: false });
+  closeRoomAccessPrompt({ restoreFocus: false });
   clearPendingBoardAnimations();
-  sessionStorage.removeItem("catan-reconnect");
   if (renderNow) render();
 }
 
@@ -951,7 +2303,12 @@ function render() {
   elements["game-view"].hidden = !hasGame;
   if (hasLobby) renderLobby();
   if (hasGame) renderGame();
-  if (!hasGame) hideTradePrompt();
+  if (!hasGame) {
+    hideTradePrompt();
+    closeMarketEditor({ restoreFocus: false });
+    closeAuctionEditor({ restoreFocus: false });
+    closeCreditEditor({ restoreFocus: false });
+  }
   syncAudioScene(nextView);
   if (state.currentView !== nextView) {
     state.currentView = nextView;
@@ -961,14 +2318,43 @@ function render() {
 
 function renderLobby() {
   const lobby = state.lobby;
-  elements["lobby-room-code"].textContent = lobby.room_code || "------";
+  const roomCode = normalizeInvitationRoomCode(lobby.room_code);
+  const isPlayer = Number.isInteger(state.welcome?.seat_index);
+  const isHost = state.welcome?.role === "host";
+  const secureInvitations = roomAccessTransportAllowed();
+  const invitationAvailable = Boolean(
+    isHost
+    && secureInvitations
+    && roomCode
+    && !state.invitationCopyPending
+    && !state.invitationListLoading
+    && !state.invitationMutationPending
+    && lobby.phase === "waiting",
+  );
+  elements["lobby-room-code"].textContent = roomCode || "------";
+  elements["copy-room-code"].disabled = !roomCode;
+  elements["copy-player-invite-link"].hidden = !isHost;
+  elements["copy-spectator-invite-link"].hidden = !isHost;
+  elements["copy-player-invite-link"].disabled = !invitationAvailable || lobby.full;
+  elements["copy-spectator-invite-link"].disabled = !invitationAvailable;
+  elements["invitation-guidance"].hidden = !isHost;
+  elements["invitation-guidance"].classList.toggle(
+    "transport-warning",
+    isHost && !secureInvitations,
+  );
+  elements["invitation-guidance"].textContent = secureInvitations
+    ? "招待リンクは1時間有効・1回限りです。相手ごとに新しいリンクを発行してください。"
+    : "期限付き招待の発行にはHTTPS/WSS接続が必要です。";
+  if (elements["invite-link-fallback"].dataset.roomCode !== roomCode) {
+    hideInvitationFallback();
+    elements["invite-link-fallback"].dataset.roomCode = roomCode || "";
+  }
+  ensureActiveInvitationList();
   elements["lobby-phase"].textContent = lobby.phase === "started" ? "対局中" : "待機中";
   elements["lobby-status-text"].textContent = `${lobby.player_members}/${lobby.settings.player_count}席 · 観戦${lobby.spectators}人`;
   renderMembers(lobby);
-  renderLobbySettings(lobby.settings);
+  renderLobbySettings(lobby.settings, lobby.access);
 
-  const isPlayer = Number.isInteger(state.welcome?.seat_index);
-  const isHost = state.welcome?.role === "host";
   const ownSeat = isPlayer ? state.welcome.seat_index + 1 : null;
   const ownMember = lobby.members.find((member) => member.seat === ownSeat);
   elements["ready-button"].hidden = !isPlayer;
@@ -1038,9 +2424,33 @@ function renderMembers(lobby) {
   }
 }
 
-function renderLobbySettings(settings) {
+function roomAccessPublicPresentation(access) {
+  if (
+    !access
+    || typeof access !== "object"
+    || Array.isArray(access)
+    || typeof access.passphrase_required !== "boolean"
+  ) return null;
+  const keys = Object.keys(access);
+  if (!keys.every((key) => ["passphrase_required", "invite_only"].includes(key))) {
+    return null;
+  }
+  if (
+    Object.prototype.hasOwnProperty.call(access, "invite_only")
+    && typeof access.invite_only !== "boolean"
+  ) return null;
+  if (access.invite_only && access.passphrase_required) return null;
+  if (access.invite_only) return "期限付き招待のみ";
+  // Invite-only rooms deliberately reuse the persisted passphrase gate with
+  // a server-owned secret.  The public lobby does not reveal which protected
+  // mechanism is in use, so use an accurate non-secret umbrella label.
+  return access.passphrase_required ? "招待／パスフレーズ" : "参加コード";
+}
+
+function renderLobbySettings(settings, access) {
   const list = elements["lobby-settings-list"];
   list.replaceChildren();
+  const accessLabel = roomAccessPublicPresentation(access);
   const rows = [
     ["プレイヤー", `${settings.player_count}人`],
     ["AI", settings.ai_player_count ? `${settings.ai_player_count}人 · ${aiPersonalityLabel(settings.ai_personality_mode)}` : "なし"],
@@ -1048,6 +2458,7 @@ function renderLobbySettings(settings) {
     ["盤面", boardModeLabel(settings.board_mode)],
     ["モード", variantLabel(settings.variant)],
     ["Seed", String(settings.board_seed)],
+    ["入室保護", accessLabel || "確認不可"],
     ["追加ルール", houseRulesLabel(settings.house_rules)],
   ];
   for (const [label, value] of rows) {
@@ -1086,6 +2497,9 @@ function renderGame() {
   const ownSeat = state.welcome?.seat_index;
   const personalityMode = personalityModeForView(gameState);
   const title = phaseTitle(gameState, activeSeat);
+  const variantState = gameState.variant_state;
+  elements["game-view"].dataset.variantKind = variantState?.kind || "standard";
+  elements["game-view"].dataset.variantCatalog = variantState?.public?.catalog || "";
   elements["game-room-label"].textContent = `ROOM ${state.welcome?.room_code || "------"} · ${roleLabel(state.welcome?.role)}`;
   elements["game-phase-title"].textContent = title.title;
   elements["game-instruction"].textContent = title.detail;
@@ -1099,8 +2513,16 @@ function renderGame() {
       .map((option) => [option.args.target, option]),
   );
   const animationPlan = takePendingBoardAnimations(snapshot);
-  renderBoard(snapshot.board_manifest, gameState.players || [], animationPlan);
+  renderBoard(
+    snapshot.board_manifest,
+    gameState.players || [],
+    animationPlan,
+    variantState,
+  );
   renderActions(options);
+  renderTradeMarket(gameState, options, ownSeat);
+  renderTradeAuction(gameState, options, ownSeat);
+  renderResourceCredit(gameState, options, ownSeat);
   renderIncomingTradePrompt(gameState, options, ownSeat);
   renderPlayers(
     gameState,
@@ -1113,7 +2535,10 @@ function renderGame() {
   elements["latest-event-title"].textContent = latest.title || "進行中";
   elements["latest-event-detail"].textContent = latest.detail || "次の操作を待っています。";
   renderForecastEvent(gameState.variant_state);
-  renderFrontierStatus(gameState.variant_state);
+  renderFrontierStatus(
+    gameState.variant_state,
+    snapshot.board_manifest?.tiles?.length,
+  );
   renderAICommentary(
     gameState.ai?.status,
     personalityMode,
@@ -1157,7 +2582,7 @@ function renderForecastEvent(variantState) {
     activeList.append(textElement("li", label, "forecast-active-chip"));
   }
 
-  const publicState = variantState?.public || {};
+  const publicState = variantComponentPublic(variantState, "forecast_events") || {};
   const activeEffects = Array.isArray(publicState.active_effects)
     ? publicState.active_effects
     : [];
@@ -1177,8 +2602,8 @@ function renderForecastEvent(variantState) {
   }
 }
 
-function renderFrontierStatus(variantState) {
-  const presentation = frontierPresentation(variantState);
+function renderFrontierStatus(variantState, totalTiles) {
+  const presentation = frontierPresentation(variantState, totalTiles);
   const card = elements["frontier-status-card"];
   card.hidden = !presentation.visible;
   if (!presentation.visible) return;
@@ -1201,7 +2626,19 @@ function renderAICommentary(status, personalityMode, isActiveAI = true) {
 function renderActions(options) {
   const list = elements["action-list"];
   list.replaceChildren();
-  const direct = options.filter((option) => !option?.args?.target);
+  const hasVariantOptions = options.some((option) => (
+    isMarketCommand(option.command)
+      || isAuctionCommand(option.command)
+      || isCreditCommand(option.command)
+  ));
+  const direct = options.filter(
+    (option) => (
+      !option?.args?.target
+      && !isMarketCommand(option.command)
+      && !isAuctionCommand(option.command)
+      && !isCreditCommand(option.command)
+    ),
+  );
   const gameState = state.snapshot?.state || {};
   const isTradeEditor =
     gameState.phase?.special_phase === "domestic_trade_edit"
@@ -1215,15 +2652,778 @@ function renderActions(options) {
     }
   }
   const targetCount = state.targetOptions.size;
-  elements["action-hint"].textContent = targetCount
+  const hint = targetCount
     ? `盤面上で光っている候補を選べます（${targetCount}か所）。`
     : isTradeEditor
       ? "「− / ＋」で枚数を調整します。ORにした欄は、承諾側が候補から1種類を選びます。"
-    : direct.length
-      ? "行動を選ぶと権威サーバーが合法性を再確認します。"
+    : direct.length || hasVariantOptions
+      ? ""
       : state.welcome?.role === "spectator"
         ? "観戦中です。操作はプレイヤーだけに表示されます。"
         : "ほかのプレイヤーの操作を待っています。";
+  elements["action-hint"].textContent = hint;
+  elements["action-hint"].hidden = !hint;
+}
+
+function isMarketCommand(command) {
+  return typeof command === "string" && command.startsWith("market_");
+}
+
+function isAuctionCommand(command) {
+  return typeof command === "string" && command.startsWith("auction_");
+}
+
+function isCreditCommand(command) {
+  return typeof command === "string" && command.startsWith("credit_");
+}
+
+function tradeMarketPresentation(
+  variantState,
+  players = [],
+  options = [],
+  ownSeat = null,
+) {
+  const publicState = variantComponentPublic(variantState, "trade2");
+  if (!publicState) return { visible: false };
+  const completedTurns = Number.isInteger(publicState.completed_turns)
+    ? publicState.completed_turns
+    : 0;
+  const createOption = options.find((option) => option.command === "market_create") || null;
+  const ownResources = Number.isInteger(ownSeat)
+    ? players?.[ownSeat]?.resources
+    : null;
+  const orders = (Array.isArray(publicState.orders) ? publicState.orders : []).map(
+    (order) => {
+      const sellerIndex = Number(order?.seller_index);
+      const sellerName = Number.isInteger(sellerIndex)
+        ? players?.[sellerIndex]?.name || `プレイヤー${sellerIndex + 1}`
+        : "不明なプレイヤー";
+      const remainingTurns = Math.max(
+        0,
+        (Number.isInteger(order?.expires_turn) ? order.expires_turn : completedTurns)
+          - completedTurns,
+      );
+      return {
+        ...order,
+        sellerIndex,
+        sellerName,
+        remainingTurns,
+        isOwn: Number.isInteger(ownSeat) && sellerIndex === ownSeat,
+        canAfford: canAffordMarketBundle(ownResources, order?.wanted),
+        fillOption: findMarketOrderOption(options, "market_fill", order),
+        cancelOption: findMarketOrderOption(options, "market_cancel", order),
+      };
+    },
+  );
+  return {
+    visible: true,
+    completedTurns,
+    orders,
+    createOption,
+    ownResourceTotal: TRADE_RESOURCE_KEYS.reduce(
+      (total, resource) => total + Math.max(0, Number(ownResources?.[resource]) || 0),
+      0,
+    ),
+    ownOrderCount: orders.filter((order) => order.isOwn).length,
+    countLabel: `${orders.length} / 16`,
+  };
+}
+
+function marketCreateUnavailableLabel(
+  presentation,
+  { replaying = false, role = "player" } = {},
+) {
+  if (replaying) return "リプレイ中は出品できません";
+  if (role === "spectator") return "観戦者は出品できません";
+  if (presentation.orders.length >= 16) return "市場の注文枠が満杯です";
+  if (presentation.ownOrderCount >= 4) return "自分の注文枠は4件までです";
+  if (presentation.ownResourceTotal <= 0) return "出品できる資源がありません";
+  return "自分の行動手番に出品できます";
+}
+
+function findMarketOrderOption(options, command, order) {
+  return options.find((option) => (
+    option.command === command
+    && option.args?.order_id === order?.order_id
+    && Number(option.args?.revision) === Number(order?.revision)
+  )) || null;
+}
+
+function canAffordMarketBundle(resources, bundle) {
+  if (!resources || !bundle || typeof bundle !== "object") return false;
+  return Object.entries(bundle).every(([resource, count]) => (
+    TRADE_RESOURCE_KEYS.includes(resource)
+    && Number.isInteger(Number(count))
+    && Number(count) > 0
+    && Number(resources[resource] || 0) >= Number(count)
+  ));
+}
+
+function formatMarketBundle(bundle) {
+  const labels = TRADE_RESOURCE_KEYS
+    .filter((resource) => Number(bundle?.[resource]) > 0)
+    .map((resource) => `${RESOURCE_LABELS[resource]}${Number(bundle[resource])}`);
+  return labels.length ? labels.join(" + ") : "未指定";
+}
+
+function renderTradeMarket(gameState, options, ownSeat) {
+  const panel = elements["market-panel"];
+  const presentation = tradeMarketPresentation(
+    gameState?.variant_state,
+    gameState?.players || [],
+    options,
+    ownSeat,
+  );
+  panel.hidden = !presentation.visible;
+  if (!presentation.visible) {
+    elements["market-order-list"].replaceChildren();
+    closeMarketEditor({ restoreFocus: false });
+    return;
+  }
+
+  elements["market-order-count"].textContent = presentation.countLabel;
+  const list = elements["market-order-list"];
+  list.replaceChildren();
+  if (!presentation.orders.length) {
+    list.append(
+      textElement(
+        "p",
+        "まだ注文はありません。自分の手番に最初の条件を公開できます。",
+        "market-empty",
+      ),
+    );
+  }
+  for (const order of presentation.orders) {
+    const card = document.createElement("article");
+    card.className = `market-order-card${order.isOwn ? " own-order" : ""}`;
+    const heading = document.createElement("div");
+    heading.className = "market-order-heading";
+    heading.append(
+      textElement("strong", `${order.sellerName}${order.isOwn ? "（あなた）" : ""}`),
+      textElement("span", `残り${order.remainingTurns}手番`),
+    );
+    const terms = document.createElement("div");
+    terms.className = "market-order-terms";
+    terms.append(
+      createMarketOrderTerm("出品", order.offer, "offer"),
+      textElement("span", "→", "market-order-arrow"),
+      createMarketOrderTerm("希望", order.wanted, "wanted"),
+    );
+    card.append(heading, terms, createMarketOrderButton(order, ownSeat));
+    list.append(card);
+  }
+
+  const createButton = elements["market-create-button"];
+  createButton.disabled = !presentation.createOption || state.commandPending;
+  createButton.textContent = presentation.createOption
+    ? "新しい注文を出す"
+    : marketCreateUnavailableLabel(presentation, {
+      replaying: state.replayIndex !== null,
+      role: state.welcome?.role,
+    });
+  const hint = state.welcome?.role === "spectator"
+    ? "観戦者は公開注文と残り期限を確認できます。"
+    : "購入・取消は、自分の行動手番に実行できます。";
+  elements["market-hint"].textContent = hint;
+  elements["market-hint"].hidden = !hint;
+
+  if (state.marketEditorOpen && !presentation.createOption) {
+    closeMarketEditor({ restoreFocus: false });
+  }
+}
+
+function createMarketOrderTerm(label, bundle, className) {
+  const term = document.createElement("div");
+  term.className = `market-order-term ${className}`;
+  term.append(
+    textElement("span", label),
+    textElement("strong", formatMarketBundle(bundle)),
+  );
+  return term;
+}
+
+function createMarketOrderButton(order, ownSeat) {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = `${
+    order.isOwn ? "ghost-button" : "secondary-button"
+  } market-order-button`;
+  const option = order.isOwn ? order.cancelOption : order.fillOption;
+  if (option) {
+    button.textContent = order.isOwn ? "この注文を取り消す" : "この条件で購入";
+    button.disabled = state.commandPending;
+    button.addEventListener("click", () => sendGameCommand(option));
+    return button;
+  }
+  button.disabled = true;
+  if (!Number.isInteger(ownSeat)) {
+    button.textContent = "観戦中";
+  } else if (order.isOwn) {
+    button.textContent = "自分の行動手番に取消";
+  } else if (!order.canAfford) {
+    button.textContent = "希望資源が不足";
+  } else {
+    button.textContent = "自分の行動手番に購入";
+  }
+  return button;
+}
+
+function tradeAuctionPresentation(
+  variantState,
+  players = [],
+  options = [],
+  ownSeat = null,
+) {
+  const publicState = variantComponentPublic(variantState, "trade2");
+  if (
+    !publicState
+    || publicState.catalog !== "market_auction_v1"
+    || !Array.isArray(publicState.auctions)
+  ) return { visible: false };
+  const completedTurns = Number.isInteger(publicState.completed_turns)
+    ? publicState.completed_turns
+    : 0;
+  const ownResources = Number.isInteger(ownSeat)
+    ? players?.[ownSeat]?.resources
+    : null;
+  const auctions = publicState.auctions.map((auction) => {
+    const sellerIndex = Number(auction?.seller_index);
+    const bids = (Array.isArray(auction?.bids) ? auction.bids : []).map((bid) => {
+      const bidderIndex = Number(bid?.bidder_index);
+      return {
+        ...bid,
+        bidderIndex,
+        bidderName: Number.isInteger(bidderIndex)
+          ? players?.[bidderIndex]?.name || `プレイヤー${bidderIndex + 1}`
+          : "不明なプレイヤー",
+        isOwn: Number.isInteger(ownSeat) && bidderIndex === ownSeat,
+        acceptOption: findAuctionOption(
+          options,
+          "auction_accept",
+          auction,
+          bidderIndex,
+        ),
+      };
+    });
+    const ownBid = bids.find((bid) => bid.isOwn) || null;
+    return {
+      ...auction,
+      sellerIndex,
+      sellerName: Number.isInteger(sellerIndex)
+        ? players?.[sellerIndex]?.name || `プレイヤー${sellerIndex + 1}`
+        : "不明なプレイヤー",
+      remainingTurns: Math.max(
+        0,
+        (Number.isInteger(auction?.expires_turn)
+          ? auction.expires_turn
+          : completedTurns) - completedTurns,
+      ),
+      isOwn: Number.isInteger(ownSeat) && sellerIndex === ownSeat,
+      bids,
+      ownBid,
+      bidOption: findAuctionOption(options, "auction_bid", auction),
+      cancelBidOption: findAuctionOption(
+        options,
+        "auction_cancel_bid",
+        auction,
+      ),
+      cancelOption: findAuctionOption(options, "auction_cancel", auction),
+    };
+  });
+  return {
+    visible: true,
+    completedTurns,
+    auctions,
+    createOption: options.find((option) => option.command === "auction_create") || null,
+    ownResources,
+    ownAuctionCount: auctions.filter((auction) => auction.isOwn).length,
+    countLabel: `${auctions.length} / 8`,
+  };
+}
+
+function findAuctionOption(options, command, auction, bidderIndex = null) {
+  return options.find((option) => (
+    option.command === command
+    && option.args?.auction_id === auction?.auction_id
+    && Number(option.args?.revision) === Number(auction?.revision)
+    && (
+      bidderIndex === null
+      || Number(option.args?.bidder_index) === Number(bidderIndex)
+    )
+  )) || null;
+}
+
+function renderTradeAuction(gameState, options, ownSeat) {
+  const panel = elements["auction-panel"];
+  const presentation = tradeAuctionPresentation(
+    gameState?.variant_state,
+    gameState?.players || [],
+    options,
+    ownSeat,
+  );
+  panel.hidden = !presentation.visible;
+  if (!presentation.visible) {
+    elements["auction-list"].replaceChildren();
+    closeAuctionEditor({ restoreFocus: false });
+    return;
+  }
+  elements["auction-count"].textContent = presentation.countLabel;
+  const list = elements["auction-list"];
+  list.replaceChildren();
+  if (!presentation.auctions.length) {
+    list.append(
+      textElement(
+        "p",
+        "まだ競売はありません。品物を公開すると、相手が自由な組み合わせで入札できます。",
+        "market-empty",
+      ),
+    );
+  }
+  for (const auction of presentation.auctions) {
+    list.append(createAuctionCard(auction, ownSeat));
+  }
+
+  const createButton = elements["auction-create-button"];
+  createButton.disabled = !presentation.createOption || state.commandPending;
+  createButton.textContent = presentation.createOption
+    ? "新しい競売を開く"
+    : state.replayIndex !== null
+      ? "リプレイ中は競売を開けません"
+      : state.welcome?.role === "spectator"
+        ? "観戦者は競売を開けません"
+        : presentation.auctions.length >= 8
+          ? "競売枠が満杯です"
+          : presentation.ownAuctionCount >= 2
+            ? "自分の競売枠は2件までです"
+            : "自分の行動手番に競売を開けます";
+  elements["auction-hint"].textContent = state.welcome?.role === "spectator"
+    ? "観戦者は公開された出品・入札・残り期限を確認できます。"
+    : "入札と入札取消は、ほかのプレイヤーの手番中でも実行できます。";
+
+  if (state.auctionEditorOpen) {
+    const draftAuction = presentation.auctions.find(
+      (auction) => auction.auction_id === state.auctionDraft?.auctionId,
+    );
+    const validContext = state.auctionDraft?.mode === "create"
+      ? presentation.createOption
+      : draftAuction?.bidOption;
+    if (!validContext) closeAuctionEditor({ restoreFocus: false });
+  }
+}
+
+function createAuctionCard(auction, ownSeat) {
+  const card = document.createElement("article");
+  card.className = `auction-card${auction.isOwn ? " own-auction" : ""}`;
+  const heading = document.createElement("div");
+  heading.className = "auction-heading";
+  heading.append(
+    textElement(
+      "strong",
+      `${auction.sellerName}${auction.isOwn ? "（あなた）" : ""}`,
+    ),
+    textElement("span", `残り${auction.remainingTurns}手番`),
+  );
+  const lot = document.createElement("div");
+  lot.className = "auction-lot";
+  lot.append(
+    textElement("span", "出品されている資源"),
+    textElement("strong", formatMarketBundle(auction.offer)),
+  );
+  card.append(
+    heading,
+    lot,
+    textElement(
+      "p",
+      `最低入札: 合計${Number(auction.minimum_bid_cards) || 1}枚`,
+      "auction-minimum",
+    ),
+  );
+
+  const bidList = document.createElement("div");
+  bidList.className = "auction-bid-list";
+  if (!auction.bids.length) {
+    bidList.append(textElement("p", "まだ入札はありません。", "market-empty"));
+  }
+  for (const bid of auction.bids) {
+    const bidCard = document.createElement("section");
+    bidCard.className = `auction-bid${bid.isOwn ? " own-bid" : ""}`;
+    const bidHeading = document.createElement("div");
+    bidHeading.className = "auction-bid-heading";
+    bidHeading.append(
+      textElement(
+        "strong",
+        `${bid.bidderName}${bid.isOwn ? "（あなた）" : ""}`,
+      ),
+      textElement("span", `入札 ${formatMarketBundle(bid.offer)}`),
+    );
+    bidCard.append(bidHeading);
+    if (auction.isOwn && bid.acceptOption) {
+      const accept = document.createElement("button");
+      accept.type = "button";
+      accept.className = "primary-button";
+      accept.textContent = "この入札を選んで落札確定";
+      accept.disabled = state.commandPending;
+      accept.addEventListener("click", () => sendGameCommand(bid.acceptOption));
+      bidCard.append(accept);
+    }
+    bidList.append(bidCard);
+  }
+  card.append(bidList);
+
+  const actions = document.createElement("div");
+  actions.className = "auction-card-actions";
+  if (!auction.isOwn && auction.bidOption) {
+    const bidButton = document.createElement("button");
+    bidButton.type = "button";
+    bidButton.className = "secondary-button";
+    bidButton.textContent = auction.ownBid ? "入札内容を変更" : "この競売へ入札";
+    bidButton.disabled = state.commandPending;
+    bidButton.addEventListener("click", () => openAuctionBidEditor(auction));
+    actions.append(bidButton);
+  }
+  const cancelOption = auction.isOwn
+    ? auction.cancelOption
+    : auction.cancelBidOption;
+  if (cancelOption) {
+    const cancel = document.createElement("button");
+    cancel.type = "button";
+    cancel.className = "ghost-button";
+    cancel.textContent = auction.isOwn ? "競売を取り消す" : "自分の入札を取り消す";
+    cancel.disabled = state.commandPending;
+    cancel.addEventListener("click", () => sendGameCommand(cancelOption));
+    actions.append(cancel);
+  }
+  if (actions.childElementCount) card.append(actions);
+  if (!Number.isInteger(ownSeat)) {
+    card.append(textElement("p", "観戦中", "context-hint"));
+  }
+  return card;
+}
+
+function resourceCreditPresentation(
+  variantState,
+  players = [],
+  options = [],
+  ownSeat = null,
+) {
+  const publicState = variantComponentPublic(variantState, "credit");
+  if (
+    !publicState
+    || publicState.catalog !== "bank_loan_v1"
+    || !Array.isArray(publicState.loans)
+  ) return { visible: false };
+  const completedTurns = Number.isInteger(publicState.completed_turns)
+    ? publicState.completed_turns
+    : 0;
+  const loans = publicState.loans.map((loan) => {
+    const borrowerIndex = Number(loan?.borrower_index);
+    const delinquent = loan?.status === "delinquent";
+    return {
+      ...loan,
+      borrowerIndex,
+      borrowerName: Number.isInteger(borrowerIndex)
+        ? players?.[borrowerIndex]?.name || `プレイヤー${borrowerIndex + 1}`
+        : "不明なプレイヤー",
+      isOwn: Number.isInteger(ownSeat) && borrowerIndex === ownSeat,
+      delinquent,
+      remainingTurns: delinquent
+        ? 0
+        : Math.max(
+          0,
+          (Number.isInteger(loan?.due_turn) ? loan.due_turn : completedTurns)
+            - completedTurns,
+        ),
+      publicVpPenalty: delinquent ? 2 : 1,
+      repayOption: options.find((option) => (
+        option.command === "credit_repay"
+        && option.args?.loan_id === loan?.loan_id
+        && Number(option.args?.revision) === Number(loan?.revision)
+      )) || null,
+    };
+  });
+  const borrowOptions = options.filter((option) => (
+    option.command === "credit_borrow"
+    && TRADE_RESOURCE_KEYS.includes(option.args?.resource)
+  ));
+  const ownLoan = loans.find((loan) => loan.isOwn) || null;
+  return {
+    visible: true,
+    completedTurns,
+    loans,
+    ownLoan,
+    borrowOptions,
+    ownResources: Number.isInteger(ownSeat)
+      ? players?.[ownSeat]?.resources || null
+      : null,
+    countLabel: `債務 ${loans.length}件`,
+  };
+}
+
+function renderResourceCredit(gameState, options, ownSeat) {
+  const panel = elements["credit-panel"];
+  const presentation = resourceCreditPresentation(
+    gameState?.variant_state,
+    gameState?.players || [],
+    options,
+    ownSeat,
+  );
+  panel.hidden = !presentation.visible;
+  if (!presentation.visible) {
+    elements["credit-loan-list"].replaceChildren();
+    closeCreditEditor({ restoreFocus: false });
+    return;
+  }
+
+  elements["credit-loan-count"].textContent = presentation.countLabel;
+  elements["credit-availability"].textContent = presentation.ownLoan
+    ? "あなたは借入枠を使用中です。完済すると再び借りられます。"
+    : presentation.borrowOptions.length
+      ? `現在借入可能: ${presentation.borrowOptions
+        .map((option) => RESOURCE_LABELS[option.args.resource])
+        .join("・")}`
+      : "借入可能な資源は自分の行動手番に確認できます。";
+  const list = elements["credit-loan-list"];
+  list.replaceChildren();
+  if (!presentation.loans.length) {
+    list.append(textElement(
+      "p",
+      "現在、未返済の借入はありません。借入内容は全員へ公開されます。",
+      "credit-empty",
+    ));
+  }
+  for (const loan of presentation.loans) {
+    list.append(createCreditLoanCard(loan));
+  }
+
+  const button = elements["credit-open-button"];
+  const canOpen = presentation.ownLoan
+    ? Boolean(presentation.ownLoan.repayOption)
+    : presentation.borrowOptions.length > 0;
+  button.disabled = !canOpen || state.commandPending;
+  if (presentation.ownLoan) {
+    button.textContent = presentation.ownLoan.repayOption
+      ? presentation.ownLoan.delinquent
+        ? `延滞債務を返済（残り${presentation.ownLoan.remaining_cards}枚）`
+        : "返済内容を選ぶ"
+      : "自分の行動手番に返済できます";
+  } else if (presentation.borrowOptions.length) {
+    button.textContent = "銀行から資源を1枚借りる";
+  } else if (state.replayIndex !== null) {
+    button.textContent = "リプレイ中は借入できません";
+  } else if (state.welcome?.role === "spectator") {
+    button.textContent = "観戦者は借入できません";
+  } else {
+    button.textContent = "自分の行動手番に借入できます";
+  }
+  elements["credit-hint"].textContent = state.welcome?.role === "spectator"
+    ? "観戦者にも、債務状態・返済期限・公開VP減点が表示されます。"
+    : presentation.ownLoan?.delinquent
+      ? "延滞債務は任意資源で分割返済できます。対局進行は止まりません。"
+      : "通常債務は期限までに、借りた資源1枚＋任意資源1枚をまとめて返します。";
+
+  if (state.creditEditorOpen) {
+    const validContext = state.creditDraft?.mode === "borrow"
+      ? presentation.borrowOptions.length > 0 && !presentation.ownLoan
+      : presentation.ownLoan?.repayOption;
+    if (!validContext) closeCreditEditor({ restoreFocus: false });
+  }
+}
+
+function createCreditLoanCard(loan) {
+  const card = document.createElement("article");
+  card.className = `credit-loan-card${loan.isOwn ? " own-loan" : ""}${loan.delinquent ? " delinquent" : ""}`;
+  const heading = document.createElement("div");
+  heading.className = "credit-loan-heading";
+  heading.append(
+    textElement("strong", `${loan.borrowerName}${loan.isOwn ? "（あなた）" : ""}`),
+    textElement(
+      "span",
+      creditDeadlineLabel(loan),
+      `credit-status${loan.delinquent ? " delinquent" : ""}`,
+    ),
+  );
+  const terms = document.createElement("div");
+  terms.className = "credit-loan-terms";
+  terms.append(
+    textElement(
+      "span",
+      loan.delinquent
+        ? `残債 任意資源${Number(loan.remaining_cards) || 0}枚`
+        : `借入 ${RESOURCE_LABELS[loan.borrowed_resource] || "不明な資源"}1枚`,
+    ),
+    textElement("strong", `公開VP −${loan.publicVpPenalty}`),
+  );
+  card.append(heading, terms);
+  if (loan.isOwn && loan.repayOption) {
+    const repay = document.createElement("button");
+    repay.type = "button";
+    repay.className = "secondary-button credit-repay-button";
+    repay.textContent = loan.delinquent ? "返済する枚数を選ぶ" : "返済内容を選ぶ";
+    repay.disabled = state.commandPending;
+    repay.addEventListener("click", () => openCreditRepayEditor(loan));
+    card.append(repay);
+  }
+  return card;
+}
+
+function creditDeadlineLabel(loan) {
+  if (loan?.delinquent) return "延滞中";
+  if (Number(loan?.remainingTurns) === 0) return "この手番終了まで";
+  return `返済まで${Math.max(0, Number(loan?.remainingTurns) || 0)}手番`;
+}
+
+function emptyMarketBundle() {
+  return Object.fromEntries(TRADE_RESOURCE_KEYS.map((resource) => [resource, 0]));
+}
+
+function availableMarketResources() {
+  const ownSeat = state.welcome?.seat_index;
+  const resources = Number.isInteger(ownSeat)
+    ? state.snapshot?.state?.players?.[ownSeat]?.resources
+    : null;
+  return Object.fromEntries(
+    TRADE_RESOURCE_KEYS.map((resource) => [
+      resource,
+      Math.max(0, Math.min(MARKET_RESOURCE_LIMIT, Number(resources?.[resource]) || 0)),
+    ]),
+  );
+}
+
+function compactMarketBundle(bundle) {
+  return Object.fromEntries(
+    TRADE_RESOURCE_KEYS
+      .filter((resource) => Number(bundle?.[resource]) > 0)
+      .map((resource) => [resource, Number(bundle[resource])]),
+  );
+}
+
+function marketDraftValidation(draft, available = availableMarketResources()) {
+  const offer = compactMarketBundle(draft?.offer);
+  const wanted = compactMarketBundle(draft?.wanted);
+  if (!Object.keys(offer).length || !Object.keys(wanted).length) {
+    return {
+      valid: false,
+      offer,
+      wanted,
+      message: "出品と希望を1枚以上ずつ選んでください。",
+    };
+  }
+  if (Object.keys(offer).some((resource) => Number(wanted[resource]) > 0)) {
+    return {
+      valid: false,
+      offer,
+      wanted,
+      message: "同じ資源を出品側と希望側の両方には指定できません。",
+    };
+  }
+  const withinLimits = Object.entries(offer).every(([resource, count]) => (
+    Number.isInteger(count)
+    && count >= 1
+    && count <= MARKET_RESOURCE_LIMIT
+    && count <= Number(available?.[resource] || 0)
+  )) && Object.values(wanted).every((count) => (
+    Number.isInteger(count) && count >= 1 && count <= MARKET_RESOURCE_LIMIT
+  ));
+  if (!withinLimits) {
+    return {
+      valid: false,
+      offer,
+      wanted,
+      message: "出品枚数が手札を超えているか、指定枚数が上限を超えています。",
+    };
+  }
+  return {
+    valid: true,
+    offer,
+    wanted,
+    message: `${formatMarketBundle(offer)} を出品 → ${formatMarketBundle(wanted)} を希望`,
+  };
+}
+
+function adjustMarketDraft(side, resource, delta) {
+  if (
+    !state.marketDraft
+    || !["offer", "wanted"].includes(side)
+    || !TRADE_RESOURCE_KEYS.includes(resource)
+    || ![-1, 1].includes(Number(delta))
+  ) return;
+  const bundle = state.marketDraft[side];
+  const opposite = state.marketDraft[side === "offer" ? "wanted" : "offer"];
+  const current = Number(bundle[resource]) || 0;
+  const maximum = side === "offer"
+    ? Number(availableMarketResources()[resource]) || 0
+    : MARKET_RESOURCE_LIMIT;
+  const next = Math.max(0, Math.min(maximum, current + Number(delta)));
+  if (next > 0 && Number(opposite[resource]) > 0) return;
+  bundle[resource] = next;
+  renderMarketEditor();
+}
+
+function renderMarketEditor() {
+  if (!state.marketEditorOpen || !state.marketDraft) return;
+  const available = availableMarketResources();
+  const grid = elements["market-editor-grid"];
+  grid.replaceChildren(
+    createMarketEditorSide("offer", "出品する", "現在使える手札まで指定できます。", available),
+    createMarketEditorSide("wanted", "希望する", "購入者から受け取りたい資源です。", available),
+  );
+  const validation = marketDraftValidation(state.marketDraft, available);
+  elements["market-editor-summary"].textContent = validation.message;
+  elements["market-editor-submit"].disabled = !validation.valid || state.commandPending;
+}
+
+function createMarketEditorSide(side, title, subtitle, available) {
+  const section = document.createElement("section");
+  section.className = `market-editor-side ${side}`;
+  const heading = document.createElement("div");
+  heading.className = "market-editor-side-heading";
+  heading.append(textElement("strong", title), textElement("small", subtitle));
+  const list = document.createElement("div");
+  list.className = "market-resource-list";
+  for (const resource of TRADE_RESOURCE_KEYS) {
+    const current = Number(state.marketDraft?.[side]?.[resource]) || 0;
+    const oppositeSide = side === "offer" ? "wanted" : "offer";
+    const opposite = Number(state.marketDraft?.[oppositeSide]?.[resource]) || 0;
+    const maximum = side === "offer"
+      ? Number(available[resource]) || 0
+      : MARKET_RESOURCE_LIMIT;
+    const row = document.createElement("div");
+    row.className = "market-resource-row";
+    row.append(
+      textElement(
+        "span",
+        side === "offer"
+          ? `${RESOURCE_LABELS[resource]}（手札${available[resource]}）`
+          : RESOURCE_LABELS[resource],
+        "market-resource-name",
+      ),
+      createMarketAdjustButton(side, resource, -1, current <= 0),
+      textElement("span", String(current), "market-resource-count"),
+      createMarketAdjustButton(
+        side,
+        resource,
+        1,
+        current >= maximum || opposite > 0,
+      ),
+    );
+    list.append(row);
+  }
+  section.append(heading, list);
+  return section;
+}
+
+function createMarketAdjustButton(side, resource, delta, disabled) {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "market-adjust-button";
+  button.textContent = delta > 0 ? "+" : "−";
+  button.disabled = disabled || state.commandPending;
+  button.setAttribute(
+    "aria-label",
+    `${side === "offer" ? "出品" : "希望"}する${RESOURCE_LABELS[resource]}を${delta > 0 ? "増やす" : "減らす"}`,
+  );
+  button.addEventListener("click", () => adjustMarketDraft(side, resource, delta));
+  return button;
 }
 
 function createActionButton(option, label = commandLabel(option)) {
@@ -1442,9 +3642,14 @@ function createTradeAdjustmentButton(option, label, ariaLabel) {
 function ownResourceSummary(gameState, viewerSeat) {
   const player = Number.isInteger(viewerSeat) ? gameState.players?.[viewerSeat] : null;
   const total = Number(player?.resource_total);
-  return Number.isFinite(total)
-    ? "あなたの手札 " + total + "枚"
-    : "あなたの手札から支払います";
+  if (!Number.isFinite(total)) return "あなたの手札から支払います";
+  const available = player?.resources && typeof player.resources === "object"
+    ? resourceTotal(player.resources)
+    : total;
+  const reserved = Math.max(0, total - available);
+  return reserved > 0
+    ? `使用可能 ${available}枚 / 手札${total}枚（市場・競売で取り置き${reserved}枚）`
+    : `あなたの手札 ${total}枚`;
 }
 
 function currentTurnSeat(gameState) {
@@ -1606,8 +3811,11 @@ function renderIncomingTradePrompt(gameState, options, ownSeat) {
   renderTradePromptTerms(presentation, isHandoff);
   renderTradePromptActions(options, isHandoff, presentation);
 
-  const rulesOpen = !elements["rules-drawer"]?.hidden;
-  if (!state.tradePromptDismissed.has(signature) && !rulesOpen) {
+  const blockingModalOpen = !elements["rules-drawer"]?.hidden
+    || state.marketEditorOpen
+    || state.auctionEditorOpen
+    || state.creditEditorOpen;
+  if (!state.tradePromptDismissed.has(signature) && !blockingModalOpen) {
     showTradePrompt(firstNotice);
   } else {
     hideTradePrompt();
@@ -1750,6 +3958,21 @@ async function sendGameCommand(option) {
   if (state.replayIndex !== null || state.commandPending || !state.snapshot) return;
   state.commandPending = true;
   renderActions(state.snapshot.command_options || []);
+  renderTradeMarket(
+    state.snapshot.state,
+    state.snapshot.command_options || [],
+    state.welcome?.seat_index,
+  );
+  renderTradeAuction(
+    state.snapshot.state,
+    state.snapshot.command_options || [],
+    state.welcome?.seat_index,
+  );
+  renderResourceCredit(
+    state.snapshot.state,
+    state.snapshot.command_options || [],
+    state.welcome?.seat_index,
+  );
   const sequence = state.nextSequence;
   state.nextSequence += 1;
   try {
@@ -1773,6 +3996,7 @@ function renderBoard(
   manifest,
   players,
   animationPlan = { buildKeys: new Set(), revealIds: new Set(), dice: null },
+  variantState = null,
 ) {
   if (!manifest) return;
   const layer = elements["board-layer"];
@@ -1784,6 +4008,7 @@ function renderBoard(
     y: (bounds.min_y + bounds.max_y) / 2,
   };
   const harborLayouts = layoutBoardHarbors(manifest, nodeById, boardCenter);
+  const announcedHarborId = forecastAnnouncedHarborId(variantState);
   const viewBox = boardVisualBounds(bounds, harborLayouts);
   elements["board-svg"].setAttribute(
     "viewBox",
@@ -1829,7 +4054,11 @@ function renderBoard(
   });
 
   for (const harborLayout of harborLayouts) {
-    drawBoardHarbor(harborLayer, harborLayout);
+    drawBoardHarbor(
+      harborLayer,
+      harborLayout,
+      announcedHarborId === harborLayout.harbor.id,
+    );
   }
 
   for (const edge of manifest.edges) {
@@ -2356,13 +4585,49 @@ function boardBoundsForPoints(points, rect, padding) {
   return { x: minX, y: minY, width: maxX - minX, height: maxY - minY };
 }
 
-function drawBoardHarbor(layer, layout) {
+function harborForecastPresentation(harbor, forecastAnnounced = false) {
+  const blocked = harbor?.forecast_blocked === true;
+  const announced = forecastAnnounced === true;
+  const harborId = typeof harbor?.id === "string" ? harbor.id : "";
+  const match = /^harbor-(0|[1-9][0-9]?)$/.exec(harborId);
+  const ordinal = match ? Number(match[1]) + 1 : null;
+  const classNames = ["board-harbor"];
+  if (blocked) classNames.push("forecast-harbor-blocked");
+  if (announced) classNames.push("forecast-harbor-announced");
+  const titleStatus = [
+    blocked ? "港湾封鎖中" : "",
+    announced ? "港湾封鎖を予告中" : "",
+  ].filter(Boolean).join("・");
+  let statusLabel = "";
+  if (blocked && announced) {
+    statusLabel = `🔒${ordinal === null ? "" : ` #${ordinal}`} 封鎖・次回予告`;
+  } else if (blocked) {
+    statusLabel = `🔒${ordinal === null ? "" : ` #${ordinal}`} 封鎖`;
+  } else if (announced) {
+    statusLabel = `⚠${ordinal === null ? "" : ` #${ordinal}`} 予告`;
+  }
+  return {
+    announced,
+    blocked,
+    className: classNames.join(" "),
+    title: `交換所 ${harbor?.label || ""}${titleStatus ? `・${titleStatus}` : ""}`,
+    statusClass: announced
+      ? "forecast-harbor-notice forecast-harbor-notice-announced"
+      : "forecast-harbor-notice forecast-harbor-notice-blocked",
+    statusLabel,
+  };
+}
+
+function drawBoardHarbor(layer, layout, forecastAnnounced = false) {
   const { harbor, geometry, dock, rect, connectorLead, connectorEnd } = layout;
+  const presentation = harborForecastPresentation(harbor, forecastAnnounced);
   const group = svg("g", {
-    class: harbor.forecast_blocked ? "board-harbor forecast-harbor-blocked" : "board-harbor",
+    class: presentation.className,
+    "data-harbor-id": harbor.id,
+    "data-forecast-announced": presentation.announced ? "true" : "false",
     "pointer-events": "none",
   });
-  appendSvgTitle(group, `交換所 ${harbor.label}${harbor.forecast_blocked ? "・港湾封鎖中" : ""}`);
+  appendSvgTitle(group, presentation.title);
   const shadowOffset = { x: geometry.axis.x + geometry.outward.x * 2, y: geometry.axis.y + geometry.outward.y * 2 };
   const shifted = (point, amount = 1) => ({
     x: point.x + shadowOffset.x * amount,
@@ -2419,15 +4684,15 @@ function drawBoardHarbor(layer, layout) {
   });
   label.textContent = harbor.label;
   group.append(label);
-  if (harbor.forecast_blocked) {
-    const blocked = svg("text", {
+  if (presentation.statusLabel) {
+    const status = svg("text", {
       x: rect.x + rect.width / 2,
       y: rect.y - 7,
-      class: "forecast-harbor-lock",
+      class: presentation.statusClass,
       "text-anchor": "middle",
     });
-    blocked.textContent = "🔒 封鎖";
-    group.append(blocked);
+    status.textContent = presentation.statusLabel;
+    group.append(status);
   }
   layer.append(group);
 }
@@ -3160,6 +5425,21 @@ function renderPlayers(
         `${index === ownSeat ? "あなた · " : ""}手札${player.resource_total ?? resourceTotal(player.resources)}枚 · 発展${player.development_card_total ?? 0}枚`,
       ),
     );
+    if (player.resources && typeof player.resources === "object") {
+      const reservedCount = Math.max(
+        0,
+        Number(player.resource_total || 0) - resourceTotal(player.resources),
+      );
+      if (reservedCount > 0) {
+        main.append(
+          textElement(
+            "small",
+            `市場・競売に${reservedCount}枚取り置き中`,
+            "market-escrow",
+          ),
+        );
+      }
+    }
     const gains = gameState.history?.public_gain_history?.[player.name];
     const latestGain = Array.isArray(gains) ? gains[gains.length - 1] : null;
     if (latestGain?.text) {
@@ -3286,11 +5566,13 @@ function createResultVpBreakdown(row) {
     awarded: Boolean(row.largest_army),
     points: row.largest_army ? 2 : 0,
   };
+  const debtPenalty = breakdown.debt_penalty || null;
   const visiblePoints =
     Number(settlements.points || 0)
     + Number(cities.points || 0)
     + Number(longestRoad.points || 0)
-    + Number(largestArmy.points || 0);
+    + Number(largestArmy.points || 0)
+    + Number(debtPenalty?.points || 0);
   const victoryPointCards = breakdown.victory_point_cards || {
     count: Math.max(0, Number(row.victory_points || 0) - visiblePoints),
     points: Math.max(0, Number(row.victory_points || 0) - visiblePoints),
@@ -3314,6 +5596,13 @@ function createResultVpBreakdown(row) {
       awarded: Boolean(largestArmy.awarded),
       bonus: true,
     },
+    ...(debtPenalty && Number(debtPenalty.points) < 0
+      ? [{
+        label: `資源信用（${debtPenalty.status === "delinquent" ? "延滞" : "返済中"}） ${Number(debtPenalty.points)}点`,
+        awarded: true,
+        penalty: true,
+      }]
+      : []),
     {
       label: `勝利点カード ${Number(victoryPointCards.points) || 0}点（${Number(victoryPointCards.count) || 0}枚）`,
       awarded: Number(victoryPointCards.points) > 0,
@@ -3327,6 +5616,7 @@ function createResultVpBreakdown(row) {
     const classNames = ["result-vp-chip"];
     if (component.bonus && component.awarded) classNames.push("award");
     if (component.private && component.awarded) classNames.push("private");
+    if (component.penalty) classNames.push("penalty");
     if (!component.awarded) classNames.push("zero");
     container.append(textElement("span", component.label, classNames.join(" ")));
   }
@@ -3562,7 +5852,16 @@ function calculatePublicPoints(gameState) {
   const phase = gameState.phase || {};
   if (Number.isInteger(phase.longest_road_owner)) points[phase.longest_road_owner] += 2;
   if (Number.isInteger(phase.largest_army_owner)) points[phase.largest_army_owner] += 2;
-  return points;
+  const variantState = gameState.variant_state || state.snapshot?.state?.variant_state;
+  const creditPublic = variantComponentPublic(variantState, "credit");
+  if (Array.isArray(creditPublic?.loans)) {
+    for (const loan of creditPublic.loans) {
+      const borrower = Number(loan?.borrower_index);
+      if (!Number.isInteger(borrower) || borrower < 0 || borrower >= points.length) continue;
+      points[borrower] += loan?.status === "delinquent" ? -2 : -1;
+    }
+  }
+  return points.map((value) => Math.max(0, value));
 }
 
 function activePlayerIndex(gameState) {
@@ -3633,7 +5932,7 @@ function phaseTitle(gameState, activeSeat) {
     : { title: `ダイス前 — ${playerName}`, detail: "ダイスを振って資源を生産します。" };
 }
 
-function commandLabel(option) {
+function commandLabel(option, gameState = state.snapshot?.state) {
   const args = option.args || {};
   const fixed = {
     roll_dice: "ダイスを振る",
@@ -3650,6 +5949,16 @@ function commandLabel(option) {
       : "承諾する",
     trade_counter: "条件を変更",
     trade_reject: "拒否する",
+    market_create: "市場へ注文を出す",
+    market_fill: "市場の注文を購入",
+    market_cancel: "市場の注文を取消",
+    auction_create: "公開競売を開く",
+    auction_bid: "公開競売へ入札",
+    auction_cancel_bid: "競売の入札を取消",
+    auction_accept: "競売の落札者を決定",
+    auction_cancel: "公開競売を取消",
+    credit_borrow: `${RESOURCE_LABELS[args.resource] || "資源"}を銀行から借りる`,
+    credit_repay: "資源信用の債務を返済",
     finish_road_building: "街道建設を終了",
   };
   if (fixed[option.command]) return fixed[option.command];
@@ -3657,8 +5966,18 @@ function commandLabel(option) {
   if (option.command === "initial_place") return args.target?.startsWith("edge") ? "初期街道を配置" : "初期開拓地を配置";
   if (option.command === "move_robber") return "盗賊の移動先";
   if (option.command === "select_resource") return `${RESOURCE_LABELS[args.resource] || args.resource}を選択`;
-  if (option.command === "steal") return `席${Number(args.seat_index) + 1}から略奪`;
-  if (option.command === "trade_partner") return `席${Number(args.seat_index) + 1}と交渉`;
+  if (option.command === "steal" || option.command === "trade_partner") {
+    const seatIndex = Number(args.seat_index);
+    const playerName = Number.isInteger(seatIndex)
+      ? gameState?.players?.[seatIndex]?.name
+      : null;
+    const targetName = typeof playerName === "string" && playerName.trim()
+      ? playerName.trim()
+      : `プレイヤー${seatIndex + 1}`;
+    return option.command === "steal"
+      ? `${targetName}から資源を1枚奪う`
+      : `${targetName}と交渉する`;
+  }
   if (option.command === "trade_edit_side") return args.side === "give" ? "渡す資源を編集" : "受け取る資源を編集";
   if (option.command === "trade_receive_operator") {
     return args.operator === "or" ? "この欄をORにする" : "この欄をすべてにする";
@@ -3772,11 +6091,790 @@ function svgText(x, y, text, className) {
 
 let rulesReturnFocus = null;
 let tradePromptReturnFocus = null;
+let marketEditorReturnFocus = null;
+let auctionEditorReturnFocus = null;
+let creditEditorReturnFocus = null;
+
+function openMarketEditor() {
+  if (
+    state.marketEditorOpen
+    || state.auctionEditorOpen
+    || state.creditEditorOpen
+    || state.replayIndex !== null
+  ) return;
+  const createOption = (state.snapshot?.command_options || []).find(
+    (option) => option.command === "market_create",
+  );
+  if (!createOption) {
+    showToast("注文は自分の行動手番に作成できます。", true);
+    return;
+  }
+  marketEditorReturnFocus = document.activeElement || elements["market-create-button"];
+  hideTradePrompt({ restoreFocus: false });
+  state.marketDraft = {
+    offer: emptyMarketBundle(),
+    wanted: emptyMarketBundle(),
+  };
+  state.marketEditorOpen = true;
+  elements["market-editor"].hidden = false;
+  renderMarketEditor();
+  syncModalBodyState();
+  window.requestAnimationFrame(() => {
+    elements["market-editor"]?.querySelector?.(".market-editor-card")?.focus();
+  });
+}
+
+function auctionFromSnapshot(auctionId) {
+  const auctions = variantComponentPublic(
+    state.snapshot?.state?.variant_state,
+    "trade2",
+  )?.auctions;
+  return Array.isArray(auctions)
+    ? auctions.find((auction) => auction.auction_id === auctionId) || null
+    : null;
+}
+
+function availableAuctionResources(auction = null) {
+  const available = availableMarketResources();
+  const ownSeat = state.welcome?.seat_index;
+  const ownBid = Number.isInteger(ownSeat)
+    ? auction?.bids?.find((bid) => Number(bid.bidder_index) === ownSeat)
+    : null;
+  for (const [resource, amount] of Object.entries(ownBid?.offer || {})) {
+    if (TRADE_RESOURCE_KEYS.includes(resource)) {
+      available[resource] = Math.min(
+        MARKET_RESOURCE_LIMIT,
+        Number(available[resource] || 0) + Number(amount || 0),
+      );
+    }
+  }
+  return available;
+}
+
+function auctionDraftValidation(draft, available, auction = null) {
+  const offer = compactMarketBundle(draft?.offer);
+  if (!Object.keys(offer).length) {
+    return { valid: false, offer, message: "資源を1枚以上選んでください。" };
+  }
+  if (Object.entries(offer).some(([resource, count]) => (
+    !Number.isInteger(count)
+    || count < 1
+    || count > Number(available?.[resource] || 0)
+  ))) {
+    return { valid: false, offer, message: "使える手札を超えて指定しています。" };
+  }
+  if (draft?.mode === "create") {
+    const minimum = Number(draft.minimumBidCards);
+    if (!Number.isInteger(minimum) || minimum < 1 || minimum > MARKET_RESOURCE_LIMIT) {
+      return { valid: false, offer, message: "最低入札枚数は1〜19枚です。" };
+    }
+    return {
+      valid: true,
+      offer,
+      minimumBidCards: minimum,
+      message: `${formatMarketBundle(offer)} を出品 / 最低入札 ${minimum}枚`,
+    };
+  }
+  const minimum = Number(auction?.minimum_bid_cards) || 1;
+  if (Object.keys(offer).some((resource) => Number(auction?.offer?.[resource]) > 0)) {
+    return {
+      valid: false,
+      offer,
+      message: "出品物と同じ資源は、この競売の入札に使えません。",
+    };
+  }
+  if (Object.values(offer).reduce((total, count) => total + count, 0) < minimum) {
+    return {
+      valid: false,
+      offer,
+      message: `入札は合計${minimum}枚以上にしてください。`,
+    };
+  }
+  const ownSeat = state.welcome?.seat_index;
+  const previous = auction?.bids?.find(
+    (bid) => Number(bid.bidder_index) === Number(ownSeat),
+  );
+  if (
+    previous
+    && JSON.stringify(compactMarketBundle(previous.offer)) === JSON.stringify(offer)
+  ) {
+    return { valid: false, offer, message: "現在と異なる入札内容を指定してください。" };
+  }
+  return {
+    valid: true,
+    offer,
+    message: `${formatMarketBundle(offer)} で入札します`,
+  };
+}
+
+function openAuctionCreateEditor() {
+  if (
+    state.auctionEditorOpen
+    || state.marketEditorOpen
+    || state.creditEditorOpen
+    || state.replayIndex !== null
+  ) return;
+  const createOption = (state.snapshot?.command_options || []).find(
+    (option) => option.command === "auction_create",
+  );
+  if (!createOption) {
+    showToast("競売は自分の行動手番に開始できます。", true);
+    return;
+  }
+  auctionEditorReturnFocus = document.activeElement || elements["auction-create-button"];
+  hideTradePrompt({ restoreFocus: false });
+  state.auctionDraft = {
+    mode: "create",
+    offer: emptyMarketBundle(),
+    minimumBidCards: 1,
+  };
+  state.auctionEditorOpen = true;
+  elements["auction-editor"].hidden = false;
+  renderAuctionEditor();
+  syncModalBodyState();
+  window.requestAnimationFrame(() => {
+    elements["auction-editor"]?.querySelector?.(".auction-editor-card")?.focus();
+  });
+}
+
+function openAuctionBidEditor(auction) {
+  if (
+    state.auctionEditorOpen
+    || state.marketEditorOpen
+    || state.creditEditorOpen
+    || state.replayIndex !== null
+  ) return;
+  const bidOption = findAuctionOption(
+    state.snapshot?.command_options || [],
+    "auction_bid",
+    auction,
+  );
+  if (!bidOption) {
+    showToast("現在はこの競売へ入札できません。", true);
+    return;
+  }
+  const ownSeat = state.welcome?.seat_index;
+  const previous = auction.bids?.find(
+    (bid) => Number(bid.bidder_index) === Number(ownSeat),
+  );
+  auctionEditorReturnFocus = document.activeElement || elements["auction-panel"];
+  hideTradePrompt({ restoreFocus: false });
+  state.auctionDraft = {
+    mode: "bid",
+    auctionId: auction.auction_id,
+    revision: auction.revision,
+    offer: {
+      ...emptyMarketBundle(),
+      ...(previous?.offer || {}),
+    },
+  };
+  state.auctionEditorOpen = true;
+  elements["auction-editor"].hidden = false;
+  renderAuctionEditor();
+  syncModalBodyState();
+  window.requestAnimationFrame(() => {
+    elements["auction-editor"]?.querySelector?.(".auction-editor-card")?.focus();
+  });
+}
+
+function closeAuctionEditor({ restoreFocus = true } = {}) {
+  const wasOpen = state.auctionEditorOpen;
+  state.auctionEditorOpen = false;
+  state.auctionDraft = null;
+  if (elements["auction-editor"]) elements["auction-editor"].hidden = true;
+  if (!wasOpen) return;
+  syncModalBodyState();
+  if (restoreFocus) auctionEditorReturnFocus?.focus?.();
+  auctionEditorReturnFocus = null;
+  if (state.snapshot?.state) {
+    renderIncomingTradePrompt(
+      state.snapshot.state,
+      state.snapshot.command_options || [],
+      state.welcome?.seat_index,
+    );
+  }
+}
+
+function adjustAuctionDraft(resource, delta) {
+  if (
+    !state.auctionDraft
+    || !TRADE_RESOURCE_KEYS.includes(resource)
+    || ![-1, 1].includes(Number(delta))
+  ) return;
+  const auction = state.auctionDraft.mode === "bid"
+    ? auctionFromSnapshot(state.auctionDraft.auctionId)
+    : null;
+  const available = availableAuctionResources(auction);
+  const current = Number(state.auctionDraft.offer[resource]) || 0;
+  const maximum = Number(available[resource]) || 0;
+  state.auctionDraft.offer[resource] = Math.max(
+    0,
+    Math.min(maximum, current + Number(delta)),
+  );
+  renderAuctionEditor();
+}
+
+function adjustAuctionMinimum(delta) {
+  if (state.auctionDraft?.mode !== "create") return;
+  state.auctionDraft.minimumBidCards = Math.max(
+    1,
+    Math.min(
+      MARKET_RESOURCE_LIMIT,
+      Number(state.auctionDraft.minimumBidCards) + Number(delta),
+    ),
+  );
+  renderAuctionEditor();
+}
+
+function renderAuctionEditor() {
+  if (!state.auctionEditorOpen || !state.auctionDraft) return;
+  const isCreate = state.auctionDraft.mode === "create";
+  const auction = isCreate ? null : auctionFromSnapshot(state.auctionDraft.auctionId);
+  const available = availableAuctionResources(auction);
+  elements["auction-editor-kicker"].textContent = isCreate
+    ? "CREATE AUCTION"
+    : "PLACE OR UPDATE BID";
+  elements["auction-editor-title"].textContent = isCreate
+    ? "公開競売を開く"
+    : "公開競売へ入札";
+  elements["auction-editor-description"].textContent = isCreate
+    ? "出品する資源と、受け付ける最低入札枚数を指定します。"
+    : `${formatMarketBundle(auction?.offer)} に対する入札資源を指定します。`;
+  const body = elements["auction-editor-body"];
+  body.replaceChildren(createAuctionResourceEditor(available, auction));
+  if (isCreate) body.append(createAuctionMinimumEditor());
+  const validation = auctionDraftValidation(state.auctionDraft, available, auction);
+  elements["auction-editor-summary"].textContent = validation.message;
+  elements["auction-editor-submit"].textContent = isCreate
+    ? "この内容で競売を開く"
+    : "この内容で入札する";
+  elements["auction-editor-submit"].disabled = !validation.valid || state.commandPending;
+  elements["auction-editor-footnote"].textContent = isCreate
+    ? "出品資源は競売の取消・期限切れ・落札まで取り置かれます。"
+    : `最低入札は合計${Number(auction?.minimum_bid_cards) || 1}枚です。入札資源は取消・期限切れ・落札まで取り置かれます。`;
+}
+
+function createAuctionResourceEditor(available, auction) {
+  const section = document.createElement("section");
+  section.className = "market-editor-side offer";
+  const heading = document.createElement("div");
+  heading.className = "market-editor-side-heading";
+  heading.append(
+    textElement(
+      "strong",
+      state.auctionDraft.mode === "create" ? "出品する資源" : "入札する資源",
+    ),
+    textElement("small", "現在使える手札の範囲で指定します。"),
+  );
+  const list = document.createElement("div");
+  list.className = "market-resource-list";
+  for (const resource of TRADE_RESOURCE_KEYS) {
+    const current = Number(state.auctionDraft.offer[resource]) || 0;
+    const blocked = state.auctionDraft.mode === "bid"
+      && Number(auction?.offer?.[resource]) > 0;
+    const row = document.createElement("div");
+    row.className = "market-resource-row";
+    row.append(
+      textElement(
+        "span",
+        `${RESOURCE_LABELS[resource]}（手札${available[resource]}）${blocked ? "・入札不可" : ""}`,
+        "market-resource-name",
+      ),
+      createAuctionAdjustButton(resource, -1, current <= 0),
+      textElement("span", String(current), "market-resource-count"),
+      createAuctionAdjustButton(
+        resource,
+        1,
+        blocked || current >= Number(available[resource] || 0),
+      ),
+    );
+    list.append(row);
+  }
+  section.append(heading, list);
+  return section;
+}
+
+function createAuctionAdjustButton(resource, delta, disabled) {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "market-adjust-button";
+  button.textContent = delta > 0 ? "+" : "−";
+  button.disabled = disabled || state.commandPending;
+  button.setAttribute(
+    "aria-label",
+    `${RESOURCE_LABELS[resource]}を${delta > 0 ? "増やす" : "減らす"}`,
+  );
+  button.addEventListener("click", () => adjustAuctionDraft(resource, delta));
+  return button;
+}
+
+function createAuctionMinimumEditor() {
+  const editor = document.createElement("div");
+  editor.className = "auction-minimum-editor";
+  const label = document.createElement("div");
+  label.append(
+    textElement("strong", "最低入札枚数"),
+    textElement("small", "入札する資源の種類は相手が自由に選べます。"),
+  );
+  editor.append(
+    label,
+    createAuctionMinimumButton(-1),
+    textElement(
+      "span",
+      String(state.auctionDraft.minimumBidCards),
+      "market-resource-count",
+    ),
+    createAuctionMinimumButton(1),
+  );
+  return editor;
+}
+
+function createAuctionMinimumButton(delta) {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "market-adjust-button";
+  button.textContent = delta > 0 ? "+" : "−";
+  button.setAttribute(
+    "aria-label",
+    `最低入札枚数を${delta > 0 ? "増やす" : "減らす"}`,
+  );
+  const current = Number(state.auctionDraft.minimumBidCards);
+  button.disabled = state.commandPending
+    || (delta < 0 && current <= 1)
+    || (delta > 0 && current >= MARKET_RESOURCE_LIMIT);
+  button.addEventListener("click", () => adjustAuctionMinimum(delta));
+  return button;
+}
+
+function submitAuctionDraft() {
+  if (!state.auctionEditorOpen || !state.auctionDraft) return;
+  const isCreate = state.auctionDraft.mode === "create";
+  const auction = isCreate ? null : auctionFromSnapshot(state.auctionDraft.auctionId);
+  const validation = auctionDraftValidation(
+    state.auctionDraft,
+    availableAuctionResources(auction),
+    auction,
+  );
+  if (!validation.valid) {
+    renderAuctionEditor();
+    return;
+  }
+  const option = isCreate
+    ? (state.snapshot?.command_options || []).find(
+      (candidate) => candidate.command === "auction_create",
+    )
+    : findAuctionOption(
+      state.snapshot?.command_options || [],
+      "auction_bid",
+      auction,
+    );
+  if (!option) {
+    closeAuctionEditor();
+    showToast("競売状態が更新されました。内容を確認してください。", true);
+    return;
+  }
+  const command = isCreate
+    ? {
+      command: "auction_create",
+      args: {
+        offer: validation.offer,
+        minimum_bid_cards: validation.minimumBidCards,
+      },
+    }
+    : {
+      command: "auction_bid",
+      args: {
+        auction_id: option.args.auction_id,
+        revision: option.args.revision,
+        offer: validation.offer,
+      },
+    };
+  closeAuctionEditor();
+  sendGameCommand(command);
+}
+
+function creditLoanFromSnapshot(loanId) {
+  const loans = variantComponentPublic(
+    state.snapshot?.state?.variant_state,
+    "credit",
+  )?.loans;
+  return Array.isArray(loans)
+    ? loans.find((loan) => loan.loan_id === loanId) || null
+    : null;
+}
+
+function creditRepayOption(loan) {
+  return (state.snapshot?.command_options || []).find((option) => (
+    option.command === "credit_repay"
+    && option.args?.loan_id === loan?.loan_id
+    && Number(option.args?.revision) === Number(loan?.revision)
+  )) || null;
+}
+
+function creditDraftValidation(draft, available = availableMarketResources(), loan = null) {
+  if (draft?.mode === "borrow") {
+    const resource = draft.resource;
+    if (!TRADE_RESOURCE_KEYS.includes(resource)) {
+      return { valid: false, message: "借りる資源を1種類選んでください。" };
+    }
+    return {
+      valid: true,
+      resource,
+      message: `${RESOURCE_LABELS[resource]}を1枚借ります。期限内の返済は${RESOURCE_LABELS[resource]}1枚＋任意資源1枚です。`,
+    };
+  }
+  const payment = compactMarketBundle(draft?.payment);
+  const paymentTotal = Object.values(payment).reduce(
+    (total, count) => total + Number(count),
+    0,
+  );
+  if (!loan || !["active", "delinquent"].includes(loan.status)) {
+    return { valid: false, payment, message: "債務状態が更新されました。" };
+  }
+  if (Object.entries(payment).some(([resource, count]) => (
+    !Number.isInteger(count)
+    || count < 1
+    || count > Number(available?.[resource] || 0)
+  ))) {
+    return { valid: false, payment, message: "現在使える手札を超えて指定しています。" };
+  }
+  if (loan.status === "active") {
+    const borrowed = loan.borrowed_resource;
+    if (paymentTotal !== 2 || Number(payment[borrowed] || 0) < 1) {
+      return {
+        valid: false,
+        payment,
+        message: `期限内は${RESOURCE_LABELS[borrowed] || "借りた資源"}1枚を含む、合計2枚をまとめて返済します。`,
+      };
+    }
+    return {
+      valid: true,
+      payment,
+      message: `${formatMarketBundle(payment)} を返済し、債務を完済します。`,
+    };
+  }
+  const remaining = Math.max(1, Number(loan.remaining_cards) || 1);
+  if (paymentTotal < 1 || paymentTotal > remaining) {
+    return {
+      valid: false,
+      payment,
+      message: `延滞債務は任意資源を1〜${remaining}枚選んで返済できます。`,
+    };
+  }
+  return {
+    valid: true,
+    payment,
+    message: paymentTotal === remaining
+      ? `${formatMarketBundle(payment)} を返済し、延滞債務を完済します。`
+      : `${formatMarketBundle(payment)} を返済します。返済後の残債は${remaining - paymentTotal}枚です。`,
+  };
+}
+
+function openCreditEditor() {
+  const presentation = resourceCreditPresentation(
+    state.snapshot?.state?.variant_state,
+    state.snapshot?.state?.players || [],
+    state.snapshot?.command_options || [],
+    state.welcome?.seat_index,
+  );
+  if (presentation.ownLoan) openCreditRepayEditor(presentation.ownLoan);
+  else openCreditBorrowEditor();
+}
+
+function openCreditBorrowEditor() {
+  if (
+    state.creditEditorOpen
+    || state.marketEditorOpen
+    || state.auctionEditorOpen
+    || state.replayIndex !== null
+  ) return;
+  const borrowOptions = (state.snapshot?.command_options || []).filter(
+    (option) => option.command === "credit_borrow"
+      && TRADE_RESOURCE_KEYS.includes(option.args?.resource),
+  );
+  if (!borrowOptions.length) {
+    showToast("資源の借入は自分の行動手番に行えます。", true);
+    return;
+  }
+  creditEditorReturnFocus = document.activeElement || elements["credit-open-button"];
+  hideTradePrompt({ restoreFocus: false });
+  state.creditDraft = { mode: "borrow", resource: null };
+  state.creditEditorOpen = true;
+  elements["credit-editor"].hidden = false;
+  renderCreditEditor();
+  syncModalBodyState();
+  window.requestAnimationFrame(() => {
+    elements["credit-editor"]?.querySelector?.(".credit-editor-card")?.focus();
+  });
+}
+
+function openCreditRepayEditor(loan) {
+  if (
+    state.creditEditorOpen
+    || state.marketEditorOpen
+    || state.auctionEditorOpen
+    || state.replayIndex !== null
+  ) return;
+  if (!creditRepayOption(loan)) {
+    showToast("返済は自分の行動手番に行えます。", true);
+    return;
+  }
+  creditEditorReturnFocus = document.activeElement || elements["credit-open-button"];
+  hideTradePrompt({ restoreFocus: false });
+  state.creditDraft = {
+    mode: "repay",
+    loanId: loan.loan_id,
+    revision: loan.revision,
+    payment: emptyMarketBundle(),
+  };
+  state.creditEditorOpen = true;
+  elements["credit-editor"].hidden = false;
+  renderCreditEditor();
+  syncModalBodyState();
+  window.requestAnimationFrame(() => {
+    elements["credit-editor"]?.querySelector?.(".credit-editor-card")?.focus();
+  });
+}
+
+function closeCreditEditor({ restoreFocus = true } = {}) {
+  const wasOpen = state.creditEditorOpen;
+  state.creditEditorOpen = false;
+  state.creditDraft = null;
+  if (elements["credit-editor"]) elements["credit-editor"].hidden = true;
+  if (!wasOpen) return;
+  syncModalBodyState();
+  if (restoreFocus) creditEditorReturnFocus?.focus?.();
+  creditEditorReturnFocus = null;
+  if (state.snapshot?.state) {
+    renderIncomingTradePrompt(
+      state.snapshot.state,
+      state.snapshot.command_options || [],
+      state.welcome?.seat_index,
+    );
+  }
+}
+
+function selectCreditBorrowResource(resource) {
+  if (state.creditDraft?.mode !== "borrow" || !TRADE_RESOURCE_KEYS.includes(resource)) return;
+  state.creditDraft.resource = resource;
+  renderCreditEditor();
+}
+
+function adjustCreditPayment(resource, delta) {
+  if (
+    state.creditDraft?.mode !== "repay"
+    || !TRADE_RESOURCE_KEYS.includes(resource)
+    || ![-1, 1].includes(Number(delta))
+  ) return;
+  const loan = creditLoanFromSnapshot(state.creditDraft.loanId);
+  if (!loan) return;
+  const available = availableMarketResources();
+  const current = Number(state.creditDraft.payment[resource]) || 0;
+  const currentTotal = resourceTotal(state.creditDraft.payment);
+  const maximumTotal = loan.status === "delinquent"
+    ? Math.max(1, Number(loan.remaining_cards) || 1)
+    : 2;
+  const maximum = Math.min(
+    Number(available[resource]) || 0,
+    Math.max(0, current + maximumTotal - currentTotal),
+  );
+  state.creditDraft.payment[resource] = Math.max(
+    0,
+    Math.min(maximum, current + Number(delta)),
+  );
+  renderCreditEditor();
+}
+
+function renderCreditEditor() {
+  if (!state.creditEditorOpen || !state.creditDraft) return;
+  const borrow = state.creditDraft.mode === "borrow";
+  const loan = borrow ? null : creditLoanFromSnapshot(state.creditDraft.loanId);
+  const available = availableMarketResources();
+  elements["credit-editor-kicker"].textContent = borrow
+    ? "BORROW ONE RESOURCE"
+    : loan?.status === "delinquent"
+      ? "REPAY DELINQUENT DEBT"
+      : "REPAY ACTIVE LOAN";
+  elements["credit-editor-title"].textContent = borrow
+    ? "銀行から資源を借りる"
+    : loan?.status === "delinquent"
+      ? "延滞債務を返済する"
+      : "期限内に返済する";
+  elements["credit-editor-description"].textContent = borrow
+    ? "銀行在庫がある資源から1種類を選びます。"
+    : loan?.status === "delinquent"
+      ? `任意資源で残り${Number(loan?.remaining_cards) || 0}枚を分割返済できます。`
+      : `${RESOURCE_LABELS[loan?.borrowed_resource] || "借りた資源"}1枚を含む合計2枚を選びます。`;
+  const body = elements["credit-editor-body"];
+  body.replaceChildren(
+    borrow
+      ? createCreditBorrowChoices()
+      : createCreditRepaymentEditor(available, loan),
+  );
+  const validation = creditDraftValidation(state.creditDraft, available, loan);
+  elements["credit-editor-summary"].textContent = validation.message;
+  elements["credit-editor-submit"].textContent = borrow
+    ? "この資源を借りる"
+    : "この内容で返済する";
+  elements["credit-editor-submit"].disabled = !validation.valid || state.commandPending;
+  elements["credit-editor-footnote"].textContent = borrow
+    ? "借入中は公開VPが−1されます。期限を過ぎると任意3枚の延滞債務となり、公開VPは−2です。"
+    : loan?.status === "delinquent"
+      ? "延滞中も対局は進行します。完済すると公開VPの−2が解除されます。"
+      : "期限内の返済は一括です。完済すると公開VPの−1が解除されます。";
+}
+
+function createCreditBorrowChoices() {
+  const choices = document.createElement("div");
+  choices.className = "credit-resource-choices";
+  const options = (state.snapshot?.command_options || []).filter(
+    (option) => option.command === "credit_borrow"
+      && TRADE_RESOURCE_KEYS.includes(option.args?.resource),
+  );
+  for (const resource of TRADE_RESOURCE_KEYS) {
+    const available = options.some((option) => option.args.resource === resource);
+    const selected = state.creditDraft?.resource === resource;
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = `credit-resource-choice${selected ? " selected" : ""}`;
+    button.textContent = available
+      ? `${RESOURCE_LABELS[resource]}を1枚`
+      : `${RESOURCE_LABELS[resource]}・銀行在庫なし`;
+    button.disabled = !available || state.commandPending;
+    button.setAttribute("aria-pressed", selected ? "true" : "false");
+    button.addEventListener("click", () => selectCreditBorrowResource(resource));
+    choices.append(button);
+  }
+  return choices;
+}
+
+function createCreditRepaymentEditor(available, loan) {
+  const section = document.createElement("section");
+  section.className = "credit-payment-editor";
+  const list = document.createElement("div");
+  list.className = "market-resource-list";
+  const currentTotal = resourceTotal(state.creditDraft?.payment);
+  const maximumTotal = loan?.status === "delinquent"
+    ? Math.max(1, Number(loan?.remaining_cards) || 1)
+    : 2;
+  for (const resource of TRADE_RESOURCE_KEYS) {
+    const current = Number(state.creditDraft?.payment?.[resource]) || 0;
+    const row = document.createElement("div");
+    row.className = "market-resource-row";
+    row.append(
+      textElement(
+        "span",
+        `${RESOURCE_LABELS[resource]}（手札${available[resource]}）${loan?.status === "active" && resource === loan.borrowed_resource ? "・必須" : ""}`,
+        "market-resource-name",
+      ),
+      createCreditPaymentButton(resource, -1, current <= 0),
+      textElement("span", String(current), "market-resource-count"),
+      createCreditPaymentButton(
+        resource,
+        1,
+        current >= Number(available[resource] || 0) || currentTotal >= maximumTotal,
+      ),
+    );
+    list.append(row);
+  }
+  section.append(list);
+  return section;
+}
+
+function createCreditPaymentButton(resource, delta, disabled) {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "market-adjust-button";
+  button.textContent = delta > 0 ? "+" : "−";
+  button.disabled = disabled || state.commandPending;
+  button.setAttribute(
+    "aria-label",
+    `返済する${RESOURCE_LABELS[resource]}を${delta > 0 ? "増やす" : "減らす"}`,
+  );
+  button.addEventListener("click", () => adjustCreditPayment(resource, delta));
+  return button;
+}
+
+function submitCreditDraft() {
+  if (!state.creditEditorOpen || !state.creditDraft) return;
+  const borrow = state.creditDraft.mode === "borrow";
+  const loan = borrow ? null : creditLoanFromSnapshot(state.creditDraft.loanId);
+  const validation = creditDraftValidation(
+    state.creditDraft,
+    availableMarketResources(),
+    loan,
+  );
+  const option = borrow
+    ? (state.snapshot?.command_options || []).find((candidate) => (
+      candidate.command === "credit_borrow"
+      && candidate.args?.resource === validation.resource
+    ))
+    : creditRepayOption(loan);
+  if (!validation.valid || !option) {
+    renderCreditEditor();
+    return;
+  }
+  const command = borrow
+    ? { command: "credit_borrow", args: { resource: validation.resource } }
+    : {
+      command: "credit_repay",
+      args: {
+        loan_id: option.args.loan_id,
+        revision: option.args.revision,
+        payment: validation.payment,
+      },
+    };
+  closeCreditEditor();
+  sendGameCommand(command);
+}
+
+function closeMarketEditor({ restoreFocus = true } = {}) {
+  const editor = elements["market-editor"];
+  const wasOpen = state.marketEditorOpen;
+  state.marketEditorOpen = false;
+  state.marketDraft = null;
+  if (editor) editor.hidden = true;
+  if (!wasOpen) return;
+  syncModalBodyState();
+  if (restoreFocus) marketEditorReturnFocus?.focus?.();
+  marketEditorReturnFocus = null;
+  if (state.snapshot?.state) {
+    renderIncomingTradePrompt(
+      state.snapshot.state,
+      state.snapshot.command_options || [],
+      state.welcome?.seat_index,
+    );
+  }
+}
+
+function submitMarketDraft() {
+  if (!state.marketEditorOpen || !state.marketDraft) return;
+  const createOption = (state.snapshot?.command_options || []).find(
+    (option) => option.command === "market_create",
+  );
+  const validation = marketDraftValidation(state.marketDraft);
+  if (!createOption || !validation.valid) {
+    renderMarketEditor();
+    return;
+  }
+  const command = {
+    command: "market_create",
+    args: {
+      offer: validation.offer,
+      wanted: validation.wanted,
+    },
+  };
+  closeMarketEditor();
+  sendGameCommand(command);
+}
 
 function syncModalBodyState() {
   const open = Boolean(
     (elements["rules-drawer"] && !elements["rules-drawer"].hidden)
-      || (elements["trade-prompt"] && !elements["trade-prompt"].hidden),
+      || (elements["trade-prompt"] && !elements["trade-prompt"].hidden)
+      || state.marketEditorOpen
+      || state.auctionEditorOpen
+      || state.creditEditorOpen,
   );
   document.body?.classList?.toggle("modal-open", open);
   for (const selector of ["main", ".topbar"]) {
@@ -3796,6 +6894,9 @@ function openRulesDrawer() {
   const drawer = elements["rules-drawer"];
   if (!drawer || !drawer.hidden) return;
   rulesReturnFocus = document.activeElement || elements["rules-toggle"];
+  closeMarketEditor({ restoreFocus: false });
+  closeAuctionEditor({ restoreFocus: false });
+  closeCreditEditor({ restoreFocus: false });
   hideTradePrompt();
   updateRulesVariantNote();
   highlightRelevantRuleCosts();
@@ -3833,10 +6934,19 @@ function updateRulesVariantNote() {
   const rules = rulesDocument.house_rules
     || state.lobby?.settings?.house_rules
     || {};
-  const variant = state.snapshot?.state?.variant_state?.kind
-    || rulesDocument.variant?.kind
-    || state.lobby?.settings?.variant?.kind
-    || "standard";
+  const variantState = state.snapshot?.state?.variant_state || null;
+  const variantDocument = variantState
+    || rulesDocument.variant
+    || state.lobby?.settings?.variant
+    || { kind: "standard", options: {} };
+  const variant = variantDocument.kind || "standard";
+  const compositeCatalog = variantDocument.public?.catalog
+    ?? variantDocument.options?.catalog
+    ?? null;
+  const hasForecast = variantIncludesComponent(variantDocument, "forecast_events");
+  const hasFrontier = variantIncludesComponent(variantDocument, "frontier");
+  const hasTrade2 = variantIncludesComponent(variantDocument, "trade2");
+  const hasCredit = variantIncludesComponent(variantDocument, "credit");
   const exceptions = [];
   if (state.lobby?.settings?.player_count === 2) exceptions.push("2人簡易構成");
   if (rules.bank_trade_3_to_1) exceptions.push("銀行交易 3:1");
@@ -3845,8 +6955,44 @@ function updateRulesVariantNote() {
       && rules.disabled_development_cards.length) {
     exceptions.push("一部の発展カードを除外");
   }
-  if (variant === "forecast_events") exceptions.push("予告イベントモード");
+  if (variant === "composite") {
+    exceptions.push(
+      compositeCatalog === COMPOSITE_GRAND_CAMPAIGN_CATALOG
+        ? "グランドキャンペーン（全部入り）"
+        : "イベント＆経済（複合）モード",
+    );
+  } else if (hasForecast) {
+    exceptions.push("予告イベントモード");
+  }
   if (variant === "frontier") exceptions.push("フロンティア探索モード");
+  if (variant !== "composite" && hasCredit) {
+    exceptions.push("資源信用・借入と返済モード");
+  }
+  if (variant !== "composite" && hasTrade2) {
+    const catalog = variantComponentPublic(variantState, "trade2")?.catalog
+      || rulesDocument.variant?.options?.catalog
+      || state.lobby?.settings?.variant?.options?.catalog;
+    exceptions.push(
+      catalog === "market_auction_v1"
+        ? "交易2.0・市場と公開競売モード"
+        : "交易2.0・常設市場モード",
+    );
+  }
+  if (elements["rules-forecast-note"]) {
+    elements["rules-forecast-note"].hidden = !hasForecast;
+  }
+  if (elements["rules-frontier-note"]) {
+    elements["rules-frontier-note"].hidden = !hasFrontier;
+  }
+  if (elements["rules-campaign-note"]) {
+    elements["rules-campaign-note"].hidden = compositeCatalog !== COMPOSITE_GRAND_CAMPAIGN_CATALOG;
+  }
+  if (elements["rules-market-note"]) {
+    elements["rules-market-note"].hidden = !hasTrade2;
+  }
+  if (elements["rules-credit-note"]) {
+    elements["rules-credit-note"].hidden = !hasCredit;
+  }
   note.replaceChildren(
     textElement("strong", exceptions.length ? "適用中の例外" : "標準ルール"),
     textElement(
@@ -3899,17 +7045,33 @@ function trapModalFocus(event, modal) {
 }
 
 function handleModalKeydown(event) {
+  const roomAccessOpen = state.roomAccessPromptOpen;
   const tradeOpen = elements["trade-prompt"] && !elements["trade-prompt"].hidden;
   const rulesOpen = elements["rules-drawer"] && !elements["rules-drawer"].hidden;
-  const modal = tradeOpen
-    ? elements["trade-prompt"]
-    : rulesOpen
+  const marketOpen = state.marketEditorOpen;
+  const auctionOpen = state.auctionEditorOpen;
+  const creditOpen = state.creditEditorOpen;
+  const modal = roomAccessOpen
+    ? elements["room-access-prompt"]
+    : creditOpen
+    ? elements["credit-editor"]
+    : auctionOpen
+    ? elements["auction-editor"]
+    : marketOpen
+    ? elements["market-editor"]
+    : tradeOpen
+      ? elements["trade-prompt"]
+      : rulesOpen
       ? elements["rules-drawer"]
       : null;
   if (!modal) return;
   if (event.key === "Escape") {
     event.preventDefault();
-    if (tradeOpen) dismissTradePrompt();
+    if (roomAccessOpen) closeRoomAccessPrompt();
+    else if (creditOpen) closeCreditEditor();
+    else if (auctionOpen) closeAuctionEditor();
+    else if (marketOpen) closeMarketEditor();
+    else if (tradeOpen) dismissTradePrompt();
     else closeRulesDrawer();
     return;
   }
@@ -3919,21 +7081,47 @@ function handleModalKeydown(event) {
 elements["create-form"].addEventListener("submit", async (event) => {
   event.preventDefault();
   const form = new FormData(event.currentTarget);
+  const accessMode = elements["invite-only-room"]?.checked
+    ? "invite_only"
+    : elements["protect-room"]?.checked
+      ? "passphrase"
+      : "open";
+  if (accessMode !== "open" && !roomAccessTransportAllowed()) {
+    showToast("この接続では入室保護を利用できません。HTTPS/WSSで接続してください。", true);
+    syncCreateRoomProtection();
+    return;
+  }
+  const message = wireMessage("create_room", {
+    display_name: String(form.get("display_name") || "").trim(),
+    settings: {
+      player_count: Number(form.get("player_count")),
+      ai_player_count: Number(form.get("ai_player_count")),
+      ai_personality_mode: String(form.get("ai_personality_mode")),
+      victory_target: Number(form.get("victory_target")),
+      board_mode: String(form.get("board_mode")),
+      board_seed: Number(form.get("board_seed")),
+      variant: variantConfigDocument(String(form.get("variant_kind"))),
+    },
+  });
+  if (accessMode === "invite_only") message.invite_only = true;
+  if (accessMode === "passphrase") {
+    let passphrase = String(form.get("room_passphrase") || "");
+    const validationError = roomPassphraseClientError(passphrase);
+    if (validationError) {
+      showToast(validationError, true);
+      return;
+    }
+    message.passphrase = passphrase;
+    passphrase = null;
+  }
   try {
-    await sendMessage(
-      wireMessage("create_room", {
-        display_name: String(form.get("display_name") || "").trim(),
-        settings: {
-          player_count: Number(form.get("player_count")),
-          ai_player_count: Number(form.get("ai_player_count")),
-          ai_personality_mode: String(form.get("ai_personality_mode")),
-          victory_target: Number(form.get("victory_target")),
-          board_mode: String(form.get("board_mode")),
-          board_seed: Number(form.get("board_seed")),
-          variant: variantConfigDocument(String(form.get("variant_kind"))),
-        },
-      }),
+    const request = sendEphemeralPassphraseMessage(
+      message,
+      elements["create-room-passphrase"],
+      elements["create-passphrase-toggle"],
     );
+    form.delete("room_passphrase");
+    await request;
   } catch (error) {
     showToast(error.message, true);
   }
@@ -3942,17 +7130,52 @@ elements["create-form"].addEventListener("submit", async (event) => {
 elements["join-form"].addEventListener("submit", async (event) => {
   event.preventDefault();
   const form = new FormData(event.currentTarget);
+  const attempt = roomAccessAttempt(form, state.claimedInvitation);
+  state.pendingRoomAccessAttempt = attempt;
   try {
-    await sendMessage(
-      wireMessage("join_room", {
-        room_code: String(form.get("room_code") || "").trim().toUpperCase(),
-        display_name: String(form.get("display_name") || "").trim(),
-        role: form.get("role") === "spectator" ? "spectator" : "player",
-      }),
-    );
+    await submitRoomAccessAttempt(attempt);
   } catch (error) {
-    showToast(error.message, true);
+    if (!handleRoomAccessThrownError(error)) showToast(error.message, true);
   }
+});
+
+elements["room-access-form"].addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const attempt = state.pendingRoomAccessAttempt;
+  if (!attempt || elements["room-access-submit"].disabled) return;
+  const validationError = roomPassphraseClientError(
+    elements["join-room-passphrase"].value,
+  );
+  if (validationError) {
+    setRoomAccessError(validationError);
+    return;
+  }
+  try {
+    await submitRoomAccessAttempt(attempt, elements["join-room-passphrase"].value);
+  } catch (error) {
+    if (!handleRoomAccessThrownError(error)) showToast(error.message, true);
+  }
+});
+
+elements["invite-only-room"].addEventListener("change", syncCreateRoomProtection);
+elements["open-room"].addEventListener("change", syncCreateRoomProtection);
+elements["protect-room"].addEventListener("change", syncCreateRoomProtection);
+elements["create-passphrase-toggle"].addEventListener("click", () => {
+  togglePasswordVisibility(
+    elements["create-room-passphrase"],
+    elements["create-passphrase-toggle"],
+  );
+});
+elements["join-passphrase-toggle"].addEventListener("click", () => {
+  togglePasswordVisibility(
+    elements["join-room-passphrase"],
+    elements["join-passphrase-toggle"],
+  );
+});
+elements["room-access-close"].addEventListener("click", () => closeRoomAccessPrompt());
+elements["room-access-cancel"].addEventListener("click", () => closeRoomAccessPrompt());
+elements["room-access-prompt"].addEventListener("click", (event) => {
+  if (event.target === event.currentTarget) closeRoomAccessPrompt();
 });
 
 elements["rules-toggle"].addEventListener("click", () => {
@@ -3966,6 +7189,27 @@ elements["rules-drawer"].addEventListener("click", (event) => {
 elements["trade-prompt-close"].addEventListener("click", dismissTradePrompt);
 elements["trade-prompt"].addEventListener("click", (event) => {
   if (event.target === event.currentTarget) dismissTradePrompt();
+});
+elements["market-create-button"].addEventListener("click", openMarketEditor);
+elements["market-editor-close"].addEventListener("click", () => closeMarketEditor());
+elements["market-editor-cancel"].addEventListener("click", () => closeMarketEditor());
+elements["market-editor-submit"].addEventListener("click", submitMarketDraft);
+elements["market-editor"].addEventListener("click", (event) => {
+  if (event.target === event.currentTarget) closeMarketEditor();
+});
+elements["auction-create-button"].addEventListener("click", openAuctionCreateEditor);
+elements["auction-editor-close"].addEventListener("click", () => closeAuctionEditor());
+elements["auction-editor-cancel"].addEventListener("click", () => closeAuctionEditor());
+elements["auction-editor-submit"].addEventListener("click", submitAuctionDraft);
+elements["auction-editor"].addEventListener("click", (event) => {
+  if (event.target === event.currentTarget) closeAuctionEditor();
+});
+elements["credit-open-button"].addEventListener("click", openCreditEditor);
+elements["credit-editor-close"].addEventListener("click", () => closeCreditEditor());
+elements["credit-editor-cancel"].addEventListener("click", () => closeCreditEditor());
+elements["credit-editor-submit"].addEventListener("click", submitCreditDraft);
+elements["credit-editor"].addEventListener("click", (event) => {
+  if (event.target === event.currentTarget) closeCreditEditor();
 });
 if (typeof document.addEventListener === "function") {
   document.addEventListener("keydown", handleModalKeydown);
@@ -4018,10 +7262,18 @@ async function leaveRoom() {
     const confirmed = window.confirm("プレイヤーが退出すると対局は終了します。退出しますか？");
     if (!confirmed) return;
   }
+  let document;
   try {
-    await sendMessage(wireMessage("leave_room"));
+    document = await sendMessage(wireMessage("leave_room"));
   } catch (error) {
     showToast(error.message, true);
+    return;
+  }
+  if ((document.events || []).some((event) => event.type === "request_error")) return;
+  try {
+    await api("/api/resume", { method: "DELETE" });
+  } catch (_error) {
+    showToast("退出しました。復帰情報の消去は次回接続時に再確認します。", true);
   }
   resetRoomState();
 }
@@ -4037,6 +7289,23 @@ elements["copy-room-code"].addEventListener("click", async () => {
   } catch (_error) {
     showToast(`参加コード: ${code}`);
   }
+});
+elements["copy-player-invite-link"].addEventListener("click", () => {
+  copyRoleInvitationLink("player");
+});
+elements["copy-spectator-invite-link"].addEventListener("click", () => {
+  copyRoleInvitationLink("spectator");
+});
+elements["refresh-invitations"].addEventListener("click", () => {
+  void loadActiveInvitations({ force: true });
+});
+elements["revoke-all-invitations"].addEventListener("click", () => {
+  if (!state.activeInvitations.length) return;
+  const confirmed = window.confirm(
+    `未使用の招待${state.activeInvitations.length}件をすべて取り消しますか？`,
+  );
+  if (!confirmed) return;
+  void revokeActiveInvitations({ all: true });
 });
 
 elements["result-live-button"].addEventListener("click", showLiveSnapshot);
@@ -4072,11 +7341,41 @@ window.addEventListener("beforeunload", () => {
 });
 
 async function initialise() {
+  const capturedInvitation = captureInvitationTokenFromLocation();
+  try {
+    sessionStorage.removeItem("catan-reconnect");
+  } catch (_error) {
+    // Storage can be unavailable in hardened browser profiles. Resume state is
+    // now held exclusively by an HttpOnly cookie, so cleanup is best-effort.
+  }
   setConnection("connecting", "接続準備中");
   syncAIOptions();
+  syncCreateRoomProtection();
+  const invitationCode = applyInvitationFromLocation();
   try {
-    await startBrowserSession();
+    await startBrowserSession({
+      allowRoomResume: !invitationCode && !capturedInvitation.present,
+    });
+    if (capturedInvitation.present) {
+      if (capturedInvitation.room_code && capturedInvitation.token) {
+        try {
+          const invitation = await claimCapturedInvitation(capturedInvitation);
+          if (!invitation || !applyClaimedInvitation(invitation)) {
+            throw new Error("invalid invitation response");
+          }
+        } catch (_error) {
+          capturedInvitation.token = null;
+          showToast("招待リンクを確認できませんでした。ホストから新しいリンクを受け取るか、参加コードで入室してください。", true);
+        }
+      } else {
+        capturedInvitation.token = null;
+        showToast("招待リンクの形式が正しくありません。ホストから新しいリンクを受け取ってください。", true);
+      }
+    }
     render();
+    if (!state.lobby && invitationCode && !state.claimedInvitation) {
+      applyInvitationFromLocation();
+    }
   } catch (error) {
     setConnection("error", "サーバーに接続できません");
     showToast(error.message, true);

@@ -17,11 +17,33 @@ import json
 import random
 import secrets
 import threading
+import time
 from typing import Any, Callable, Mapping
 
 from game.ai_personality import DISRUPTOR, EXPANSION, MIXED, TRADER
+from game.controller_authority import (
+    CommandRecordAuthority,
+    CommandStateAuthority,
+    ControllerAuthorityError,
+    ControllerRoomAuthority,
+    MatchAuthority,
+    decode_controller_room_authority,
+    encode_controller_room_authority,
+)
+from game.friend_invitation import (
+    FRIEND_INVITATION_ROLES,
+    FriendInvitationAuthenticationError,
+    FriendInvitationBook,
+    FriendInvitationCapacityError,
+    FriendInvitationClaim,
+    FriendInvitationError,
+    FriendInvitationGrant,
+    FriendInvitationNotFoundError,
+    FriendInvitationSummary,
+)
 from game.game import CatanGame
 from game.lan_lobby import (
+    DEFAULT_RESTART_GRACE_SECONDS,
     ROOM_CODE_ALPHABET,
     ROOM_CODE_LENGTH,
     LobbyAuthenticationError,
@@ -49,7 +71,12 @@ from game.network_protocol import (
     build_state_snapshot,
 )
 from game.persistence import restore_game, serialize_game
-from game.frontier import FRONTIER_KIND
+from game.room_access import RoomAccessError
+from game.server_state import (
+    RoomAuthorityRecord,
+    SQLiteRoomAuthorityStore,
+)
+from game.variant import variant_uses_hidden_board
 
 
 MAX_ROOMS = 32
@@ -57,9 +84,21 @@ MAX_COMMAND_RECORDS = 128
 MAX_CONNECTION_ID_LENGTH = 128
 MAX_AI_STEPS_PER_TICK = 8
 DEFAULT_AI_STEPS_PER_TICK = 1
+DEFAULT_WAITING_ROOM_TTL_MS = 24 * 60 * 60 * 1000
+DEFAULT_LIVE_ROOM_TTL_MS = 7 * 24 * 60 * 60 * 1000
+MAX_ROOM_TTL_MS = 30 * 24 * 60 * 60 * 1000
+MAX_WALL_CLOCK_MS = 253_402_300_799_999
 _RANDOM_LOCK = threading.RLock()
 _MIXED_AI_PERSONALITIES = (EXPANSION, TRADER, DISRUPTOR)
 _MIXED_AI_SEED_SALT = 0x4D49584544
+_STATE_STORE_METHODS = (
+    "create_room",
+    "update_room",
+    "get_room",
+    "list_rooms",
+    "delete_room",
+    "delete_expired",
+)
 
 
 class LanControllerError(ValueError):
@@ -68,6 +107,10 @@ class LanControllerError(ValueError):
     def __init__(self, code: str, message: str):
         super().__init__(message)
         self.code = code
+
+
+class ControllerPersistenceError(RuntimeError):
+    """Raised when durable room authority cannot be trusted or restored."""
 
 
 @dataclass(frozen=True)
@@ -102,6 +145,10 @@ class _Session:
 @dataclass
 class _RoomContext:
     lobby: LobbyRoom
+    friend_invitations: FriendInvitationBook = field(
+        default_factory=FriendInvitationBook.create,
+        repr=False,
+    )
     match_seed: int = field(
         default_factory=lambda: secrets.randbits(256),
         repr=False,
@@ -110,6 +157,11 @@ class _RoomContext:
     game_revision: int = 0
     random_state: object | None = None
     command_states: dict[str, _CommandState] = field(default_factory=dict)
+    authority_room_id: str | None = None
+    authority_generation: int | None = None
+    authority_expires_at_ms: int | None = None
+    replay_readable: bool = False
+    replay_blocked: bool = False
 
 
 def _default_game_factory(
@@ -176,6 +228,10 @@ def _default_ai_stepper(game: Any) -> bool:
     return bool(callable(step) and step(game))
 
 
+def _default_wall_clock_ms() -> int:
+    return time.time_ns() // 1_000_000
+
+
 class LanServerController:
     """Authoritative multi-room state machine for a trusted LAN server."""
 
@@ -193,6 +249,12 @@ class LanServerController:
         ai_steps_per_tick: int = DEFAULT_AI_STEPS_PER_TICK,
         replay_store: NetworkReplayStore | None = None,
         room_limit: int = MAX_ROOMS,
+        state_store: SQLiteRoomAuthorityStore | None = None,
+        wall_clock_ms: Callable[[], int] = _default_wall_clock_ms,
+        lobby_clock: Callable[[], float] = time.monotonic,
+        waiting_room_ttl_ms: int = DEFAULT_WAITING_ROOM_TTL_MS,
+        live_room_ttl_ms: int = DEFAULT_LIVE_ROOM_TTL_MS,
+        restart_grace_seconds: float = DEFAULT_RESTART_GRACE_SECONDS,
     ) -> None:
         if (
             not callable(game_factory)
@@ -218,6 +280,25 @@ class LanServerController:
             raise ValueError(f"ai_steps_per_tick must be 1..{MAX_AI_STEPS_PER_TICK}")
         if type(room_limit) is not int or not 1 <= room_limit <= 256:
             raise ValueError("room_limit must be 1..256")
+        if state_store is not None and not all(
+            callable(getattr(state_store, method, None))
+            for method in _STATE_STORE_METHODS
+        ):
+            raise ValueError("state_store does not implement the authority contract")
+        if not callable(wall_clock_ms) or not callable(lobby_clock):
+            raise ValueError("persistence clocks must be callable")
+        for label, value in (
+            ("waiting_room_ttl_ms", waiting_room_ttl_ms),
+            ("live_room_ttl_ms", live_room_ttl_ms),
+        ):
+            if type(value) is not int or not 1 <= value <= MAX_ROOM_TTL_MS:
+                raise ValueError(f"{label} must be 1..{MAX_ROOM_TTL_MS}")
+        if (
+            isinstance(restart_grace_seconds, bool)
+            or not isinstance(restart_grace_seconds, (int, float))
+            or not 0 < float(restart_grace_seconds) <= 7 * 24 * 60 * 60
+        ):
+            raise ValueError("restart_grace_seconds must be a bounded duration")
         self._game_factory = game_factory
         self._command_applier = command_applier
         self._snapshot_builder = snapshot_builder
@@ -227,29 +308,408 @@ class LanServerController:
             NetworkReplayStore() if replay_store is None else replay_store
         )
         self._room_limit = room_limit
+        self._state_store = state_store
+        self._wall_clock_ms = wall_clock_ms
+        self._lobby_clock = lobby_clock
+        self._waiting_room_ttl_ms = waiting_room_ttl_ms
+        self._live_room_ttl_ms = live_room_ttl_ms
+        self._restart_grace_seconds = float(restart_grace_seconds)
+        self._persistence_failed = False
         self._rooms: dict[str, _RoomContext] = {}
         self._sessions: dict[str, _Session] = {}
+        if self._state_store is not None:
+            self._restore_persisted_rooms()
 
     @property
     def room_codes(self) -> tuple[str, ...]:
         return tuple(sorted(self._rooms))
 
+    def _now_ms(self) -> int:
+        value = self._wall_clock_ms()
+        if type(value) is not int or not 0 <= value <= MAX_WALL_CLOCK_MS:
+            raise ControllerPersistenceError("authority wall clock is invalid")
+        return value
+
+    @staticmethod
+    def _command_authorities(
+        states: Mapping[str, _CommandState],
+    ) -> tuple[CommandStateAuthority, ...]:
+        return tuple(
+            CommandStateAuthority(
+                member_id=member_id,
+                next_sequence=state.next_sequence,
+                records=tuple(
+                    CommandRecordAuthority(
+                        sequence=sequence,
+                        fingerprint=record.fingerprint,
+                        response=dict(record.response),
+                    )
+                    for sequence, record in state.records.items()
+                ),
+            )
+            for member_id, state in sorted(states.items())
+        )
+
+    def _authority_document(
+        self,
+        context: _RoomContext,
+        *,
+        wall_clock_ms: int,
+    ) -> dict[str, Any]:
+        lobby_document = context.lobby.to_authority_document(
+            wall_clock_ms=wall_clock_ms
+        )
+        match = None
+        if context.game is not None:
+            if context.random_state is None:
+                raise ControllerAuthorityError("live room has no random state")
+            match = MatchAuthority(
+                match_seed=context.match_seed,
+                game_revision=context.game_revision,
+                random_state=context.random_state,
+                game=serialize_game(context.game),
+                command_states=self._command_authorities(context.command_states),
+            )
+        elif context.command_states:
+            raise ControllerAuthorityError("waiting room has command state")
+        return encode_controller_room_authority(
+            ControllerRoomAuthority(
+                lobby=lobby_document,
+                match=match,
+                friend_invitations=(
+                    context.friend_invitations.to_authority_document()
+                ),
+            )
+        )
+
+    def _room_expiry_ms(self, context: _RoomContext, now_ms: int) -> int:
+        ttl = (
+            self._live_room_ttl_ms
+            if context.lobby.phase is RoomPhase.STARTED
+            else self._waiting_room_ttl_ms
+        )
+        expires_at_ms = now_ms + ttl
+        if expires_at_ms > MAX_WALL_CLOCK_MS:
+            raise ControllerPersistenceError("authority expiry is out of range")
+        return expires_at_ms
+
+    def _persistence_unavailable(self) -> LanControllerError:
+        return LanControllerError(
+            "persistence_unavailable",
+            "対局状態を安全に保存できません。サーバーを再起動して再接続してください。",
+        )
+
+    def _fail_persistence(self, exc: Exception) -> LanControllerError:
+        self._persistence_failed = True
+        return self._persistence_unavailable()
+
+    def _persist_new_context(self, context: _RoomContext) -> None:
+        if self._state_store is None:
+            return
+        try:
+            now_ms = self._now_ms()
+            record = self._state_store.create_room(
+                room_code=context.lobby.room_code,
+                authority=self._authority_document(
+                    context,
+                    wall_clock_ms=now_ms,
+                ),
+                updated_at_ms=now_ms,
+                expires_at_ms=self._room_expiry_ms(context, now_ms),
+            )
+        except Exception as exc:
+            raise self._fail_persistence(exc) from exc
+        context.authority_room_id = record.room_id
+        context.authority_generation = record.generation
+        context.authority_expires_at_ms = record.expires_at_ms
+
+    def _persist_existing_context(
+        self,
+        context: _RoomContext,
+        *,
+        preserve_expires_at_ms: int | None = None,
+    ) -> None:
+        if self._state_store is None:
+            return
+        room_id = context.authority_room_id
+        generation = context.authority_generation
+        if room_id is None or generation is None:
+            raise self._fail_persistence(
+                ControllerPersistenceError("room authority identity is missing")
+            )
+        try:
+            now_ms = self._now_ms()
+            expires_at_ms = (
+                self._room_expiry_ms(context, now_ms)
+                if preserve_expires_at_ms is None
+                else preserve_expires_at_ms
+            )
+            record = self._state_store.update_room(
+                room_id,
+                expected_generation=generation,
+                authority=self._authority_document(
+                    context,
+                    wall_clock_ms=now_ms,
+                ),
+                updated_at_ms=now_ms,
+                expires_at_ms=expires_at_ms,
+            )
+        except Exception as exc:
+            raise self._fail_persistence(exc) from exc
+        context.authority_generation = record.generation
+        context.authority_expires_at_ms = record.expires_at_ms
+
+    def _delete_persisted_context(self, context: _RoomContext) -> None:
+        if self._state_store is None:
+            return
+        room_id = context.authority_room_id
+        generation = context.authority_generation
+        if room_id is None or generation is None:
+            raise self._fail_persistence(
+                ControllerPersistenceError("room authority identity is missing")
+            )
+        try:
+            deleted = self._state_store.delete_room(
+                room_id,
+                expected_generation=generation,
+            )
+            if deleted is not True:
+                raise ControllerPersistenceError("room authority is missing")
+        except Exception as exc:
+            raise self._fail_persistence(exc) from exc
+
+    def _restore_persisted_rooms(self) -> None:
+        assert self._state_store is not None
+        try:
+            now_ms = self._now_ms()
+            self._state_store.delete_expired(now_ms)
+            metadata = self._state_store.list_rooms()
+            if len(metadata) > self._room_limit:
+                raise ControllerPersistenceError(
+                    "persisted room count exceeds the configured limit"
+                )
+            restored: dict[str, _RoomContext] = {}
+            for item in metadata:
+                record = self._state_store.get_room(item.room_id)
+                if record is None or record.metadata != item:
+                    raise ControllerPersistenceError(
+                        "persisted room metadata changed during restore"
+                    )
+                context = self._context_from_record(record, wall_clock_ms=now_ms)
+                code = context.lobby.room_code
+                if record.room_code != code or code in restored:
+                    raise ControllerPersistenceError(
+                        "persisted room identity is inconsistent"
+                    )
+                context.lobby.prune_expired()
+                if not context.lobby.has_members:
+                    if not self._state_store.delete_room(
+                        record.room_id,
+                        expected_generation=record.generation,
+                    ):
+                        raise ControllerPersistenceError(
+                            "empty persisted room could not be deleted"
+                        )
+                    continue
+                normalized_authority = self._authority_document(
+                    context,
+                    wall_clock_ms=now_ms,
+                )
+                reservation_deadlines = tuple(
+                    member["reservation_expires_at_ms"]
+                    for member in normalized_authority["lobby"]["members"]
+                    if member["reservation_expires_at_ms"] is not None
+                )
+                normalized_expiry = max(
+                    (record.expires_at_ms, *reservation_deadlines)
+                )
+                normalized = self._state_store.update_room(
+                    record.room_id,
+                    expected_generation=record.generation,
+                    authority=normalized_authority,
+                    updated_at_ms=now_ms,
+                    expires_at_ms=normalized_expiry,
+                )
+                context.authority_generation = normalized.generation
+                context.authority_expires_at_ms = normalized.expires_at_ms
+                restored[code] = context
+            self._rooms = restored
+            for context in restored.values():
+                self._reconcile_restored_replay(context)
+        except Exception as exc:
+            self._rooms = {}
+            self._sessions = {}
+            raise ControllerPersistenceError(
+                "persisted room authority could not be restored"
+            ) from exc
+
+    def _context_from_record(
+        self,
+        record: RoomAuthorityRecord,
+        *,
+        wall_clock_ms: int,
+    ) -> _RoomContext:
+        authority = decode_controller_room_authority(record.authority)
+        lobby = LobbyRoom.from_authority_document(
+            authority.lobby,
+            wall_clock_ms=wall_clock_ms,
+            clock=self._lobby_clock,
+            restart_grace_seconds=self._restart_grace_seconds,
+        )
+        friend_invitations = (
+            FriendInvitationBook.create()
+            if authority.friend_invitations is None
+            else FriendInvitationBook.from_authority_document(
+                authority.friend_invitations
+            )
+        )
+        context = _RoomContext(
+            lobby=lobby,
+            friend_invitations=friend_invitations,
+            authority_room_id=record.room_id,
+            authority_generation=record.generation,
+            authority_expires_at_ms=record.expires_at_ms,
+        )
+        match = authority.match
+        if match is None:
+            if lobby.phase is not RoomPhase.WAITING:
+                raise ControllerPersistenceError(
+                    "started lobby has no persisted match"
+                )
+            return context
+        if lobby.phase is not RoomPhase.STARTED:
+            raise ControllerPersistenceError("waiting lobby contains a match")
+
+        player_names = self._player_names(lobby)
+        with _RANDOM_LOCK:
+            caller_state = random.getstate()
+            try:
+                random.seed(match.match_seed)
+                game = self._game_factory(lobby.settings, player_names)
+                _assign_private_mixed_ai_personalities(
+                    game,
+                    lobby.settings,
+                    match.match_seed,
+                )
+                restore_game(game, match.game, runtime_side_effects=False)
+            finally:
+                random.setstate(caller_state)
+        self._validate_restored_game_contract(game, lobby.settings)
+        if serialize_game(game) != match.game:
+            raise ControllerPersistenceError(
+                "persisted game is not canonical after restore"
+            )
+        stored_names = tuple(player["name"] for player in match.game["players"])
+        if stored_names != player_names:
+            raise ControllerPersistenceError(
+                "persisted game players do not match the lobby"
+            )
+        seated_member_ids = {
+            member["member_id"]
+            for member in authority.lobby["members"]
+            if member["seat"] is not None
+        }
+        command_states: dict[str, _CommandState] = {}
+        for state in match.command_states:
+            if state.member_id not in seated_member_ids:
+                raise ControllerPersistenceError(
+                    "persisted command owner is not a player"
+                )
+            command_states[state.member_id] = _CommandState(
+                next_sequence=state.next_sequence,
+                records=OrderedDict(
+                    (
+                        record.sequence,
+                        _CommandRecord(
+                            fingerprint=record.fingerprint,
+                            response=dict(record.response),
+                        ),
+                    )
+                    for record in state.records
+                ),
+            )
+        context.match_seed = match.match_seed
+        context.game = game
+        context.game_revision = match.game_revision
+        context.random_state = match.random_state
+        context.command_states = command_states
+        return context
+
+    @staticmethod
+    def _validate_restored_game_contract(game: Any, settings: RoomSettings) -> None:
+        """Ensure a valid save cannot override the public room contract."""
+
+        players = tuple(getattr(game, "players", ()))
+        expected_ai = (False,) * (
+            settings.player_count - settings.ai_player_count
+        ) + (True,) * settings.ai_player_count
+        actual_ai = tuple(bool(getattr(player, "is_ai", False)) for player in players)
+        if (
+            len(players) != settings.player_count
+            or actual_ai != expected_ai
+            or getattr(game, "victory_point_target", None)
+            != settings.victory_target
+            or getattr(game, "board_mode", None) != settings.board_mode
+            or getattr(game, "board_seed", None) != settings.board_seed
+            or getattr(game, "custom_map_spec", None) != settings.custom_map
+            or getattr(game, "house_rules", None) != settings.house_rules
+            or getattr(game, "variant_config", None) != settings.variant
+            or getattr(game, "ai_player_count", None) != settings.ai_player_count
+            or getattr(game, "ai_personality_mode", None)
+            != settings.ai_personality_mode
+        ):
+            raise ControllerPersistenceError(
+                "persisted game does not match the room settings"
+            )
+
     def handle(
         self,
         connection_id: str | int,
         message: Mapping[str, Any],
+        *,
+        protected_room_access_allowed: bool = False,
+        rotate_reconnect_token: bool = False,
     ) -> tuple[OutboundMessage, ...]:
         """Handle one decoded request and return messages to send."""
 
         connection_key = self._connection_key(connection_id)
         try:
+            if type(protected_room_access_allowed) is not bool:
+                raise LanControllerError(
+                    "invalid_transport_context",
+                    "通信の保護状態を確認できません。",
+                )
+            if type(rotate_reconnect_token) is not bool:
+                raise LanControllerError(
+                    "invalid_transport_context",
+                    "再接続資格の更新状態を確認できません。",
+                )
             message_type = self._validate_envelope(message)
+            if rotate_reconnect_token and message_type != "reconnect_room":
+                raise LanControllerError(
+                    "invalid_transport_context",
+                    "再接続資格の更新対象が不正です。",
+                )
+            if self._persistence_failed and message_type != "ping":
+                raise self._persistence_unavailable()
             if message_type == "create_room":
-                return self._create_room(connection_key, message)
+                return self._create_room(
+                    connection_key,
+                    message,
+                    protected_room_access_allowed=protected_room_access_allowed,
+                )
             if message_type == "join_room":
-                return self._join_room(connection_key, message)
+                return self._join_room(
+                    connection_key,
+                    message,
+                    protected_room_access_allowed=protected_room_access_allowed,
+                )
             if message_type == "reconnect_room":
-                return self._reconnect_room(connection_key, message)
+                return self._reconnect_room(
+                    connection_key,
+                    message,
+                    rotate_reconnect_token=rotate_reconnect_token,
+                )
             if message_type == "leave_room":
                 return self._leave_room(connection_key, message)
             if message_type == "set_ready":
@@ -271,12 +731,15 @@ class LanServerController:
             )
         except (LanControllerError, LobbyError, NetworkProtocolError) as exc:
             code, detail = self._public_error(exc)
-            return (
+            outbound = [
                 OutboundMessage(
                     connection_key,
                     self._wire("request_error", code=code, message=detail),
-                ),
-            )
+                )
+            ]
+            if code == "persistence_unavailable" and self._persistence_failed:
+                outbound.extend(self._fence_all_rooms())
+            return tuple(outbound)
         except Exception:
             # Transport-facing errors must neither terminate the server loop nor
             # expose implementation details to an untrusted peer.  Mutating
@@ -299,51 +762,92 @@ class LanServerController:
         """Detach a transport while preserving its reconnect reservation."""
 
         connection_key = self._connection_key(connection_id)
-        session = self._sessions.pop(connection_key, None)
+        session = self._sessions.get(connection_key)
         if session is None:
+            return ()
+        if self._persistence_failed:
+            self._sessions.pop(connection_key, None)
             return ()
         context = self._rooms.get(session.room_code)
         if context is None:
+            self._sessions.pop(connection_key, None)
             return ()
+        lobby_before = deepcopy(context.lobby)
         try:
             context.lobby.disconnect(connection_key)
         except LobbyError:
+            self._sessions.pop(connection_key, None)
             return ()
-        return self._broadcast_lobby(context)
+        try:
+            outbound = self._broadcast_lobby(context)
+            self._persist_existing_context(context)
+        except LanControllerError:
+            context.lobby = lobby_before
+            return self._fence_all_rooms()
+        self._sessions.pop(connection_key, None)
+        return outbound
 
     def tick(self) -> tuple[OutboundMessage, ...]:
         """Maintain rooms and advance authoritative AI by bounded steps."""
 
+        if self._persistence_failed:
+            return ()
         outbound = []
-        for room_code, context in tuple(self._rooms.items()):
-            if context.lobby.has_expired_player_reservation():
-                closed = self._wire(
-                    "room_closed",
-                    code="player_reconnect_expired",
-                    message=(
-                        "プレイヤーの再接続期限が切れたため、LAN対戦を終了しました。"
-                    ),
-                )
-                sessions = self._room_sessions(room_code)
-                outbound.extend(
-                    OutboundMessage(session.connection_id, closed)
-                    for session in sessions
-                )
-                for session in sessions:
-                    self._sessions.pop(session.connection_id, None)
-                self._rooms.pop(room_code, None)
-                self._discard_replay(room_code)
-                continue
-            pruned = context.lobby.prune_expired()
-            if pruned:
-                if not context.lobby.has_members:
-                    self._rooms.pop(room_code, None)
-                    for session in self._room_sessions(room_code):
+        try:
+            for room_code, context in tuple(self._rooms.items()):
+                invitations_before = deepcopy(context.friend_invitations)
+                if context.friend_invitations.prune_expired(
+                    now_ms=self._now_ms()
+                ):
+                    try:
+                        self._persist_existing_context(
+                            context,
+                            preserve_expires_at_ms=(
+                                context.authority_expires_at_ms
+                            ),
+                        )
+                    except Exception:
+                        context.friend_invitations = invitations_before
+                        raise
+                if context.lobby.has_expired_player_reservation():
+                    closed = self._wire(
+                        "room_closed",
+                        code="player_reconnect_expired",
+                        message=(
+                            "プレイヤーの再接続期限が切れたため、LAN対戦を終了しました。"
+                        ),
+                    )
+                    sessions = self._room_sessions(room_code)
+                    self._delete_persisted_context(context)
+                    outbound.extend(
+                        OutboundMessage(session.connection_id, closed)
+                        for session in sessions
+                    )
+                    for session in sessions:
                         self._sessions.pop(session.connection_id, None)
+                    self._rooms.pop(room_code, None)
                     self._discard_replay(room_code)
                     continue
-                outbound.extend(self._broadcast_lobby(context))
-            outbound.extend(self._advance_ai(context))
+                lobby_before = deepcopy(context.lobby)
+                pruned = context.lobby.prune_expired()
+                if pruned:
+                    if not context.lobby.has_members:
+                        self._delete_persisted_context(context)
+                        self._rooms.pop(room_code, None)
+                        for session in self._room_sessions(room_code):
+                            self._sessions.pop(session.connection_id, None)
+                        self._discard_replay(room_code)
+                        continue
+                    try:
+                        snapshots = self._broadcast_lobby(context)
+                        self._persist_existing_context(context)
+                    except Exception:
+                        context.lobby = lobby_before
+                        raise
+                    outbound.extend(snapshots)
+                outbound.extend(self._advance_ai(context))
+        except LanControllerError:
+            return (*outbound, *self._fence_all_rooms())
         return tuple(outbound)
 
     def snapshot_for_connection(self, connection_id: str | int) -> dict[str, Any]:
@@ -365,6 +869,12 @@ class LanServerController:
         """Return one read-only replay frame for the authenticated viewer."""
 
         session = self._require_session(self._connection_key(connection_id))
+        context = self._rooms[session.room_code]
+        if context.game is None:
+            raise LanControllerError(
+                "game_not_started", "対局はまだ開始されていません。"
+            )
+        self._bind_replay_for_read(context)
         return self._replay_store.frame_payload(
             session.room_code,
             viewer_player_index=session.seat_index,
@@ -378,23 +888,302 @@ class LanServerController:
         """Return the public result and replay manifest for one room member."""
 
         session = self._require_session(self._connection_key(connection_id))
+        context = self._rooms[session.room_code]
+        if context.game is None:
+            raise LanControllerError(
+                "game_not_started", "対局はまだ開始されていません。"
+            )
+        self._bind_replay_for_read(context)
         return self._replay_store.result_payload(
             session.room_code,
             viewer_player_index=session.seat_index,
         )
 
+    def issue_friend_invitation(
+        self,
+        connection_id: str | int,
+        *,
+        role: str,
+        ttl_seconds: int,
+    ) -> FriendInvitationGrant:
+        """Issue one private, role-scoped bearer for the connected host."""
+
+        connection_key = self._connection_key(connection_id)
+        context: _RoomContext | None = None
+        invitations_before: FriendInvitationBook | None = None
+        try:
+            if self._persistence_failed:
+                raise self._persistence_unavailable()
+            session = self._require_session(connection_key)
+            context = self._rooms[session.room_code]
+            context.lobby.require_host(connection_key)
+            if role not in FRIEND_INVITATION_ROLES:
+                raise LanControllerError(
+                    "invalid_request", "招待の参加方法が不正です。"
+                )
+            if role == MemberRole.PLAYER.value:
+                if context.lobby.phase is not RoomPhase.WAITING:
+                    raise LanControllerError(
+                        "invalid_state",
+                        "対局開始後はプレイヤーを招待できません。",
+                    )
+                if context.lobby.is_full:
+                    raise LanControllerError(
+                        "room_full", "プレイヤー席が満員です。"
+                    )
+            invitations_before = deepcopy(context.friend_invitations)
+            grant = context.friend_invitations.issue(
+                role,
+                now_ms=self._now_ms(),
+                ttl_seconds=ttl_seconds,
+            )
+            self._persist_existing_context(context)
+            return grant
+        except (LobbyError, FriendInvitationError) as exc:
+            if context is not None and invitations_before is not None:
+                context.friend_invitations = invitations_before
+            code, detail = self._public_error(exc)
+            raise LanControllerError(code, detail) from exc
+        except Exception:
+            if context is not None and invitations_before is not None:
+                context.friend_invitations = invitations_before
+            raise
+
+    def inspect_friend_invitation(
+        self,
+        room_code: str,
+        invite_token: object,
+    ) -> FriendInvitationClaim:
+        """Return proven non-secret invite scope without consuming the bearer."""
+
+        try:
+            if self._persistence_failed:
+                raise self._persistence_unavailable()
+            context = self._room(room_code)
+            return context.friend_invitations.inspect(
+                invite_token,
+                now_ms=self._now_ms(),
+            )
+        except FriendInvitationAuthenticationError as exc:
+            raise LanControllerError(
+                "authentication_failed", "認証情報を確認できませんでした。"
+            ) from exc
+        except LanControllerError as exc:
+            if exc.code == "room_not_found":
+                raise LanControllerError(
+                    "authentication_failed", "認証情報を確認できませんでした。"
+                ) from exc
+            raise
+        except FriendInvitationError as exc:
+            raise LanControllerError(
+                "invalid_request", "招待情報が不正です。"
+            ) from exc
+
+    def list_friend_invitations(
+        self,
+        connection_id: str | int,
+    ) -> tuple[FriendInvitationSummary, ...]:
+        """Return the host's active token-free invitations in canonical order."""
+
+        connection_key = self._connection_key(connection_id)
+        context: _RoomContext | None = None
+        invitations_before: FriendInvitationBook | None = None
+        try:
+            if self._persistence_failed:
+                raise self._persistence_unavailable()
+            session = self._require_session(connection_key)
+            context = self._rooms[session.room_code]
+            context.lobby.require_host(connection_key)
+            invitations_before = deepcopy(context.friend_invitations)
+            count_before = context.friend_invitations.invitation_count
+            invitations = context.friend_invitations.list_active(
+                now_ms=self._now_ms()
+            )
+            if context.friend_invitations.invitation_count != count_before:
+                self._persist_existing_context(
+                    context,
+                    preserve_expires_at_ms=context.authority_expires_at_ms,
+                )
+            return invitations
+        except (LobbyError, FriendInvitationError) as exc:
+            if context is not None and invitations_before is not None:
+                context.friend_invitations = invitations_before
+            code, detail = self._public_error(exc)
+            raise LanControllerError(code, detail) from exc
+        except Exception:
+            if context is not None and invitations_before is not None:
+                context.friend_invitations = invitations_before
+            raise
+
+    def revoke_friend_invitation(
+        self,
+        connection_id: str | int,
+        *,
+        invitation_id: str,
+    ) -> FriendInvitationSummary:
+        """Atomically revoke one unused invitation for the connected host."""
+
+        connection_key = self._connection_key(connection_id)
+        context: _RoomContext | None = None
+        invitations_before: FriendInvitationBook | None = None
+        try:
+            if self._persistence_failed:
+                raise self._persistence_unavailable()
+            session = self._require_session(connection_key)
+            context = self._rooms[session.room_code]
+            context.lobby.require_host(connection_key)
+            invitations_before = deepcopy(context.friend_invitations)
+            revoked = context.friend_invitations.revoke(
+                invitation_id,
+                now_ms=self._now_ms(),
+            )
+            self._persist_existing_context(
+                context,
+                preserve_expires_at_ms=context.authority_expires_at_ms,
+            )
+            return revoked
+        except (LobbyError, FriendInvitationError) as exc:
+            if context is not None and invitations_before is not None:
+                context.friend_invitations = invitations_before
+            code, detail = self._public_error(exc)
+            raise LanControllerError(code, detail) from exc
+        except Exception:
+            if context is not None and invitations_before is not None:
+                context.friend_invitations = invitations_before
+            raise
+
+    def revoke_all_friend_invitations(
+        self,
+        connection_id: str | int,
+    ) -> int:
+        """Atomically revoke every unused invitation for the connected host."""
+
+        connection_key = self._connection_key(connection_id)
+        context: _RoomContext | None = None
+        invitations_before: FriendInvitationBook | None = None
+        try:
+            if self._persistence_failed:
+                raise self._persistence_unavailable()
+            session = self._require_session(connection_key)
+            context = self._rooms[session.room_code]
+            context.lobby.require_host(connection_key)
+            invitations_before = deepcopy(context.friend_invitations)
+            count_before = context.friend_invitations.invitation_count
+            revoked_count = context.friend_invitations.revoke_all(
+                now_ms=self._now_ms()
+            )
+            if count_before:
+                self._persist_existing_context(
+                    context,
+                    preserve_expires_at_ms=context.authority_expires_at_ms,
+                )
+            return revoked_count
+        except (LobbyError, FriendInvitationError) as exc:
+            if context is not None and invitations_before is not None:
+                context.friend_invitations = invitations_before
+            code, detail = self._public_error(exc)
+            raise LanControllerError(code, detail) from exc
+        except Exception:
+            if context is not None and invitations_before is not None:
+                context.friend_invitations = invitations_before
+            raise
+
+    def join_room_with_friend_invitation(
+        self,
+        connection_id: str | int,
+        *,
+        room_code: str,
+        display_name: str,
+        invite_token: object,
+        expected_room_id: str,
+    ) -> tuple[OutboundMessage, ...]:
+        """Atomically consume a proven invite and create its server-owned role."""
+
+        connection_key = self._connection_key(connection_id)
+        context: _RoomContext | None = None
+        lobby_before: LobbyRoom | None = None
+        invitations_before: FriendInvitationBook | None = None
+        try:
+            if self._persistence_failed:
+                raise self._persistence_unavailable()
+            self._require_unattached(connection_key)
+            try:
+                context = self._room(room_code)
+            except LanControllerError as exc:
+                if exc.code == "room_not_found":
+                    raise FriendInvitationAuthenticationError(
+                        "friend invitation could not be verified"
+                    ) from exc
+                raise
+            claim = context.friend_invitations.inspect(
+                invite_token,
+                now_ms=self._now_ms(),
+            )
+            if (
+                type(expected_room_id) is not str
+                or not secrets.compare_digest(claim.room_id, expected_room_id)
+            ):
+                raise FriendInvitationAuthenticationError(
+                    "friend invitation could not be verified"
+                )
+            lobby_before = deepcopy(context.lobby)
+            invitations_before = deepcopy(context.friend_invitations)
+            consumed = context.friend_invitations.consume(
+                invite_token,
+                now_ms=self._now_ms(),
+            )
+            if consumed.role == MemberRole.PLAYER.value:
+                grant = context.lobby.join_player_authorized(
+                    display_name=display_name,
+                    connection_id=connection_key,
+                )
+            elif consumed.role == MemberRole.SPECTATOR.value:
+                grant = context.lobby.join_spectator_authorized(
+                    display_name=display_name,
+                    connection_id=connection_key,
+                )
+            else:  # pragma: no cover - domain validation establishes this.
+                raise FriendInvitationError("friend invitation role is invalid")
+            self._attach(connection_key, context.lobby.room_code, grant)
+            outbound = self._welcome_and_broadcast(
+                context,
+                connection_key,
+                grant,
+            )
+            self._persist_existing_context(context)
+            return outbound
+        except (LobbyError, FriendInvitationError) as exc:
+            self._sessions.pop(connection_key, None)
+            if context is not None and lobby_before is not None:
+                context.lobby = lobby_before
+            if context is not None and invitations_before is not None:
+                context.friend_invitations = invitations_before
+            code, detail = self._public_error(exc)
+            raise LanControllerError(code, detail) from exc
+        except Exception:
+            self._sessions.pop(connection_key, None)
+            if context is not None and lobby_before is not None:
+                context.lobby = lobby_before
+            if context is not None and invitations_before is not None:
+                context.friend_invitations = invitations_before
+            raise
+
     def _create_room(
         self,
         connection_id: str,
         message: Mapping[str, Any],
+        *,
+        protected_room_access_allowed: bool,
     ) -> tuple[OutboundMessage, ...]:
-        self._expect_fields(
-            message,
-            "type",
-            "protocol_version",
-            "display_name",
-            "settings",
-        )
+        fields = ["type", "protocol_version", "display_name", "settings"]
+        if "passphrase" in message:
+            fields.append("passphrase")
+        self._expect_fields(message, *fields)
+        if "passphrase" in message and not protected_room_access_allowed:
+            raise LanControllerError(
+                "secure_transport_required",
+                "部屋パスフレーズは保護された通信または同一端末でのみ利用できます。",
+            )
         self._require_unattached(connection_id)
         if len(self._rooms) >= self._room_limit:
             raise LanControllerError(
@@ -424,22 +1213,32 @@ class LanServerController:
                 "settingsのfieldが不正です。",
             )
         settings = RoomSettings(**raw_settings)
-        if settings.variant.kind == FRONTIER_KIND:
+        if variant_uses_hidden_board(settings.variant):
             # The submitted seed must not let any participant reconstruct the
             # fogged terrain.  Keep the authority seed secret for this mode.
             settings = replace(settings, board_seed=secrets.randbits(52))
         code = self._new_room_code()
-        lobby, grant = LobbyRoom.create(
-            settings,
-            host_name=message["display_name"],
-            connection_id=connection_id,
-            code_generator=lambda: code,
-        )
+        try:
+            lobby, grant = LobbyRoom.create(
+                settings,
+                host_name=message["display_name"],
+                connection_id=connection_id,
+                clock=self._lobby_clock,
+                code_generator=lambda: code,
+                passphrase=message.get("passphrase"),
+            )
+        except RoomAccessError as exc:
+            raise LanControllerError(
+                "invalid_passphrase",
+                "部屋パスフレーズは推測されにくい15〜64文字で指定してください。",
+            ) from exc
         context = _RoomContext(lobby=lobby)
         self._rooms[code] = context
         self._attach(connection_id, code, grant)
         try:
-            return self._welcome_and_broadcast(context, connection_id, grant)
+            outbound = self._welcome_and_broadcast(context, connection_id, grant)
+            self._persist_new_context(context)
+            return outbound
         except Exception:
             self._sessions.pop(connection_id, None)
             self._rooms.pop(code, None)
@@ -449,34 +1248,49 @@ class LanServerController:
         self,
         connection_id: str,
         message: Mapping[str, Any],
+        *,
+        protected_room_access_allowed: bool,
     ) -> tuple[OutboundMessage, ...]:
-        self._expect_fields(
-            message,
+        fields = [
             "type",
             "protocol_version",
             "room_code",
             "display_name",
             "role",
-        )
+        ]
+        if "passphrase" in message:
+            fields.append("passphrase")
+        self._expect_fields(message, *fields)
         self._require_unattached(connection_id)
         context = self._room(message["room_code"])
+        if (
+            "passphrase" in message or context.lobby.passphrase_required
+        ) and not protected_room_access_allowed:
+            raise LanControllerError(
+                "secure_transport_required",
+                "部屋パスフレーズは保護された通信または同一端末でのみ利用できます。",
+            )
         lobby_before = deepcopy(context.lobby)
         role = message["role"]
         if role == MemberRole.PLAYER.value:
             grant = context.lobby.join_player(
                 display_name=message["display_name"],
                 connection_id=connection_id,
+                passphrase=message.get("passphrase"),
             )
         elif role == MemberRole.SPECTATOR.value:
             grant = context.lobby.join_spectator(
                 display_name=message["display_name"],
                 connection_id=connection_id,
+                passphrase=message.get("passphrase"),
             )
         else:
             raise LanControllerError("invalid_request", "参加roleが不正です。")
         self._attach(connection_id, context.lobby.room_code, grant)
         try:
-            return self._welcome_and_broadcast(context, connection_id, grant)
+            outbound = self._welcome_and_broadcast(context, connection_id, grant)
+            self._persist_existing_context(context)
+            return outbound
         except Exception:
             self._sessions.pop(connection_id, None)
             context.lobby = lobby_before
@@ -486,6 +1300,8 @@ class LanServerController:
         self,
         connection_id: str,
         message: Mapping[str, Any],
+        *,
+        rotate_reconnect_token: bool = False,
     ) -> tuple[OutboundMessage, ...]:
         self._expect_fields(
             message,
@@ -497,17 +1313,88 @@ class LanServerController:
         self._require_unattached(connection_id)
         context = self._room(message["room_code"])
         lobby_before = deepcopy(context.lobby)
-        grant = context.lobby.reconnect(
-            reconnect_token=message["reconnect_token"],
-            connection_id=connection_id,
-        )
-        self._attach(connection_id, context.lobby.room_code, grant)
         try:
-            return self._welcome_and_broadcast(context, connection_id, grant)
+            reconnect = (
+                context.lobby.reconnect_rotating
+                if rotate_reconnect_token
+                else context.lobby.reconnect
+            )
+            grant = reconnect(
+                reconnect_token=message["reconnect_token"],
+                connection_id=connection_id,
+            )
+            self._attach(connection_id, context.lobby.room_code, grant)
+            outbound = self._welcome_and_broadcast(context, connection_id, grant)
+            self._persist_existing_context(context)
+            return outbound
         except Exception:
             self._sessions.pop(connection_id, None)
             context.lobby = lobby_before
             raise
+
+    def confirm_reconnect_token(
+        self,
+        connection_id: str | int,
+        room_code: str,
+        reconnect_token: str,
+    ) -> tuple[OutboundMessage, ...]:
+        """Confirm one trusted Web cookie and revoke its predecessor.
+
+        This is intentionally not a wire message.  It uses the same durable
+        room CAS and rollback/fencing semantics as other controller mutations.
+        """
+
+        connection_key = self._connection_key(connection_id)
+        context: _RoomContext | None = None
+        lobby_before: LobbyRoom | None = None
+        try:
+            if self._persistence_failed:
+                raise self._persistence_unavailable()
+            session = self._require_session(connection_key)
+            if session.room_code != room_code:
+                raise LobbyAuthenticationError(
+                    "invalid or expired reconnect token"
+                )
+            context = self._rooms[session.room_code]
+            lobby_before = deepcopy(context.lobby)
+            changed = context.lobby.confirm_reconnect_rotation(
+                connection_id=connection_key,
+                reconnect_token=reconnect_token,
+            )
+            if changed:
+                self._persist_existing_context(context)
+            return (
+                OutboundMessage(
+                    connection_key,
+                    self._wire("resume_confirmed"),
+                ),
+            )
+        except (LanControllerError, LobbyError, NetworkProtocolError) as exc:
+            if context is not None and lobby_before is not None:
+                context.lobby = lobby_before
+            code, detail = self._public_error(exc)
+            outbound = [
+                OutboundMessage(
+                    connection_key,
+                    self._wire("request_error", code=code, message=detail),
+                )
+            ]
+            if code == "persistence_unavailable" and self._persistence_failed:
+                outbound.extend(self._fence_all_rooms())
+            return tuple(outbound)
+        except Exception:
+            if context is not None and lobby_before is not None:
+                context.lobby = lobby_before
+            return (
+                OutboundMessage(
+                    connection_key,
+                    self._wire(
+                        "request_error",
+                        code="internal_error",
+                        message="再接続情報を確認できませんでした。",
+                    ),
+                ),
+            )
 
     def _set_ready(
         self,
@@ -517,8 +1404,17 @@ class LanServerController:
         self._expect_fields(message, "type", "protocol_version", "ready")
         session = self._require_session(connection_id)
         context = self._rooms[session.room_code]
-        context.lobby.set_ready(connection_id, message["ready"])
-        return self._broadcast_lobby(context)
+        lobby_before = deepcopy(context.lobby)
+        revision_before = context.lobby.revision
+        try:
+            context.lobby.set_ready(connection_id, message["ready"])
+            outbound = self._broadcast_lobby(context)
+            if context.lobby.revision != revision_before:
+                self._persist_existing_context(context)
+            return outbound
+        except Exception:
+            context.lobby = lobby_before
+            raise
 
     def _leave_room(
         self,
@@ -537,6 +1433,7 @@ class LanServerController:
                 message="プレイヤーが退出したため、LAN対戦を終了しました。",
             )
             sessions = self._room_sessions(session.room_code)
+            self._delete_persisted_context(context)
             for room_session in sessions:
                 self._sessions.pop(room_session.connection_id, None)
             self._rooms.pop(session.room_code, None)
@@ -545,13 +1442,23 @@ class LanServerController:
                 OutboundMessage(room_session.connection_id, closed)
                 for room_session in sessions
             )
-        context.lobby.leave(connection_id)
+        lobby_before = deepcopy(context.lobby)
+        try:
+            context.lobby.leave(connection_id)
+            if not context.lobby.has_members:
+                self._delete_persisted_context(context)
+                outbound: tuple[OutboundMessage, ...] = ()
+            else:
+                outbound = self._broadcast_lobby(context)
+                self._persist_existing_context(context)
+        except Exception:
+            context.lobby = lobby_before
+            raise
         self._sessions.pop(connection_id, None)
         if not context.lobby.has_members:
             self._rooms.pop(session.room_code, None)
             self._discard_replay(session.room_code)
-            return ()
-        return self._broadcast_lobby(context)
+        return outbound
 
     def _start_game(
         self,
@@ -591,13 +1498,25 @@ class LanServerController:
         # Commit only after construction and every viewer snapshot succeeds.
         # This prevents a factory/snapshot exception from leaving a STARTED
         # lobby with no usable authoritative game.
-        context.lobby.start(connection_id)
-        context.game = game
-        context.random_state = match_random_state
-        context.game_revision = 0
+        lobby_before = deepcopy(context.lobby)
+        game_before = context.game
+        random_state_before = context.random_state
+        revision_before = context.game_revision
+        try:
+            context.lobby.start(connection_id)
+            context.game = game
+            context.random_state = match_random_state
+            context.game_revision = 0
+            outbound = list(self._broadcast_lobby(context))
+            outbound.extend(game_snapshots)
+            self._persist_existing_context(context)
+        except Exception:
+            context.lobby = lobby_before
+            context.game = game_before
+            context.random_state = random_state_before
+            context.game_revision = revision_before
+            raise
         self._capture_replay(context)
-        outbound = list(self._broadcast_lobby(context))
-        outbound.extend(game_snapshots)
         return tuple(outbound)
 
     def _game_command(
@@ -629,10 +1548,21 @@ class LanServerController:
                 "game_not_started", "対局はまだ開始されていません。"
             )
         seat = context.lobby.require_player_seat(connection_id) - 1
+        command_state_existed = session.member_id in context.command_states
         command_state = context.command_states.setdefault(
             session.member_id,
             _CommandState(),
         )
+        command_state_before = deepcopy(command_state)
+
+        def restore_command_cursor() -> None:
+            if command_state_existed:
+                context.command_states[session.member_id] = deepcopy(
+                    command_state_before
+                )
+            else:
+                context.command_states.pop(session.member_id, None)
+
         fingerprint = self._command_fingerprint(canonical)
         sequence = canonical["sequence"]
         previous = command_state.records.get(sequence)
@@ -681,6 +1611,11 @@ class LanServerController:
                 message="盤面が更新されています。最新状態で操作し直してください。",
             )
             self._remember_command(command_state, sequence, fingerprint, response)
+            try:
+                self._persist_existing_context(context)
+            except Exception:
+                restore_command_cursor()
+                raise
             return self._result_with_latest_snapshot(
                 context,
                 session,
@@ -688,9 +1623,14 @@ class LanServerController:
             )
 
         random_state_before = context.random_state
+        revision_before = context.game_revision
         try:
             game_state_before = serialize_game(context.game)
-        except Exception:
+        except Exception as exc:
+            if self._state_store is not None:
+                restore_command_cursor()
+                self._persistence_failed = True
+                raise self._persistence_unavailable() from exc
             response = self._command_result(
                 sequence,
                 accepted=False,
@@ -737,6 +1677,10 @@ class LanServerController:
             else:
                 code = "internal_error"
                 detail = "操作を安全に適用できなかったため取り消しました。"
+            if not rollback_ok and self._state_store is not None:
+                restore_command_cursor()
+                self._persistence_failed = True
+                raise self._persistence_unavailable()
             response = self._command_result(
                 sequence,
                 accepted=False,
@@ -745,6 +1689,11 @@ class LanServerController:
                 message=detail,
             )
             self._remember_command(command_state, sequence, fingerprint, response)
+            try:
+                self._persist_existing_context(context)
+            except Exception:
+                restore_command_cursor()
+                raise
             return self._result_with_latest_snapshot(
                 context,
                 session,
@@ -758,12 +1707,16 @@ class LanServerController:
                 context.game,
                 revision=next_revision,
             )
-        except Exception:
-            self._rollback_game(
+        except Exception as exc:
+            rollback_ok = self._rollback_game(
                 context,
                 game_state_before,
                 random_state_before,
             )
+            if not rollback_ok and self._state_store is not None:
+                restore_command_cursor()
+                self._persistence_failed = True
+                raise self._persistence_unavailable() from exc
             response = self._command_result(
                 sequence,
                 accepted=False,
@@ -772,17 +1725,35 @@ class LanServerController:
                 message="最新状態を安全に配信できなかったため操作を取り消しました。",
             )
             self._remember_command(command_state, sequence, fingerprint, response)
+            try:
+                self._persist_existing_context(context)
+            except Exception:
+                restore_command_cursor()
+                raise
             return (OutboundMessage(connection_id, response),)
 
         context.random_state = applied_random_state
         context.game_revision = next_revision
-        self._capture_replay(context)
         response = self._command_result(
             sequence,
             accepted=True,
             revision=context.game_revision,
         )
         self._remember_command(command_state, sequence, fingerprint, response)
+        try:
+            self._persist_existing_context(context)
+        except Exception:
+            rollback_ok = self._rollback_game(
+                context,
+                game_state_before,
+                random_state_before,
+            )
+            context.game_revision = revision_before
+            restore_command_cursor()
+            if not rollback_ok:
+                self._persistence_failed = True
+            raise
+        self._capture_replay(context)
         outbound = [OutboundMessage(connection_id, response)]
         outbound.extend(game_snapshots)
         return tuple(outbound)
@@ -845,9 +1816,13 @@ class LanServerController:
             if game is None or not self._is_ai_action_pending(game):
                 break
             random_state_before = context.random_state
+            revision_before = context.game_revision
             try:
                 game_state_before = serialize_game(game)
-            except Exception:
+            except Exception as exc:
+                if self._state_store is not None:
+                    self._persistence_failed = True
+                    raise self._persistence_unavailable() from exc
                 break
 
             changed = False
@@ -868,11 +1843,14 @@ class LanServerController:
                     random.setstate(caller_state)
 
             if not changed:
-                self._rollback_game(
+                rollback_ok = self._rollback_game(
                     context,
                     game_state_before,
                     random_state_before,
                 )
+                if not rollback_ok and self._state_store is not None:
+                    self._persistence_failed = True
+                    raise self._persistence_unavailable()
                 break
 
             next_revision = context.game_revision + 1
@@ -882,39 +1860,174 @@ class LanServerController:
                     game,
                     revision=next_revision,
                 )
-            except Exception:
-                self._rollback_game(
+            except Exception as exc:
+                rollback_ok = self._rollback_game(
                     context,
                     game_state_before,
                     random_state_before,
                 )
+                if not rollback_ok and self._state_store is not None:
+                    self._persistence_failed = True
+                    raise self._persistence_unavailable() from exc
                 break
             context.random_state = applied_random_state
             context.game_revision = next_revision
+            try:
+                self._persist_existing_context(context)
+            except Exception:
+                rollback_ok = self._rollback_game(
+                    context,
+                    game_state_before,
+                    random_state_before,
+                )
+                context.game_revision = revision_before
+                if not rollback_ok:
+                    self._persistence_failed = True
+                raise
             self._capture_replay(context)
             outbound.extend(snapshots)
         return tuple(outbound)
 
-    def _capture_replay(self, context: _RoomContext) -> bool:
+    def _capture_replay(
+        self,
+        context: _RoomContext,
+        *,
+        restored: bool = False,
+    ) -> bool:
         """Best-effort archive capture that can never roll back live play."""
 
-        if context.game is None:
+        if context.game is None or context.replay_blocked:
             return False
         try:
-            self._replay_store.capture_game(
+            self._bind_replay_context(context)
+            capture = (
+                getattr(self._replay_store, "capture_restored_game", None)
+                if restored
+                else self._replay_store.capture_game
+            )
+            if not callable(capture):
+                return False
+            capture(
                 context.lobby.room_code,
                 context.game,
                 revision=context.game_revision,
             )
         except Exception:
+            # If this room has never established a replay that matches its
+            # current authority, later revisions must not be appended to a
+            # stale same-code archive and accidentally make it readable.
+            if not context.replay_readable:
+                context.replay_blocked = True
             return False
+        context.replay_readable = True
         return True
+
+    def _reconcile_restored_replay(self, context: _RoomContext) -> None:
+        """Reconcile independently persisted game and replay authorities.
+
+        A replay is optional, but a stale viewer-specific archive must never
+        become readable through a current membership.  Rooms start disabled
+        and are enabled only after a successful same-state refresh or restart
+        boundary capture.  A waiting room with frames is an impossible pairing
+        and remains replay-blocked for its lifetime.  A replay ahead of game
+        authority is a stronger durability violation and aborts startup.
+        """
+
+        context.replay_readable = False
+        context.replay_blocked = False
+        try:
+            self._bind_replay_context(context)
+            latest_revision = getattr(
+                self._replay_store,
+                "latest_revision",
+                None,
+            )
+            archived_revision = (
+                latest_revision(context.lobby.room_code)
+                if callable(latest_revision)
+                else None
+            )
+        except Exception:
+            context.replay_blocked = True
+            return
+
+        if context.game is None:
+            if archived_revision is not None:
+                context.replay_blocked = True
+            return
+        if (
+            archived_revision is not None
+            and archived_revision > context.game_revision
+        ):
+            raise ControllerPersistenceError(
+                "persisted replay is ahead of room authority"
+            )
+        self._capture_replay(context, restored=True)
+
+    def _bind_replay_context(self, context: _RoomContext) -> None:
+        """Bind a durable archive to the room's non-reusable authority ID.
+
+        In-memory replay stores need only the short room code and therefore do
+        not implement ``bind_room``.  A durable adapter must bind the code to
+        the stable authority row ID before reading or appending frames so a
+        later room that happens to reuse the same six-character code cannot
+        inherit another match's private replay variants.
+        """
+
+        bind_room = getattr(self._replay_store, "bind_room", None)
+        if not callable(bind_room):
+            return
+        room_id = context.authority_room_id
+        if not isinstance(room_id, str) or not room_id:
+            raise ControllerPersistenceError(
+                "durable replay requires a persisted room identity"
+            )
+        bind_room(context.lobby.room_code, room_id)
+
+    def _bind_replay_for_read(self, context: _RoomContext) -> None:
+        """Fail closed before reading an archive through a reusable room code."""
+
+        if context.replay_blocked or not context.replay_readable:
+            raise LanControllerError(
+                "replay_unavailable",
+                "リプレイを安全に読み込めませんでした。",
+            )
+        try:
+            self._bind_replay_context(context)
+        except Exception as exc:
+            raise LanControllerError(
+                "replay_unavailable",
+                "リプレイを安全に読み込めませんでした。",
+            ) from exc
 
     def _discard_replay(self, room_code: str) -> None:
         try:
             self._replay_store.discard_room(room_code)
         except Exception:
             pass
+
+    def _fence_all_rooms(self) -> tuple[OutboundMessage, ...]:
+        """Stop every in-memory room after an uncertain durable commit."""
+
+        closed = self._wire(
+            "room_closed",
+            code="persistence_unavailable",
+            message=(
+                "対局状態を安全に保存できません。サーバー再起動後に"
+                "再接続してください。"
+            ),
+        )
+        sessions = tuple(
+            sorted(self._sessions.values(), key=lambda item: item.connection_id)
+        )
+        room_codes = tuple(self._rooms)
+        self._sessions.clear()
+        self._rooms.clear()
+        for room_code in room_codes:
+            self._discard_replay(room_code)
+        return tuple(
+            OutboundMessage(session.connection_id, closed) for session in sessions
+        )
 
     @staticmethod
     def _is_ai_action_pending(game: Any) -> bool:
@@ -1182,8 +2295,16 @@ class LanServerController:
     def _public_error(exc: Exception) -> tuple[str, str]:
         if isinstance(exc, LanControllerError):
             return exc.code, str(exc)
+        if isinstance(exc, FriendInvitationAuthenticationError):
+            return "authentication_failed", "認証情報を確認できませんでした。"
+        if isinstance(exc, FriendInvitationCapacityError):
+            return "invite_limit", "有効な招待が上限に達しています。"
+        if isinstance(exc, FriendInvitationNotFoundError):
+            return "invitation_not_found", "招待を確認できませんでした。"
+        if isinstance(exc, FriendInvitationError):
+            return "invalid_request", "招待情報が不正です。"
         if isinstance(exc, LobbyAuthenticationError):
-            return "authentication_failed", "再接続情報を確認できませんでした。"
+            return "authentication_failed", "認証情報を確認できませんでした。"
         if isinstance(exc, LobbyCapacityError):
             return "room_full", "プレイヤー席が満員です。"
         if isinstance(exc, LobbyPermissionError):

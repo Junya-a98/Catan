@@ -49,26 +49,53 @@ HARBOR_ROAD_CLEARANCE = 13
 HARBOR_TILE_CLEARANCE = 0
 HARBOR_CONNECTOR_LEAD_DISTANCE = 38
 
+STANDARD_TOPOLOGY_ID = "standard_19_v1"
+OUTER_RING_TOPOLOGY_ID = "outer_ring_37_v1"
+SUPPORTED_TOPOLOGY_IDS = frozenset(
+    {STANDARD_TOPOLOGY_ID, OUTER_RING_TOPOLOGY_ID}
+)
+OUTER_RING_HEX_RADIUS = 35
+
 
 def _load_font(size):
     return get_font(size)
 
 
 class GameBoard:
-    def __init__(self, mode="constrained", seed=None, *, custom_map=None):
+    def __init__(
+        self,
+        mode="constrained",
+        seed=None,
+        *,
+        custom_map=None,
+        topology_id=STANDARD_TOPOLOGY_ID,
+    ):
         if mode == "balanced":
             mode = "constrained"
         if mode not in ("constrained", "fully_random", "custom"):
             raise ValueError(f"Unsupported board mode: {mode}")
+        if topology_id not in SUPPORTED_TOPOLOGY_IDS:
+            raise ValueError(f"Unsupported board topology: {topology_id}")
         if mode == "custom":
             if not isinstance(custom_map, CustomMapSpec):
                 raise ValueError("custom mode requires a CustomMapSpec")
+            if topology_id != STANDARD_TOPOLOGY_ID:
+                raise ValueError("custom mode supports only the standard topology")
         elif custom_map is not None:
             raise ValueError("custom_map is only valid in custom mode")
 
         self.mode = mode
         self.seed = seed
         self.custom_map = custom_map
+        self.topology_id = topology_id
+        self.board_radius = (
+            3 if topology_id == OUTER_RING_TOPOLOGY_ID else 2
+        )
+        self.hex_radius = (
+            OUTER_RING_HEX_RADIUS
+            if topology_id == OUTER_RING_TOPOLOGY_ID
+            else HEX_RADIUS
+        )
         self.rng = random.Random(seed)
         self.roads = []
         self.tiles = []
@@ -86,7 +113,7 @@ class GameBoard:
             self.rng.shuffle(resources)
 
         axial_coords = []
-        radius = 2
+        radius = self.board_radius
         for q in range(-radius, radius + 1):
             r_min = max(-radius, -q - radius)
             r_max = min(radius, -q + radius)
@@ -102,11 +129,17 @@ class GameBoard:
         for q, r in axial_coords:
             x, y = self.axial_to_pixel(q, r)
             custom_tile = custom_tiles.get((q, r))
-            resource = (
-                custom_tile.resource if custom_tile is not None else resources.pop(0)
-            )
+            if custom_tile is not None:
+                resource = custom_tile.resource
+            elif (
+                self.topology_id == OUTER_RING_TOPOLOGY_ID
+                and (q, r) == (0, 0)
+            ):
+                resource = ResourceType.DESERT
+            else:
+                resource = resources.pop(0)
             number = custom_tile.number if custom_tile is not None else None
-            tile = HexTile(x, y, resource, number)
+            tile = HexTile(x, y, resource, number, radius=self.hex_radius)
             tile.axial = (q, r)
             self.tiles.append(tile)
             if resource == ResourceType.DESERT:
@@ -119,6 +152,14 @@ class GameBoard:
         self._create_harbors()
 
     def _build_resource_pool(self):
+        if self.topology_id == OUTER_RING_TOPOLOGY_ID:
+            return [
+                *([ResourceType.WOOD] * 8),
+                *([ResourceType.SHEEP] * 8),
+                *([ResourceType.WHEAT] * 8),
+                *([ResourceType.BRICK] * 6),
+                *([ResourceType.ORE] * 6),
+            ]
         resources = [ResourceType.DESERT]
         for resource in [res for res in ResourceType if res != ResourceType.DESERT]:
             if resource in (ResourceType.BRICK, ResourceType.ORE):
@@ -128,7 +169,8 @@ class GameBoard:
         return resources
 
     def _build_number_pool(self):
-        return [2, 3, 3, 4, 4, 5, 5, 6, 6, 8, 8, 9, 9, 10, 10, 11, 11, 12]
+        standard = [2, 3, 3, 4, 4, 5, 5, 6, 6, 8, 8, 9, 9, 10, 10, 11, 11, 12]
+        return standard * (2 if self.topology_id == OUTER_RING_TOPOLOGY_ID else 1)
 
     def _assign_numbers(self):
         land_tiles = [
@@ -205,9 +247,10 @@ class GameBoard:
                 high_number_resources[tile.resource_type] = (
                     high_number_resources.get(tile.resource_type, 0) + 1
                 )
+        high_number_limit = 2 if self.topology_id == OUTER_RING_TOPOLOGY_ID else 1
         for count in high_number_resources.values():
-            if count > 1:
-                score += (count - 1) * 1800
+            if count > high_number_limit:
+                score += (count - high_number_limit) * 1800
 
         resource_pips = {}
         for tile, number in assignment.items():
@@ -222,11 +265,18 @@ class GameBoard:
             actual_total = sum(pip_values)
             score += int((actual_total - expected_total) ** 2 * 5)
 
-            strongest_two = sorted(pip_values, reverse=True)[:2]
-            if sum(strongest_two) > 8:
-                score += (sum(strongest_two) - 8) * 36
-            if pip_values.count(5) > 1:
-                score += (pip_values.count(5) - 1) * 1800
+            if self.topology_id == OUTER_RING_TOPOLOGY_ID:
+                strongest = sorted(pip_values, reverse=True)[:4]
+                strongest_limit = 16
+                red_token_limit = 2
+            else:
+                strongest = sorted(pip_values, reverse=True)[:2]
+                strongest_limit = 8
+                red_token_limit = 1
+            if sum(strongest) > strongest_limit:
+                score += (sum(strongest) - strongest_limit) * 36
+            if pip_values.count(5) > red_token_limit:
+                score += (pip_values.count(5) - red_token_limit) * 1800
 
         for tile, number in assignment.items():
             for neighbor in adjacency[tile]:
@@ -241,8 +291,8 @@ class GameBoard:
         return score
 
     def axial_to_pixel(self, q, r):
-        x = BOARD_CENTER_X + math.sqrt(3) * HEX_RADIUS * (q + r / 2)
-        y = BOARD_CENTER_Y + 1.5 * HEX_RADIUS * r
+        x = BOARD_CENTER_X + math.sqrt(3) * self.hex_radius * (q + r / 2)
+        y = BOARD_CENTER_Y + 1.5 * self.hex_radius * r
         return x, y
 
     def _get_hex_corners(self, cx, cy, radius):
@@ -257,7 +307,7 @@ class GameBoard:
 
     def _create_nodes_for_tiles(self):
         for tile in self.tiles:
-            corners = self._get_hex_corners(tile.x, tile.y, HEX_RADIUS)
+            corners = self._get_hex_corners(tile.x, tile.y, self.hex_radius)
             tile.corners = []
             for cx, cy in corners:
                 node = self.find_or_create_node(cx, cy)
@@ -289,10 +339,13 @@ class GameBoard:
         ]
 
     def _create_harbors(self):
-        harbor_types = (
-            list(self.custom_map.harbors)
-            if self.custom_map is not None
-            else [
+        if self.custom_map is not None:
+            harbor_types = list(self.custom_map.harbors)
+        elif self.topology_id == OUTER_RING_TOPOLOGY_ID:
+            harbor_types = [
+                None,
+                None,
+                None,
                 None,
                 None,
                 None,
@@ -303,7 +356,18 @@ class GameBoard:
                 ResourceType.BRICK,
                 ResourceType.ORE,
             ]
-        )
+        else:
+            harbor_types = [
+                None,
+                None,
+                None,
+                None,
+                ResourceType.WOOD,
+                ResourceType.SHEEP,
+                ResourceType.WHEAT,
+                ResourceType.BRICK,
+                ResourceType.ORE,
+            ]
 
         sorted_edges = sorted(
             self.perimeter_edges,
@@ -315,8 +379,9 @@ class GameBoard:
 
         used_indices = []
         edge_count = len(sorted_edges)
-        for index in range(9):
-            candidate = round(index * edge_count / 9)
+        harbor_count = len(harbor_types)
+        for index in range(harbor_count):
+            candidate = round(index * edge_count / harbor_count)
             if candidate in used_indices:
                 candidate = (candidate + 1) % edge_count
             used_indices.append(candidate)
@@ -538,7 +603,7 @@ class GameBoard:
         return self._rect_overlaps_circle(
             visual_rect,
             (tile.x, tile.y),
-            HEX_RADIUS + HARBOR_TILE_CLEARANCE,
+            getattr(tile, "radius", self.hex_radius) + HARBOR_TILE_CLEARANCE,
         )
 
     def _get_harbor_protected_nodes(self, harbor):
@@ -587,7 +652,10 @@ class GameBoard:
         return {
             "building_rects": building_rects,
             "road_lines": road_lines,
-            "tile_centers": tuple((tile.x, tile.y) for tile in self.tiles),
+            "tile_circles": tuple(
+                (tile.x, tile.y, getattr(tile, "radius", self.hex_radius))
+                for tile in self.tiles
+            ),
             "own_building_rects": (
                 self._get_harbor_building_exclusion_rect(harbor.node1),
                 self._get_harbor_building_exclusion_rect(harbor.node2),
@@ -640,10 +708,10 @@ class GameBoard:
         tile_conflicts = sum(
             self._rect_overlaps_circle(
                 visual_rect,
-                tile_center,
-                HEX_RADIUS + HARBOR_TILE_CLEARANCE,
+                tile_circle[:2],
+                tile_circle[2] + HARBOR_TILE_CLEARANCE,
             )
-            for tile_center in clearance_context["tile_centers"]
+            for tile_circle in clearance_context["tile_circles"]
         )
 
         badge_probe = visual_rect.inflate(HARBOR_BADGE_GAP * 2, HARBOR_BADGE_GAP * 2)
@@ -717,10 +785,10 @@ class GameBoard:
         if any(
             self._rect_overlaps_circle(
                 visual_rect,
-                tile_center,
-                HEX_RADIUS + HARBOR_TILE_CLEARANCE,
+                tile_circle[:2],
+                tile_circle[2] + HARBOR_TILE_CLEARANCE,
             )
-            for tile_center in clearance_context["tile_centers"]
+            for tile_circle in clearance_context["tile_circles"]
         ):
             return False
 
@@ -1248,13 +1316,16 @@ class GameBoard:
             pygame.draw.polygon(screen, (83, 139, 145), points, 4)
             pygame.draw.polygon(screen, (180, 211, 196), points, 1)
             center = (round(tile.x), round(tile.y))
-            for radius, alpha_color in (
-                (36, (49, 91, 99)),
-                (25, (65, 112, 116)),
-                (13, (91, 139, 137)),
+            scale = getattr(tile, "radius", self.hex_radius) / HEX_RADIUS
+            for fog_radius, alpha_color in (
+                (round(36 * scale), (49, 91, 99)),
+                (round(25 * scale), (65, 112, 116)),
+                (round(13 * scale), (91, 139, 137)),
             ):
-                pygame.draw.circle(screen, alpha_color, center, radius, 2)
-            unknown = _load_font(27).render("?", True, (216, 230, 214))
+                pygame.draw.circle(screen, alpha_color, center, fog_radius, 2)
+            unknown = _load_font(max(18, round(27 * scale))).render(
+                "?", True, (216, 230, 214)
+            )
             screen.blit(unknown, unknown.get_rect(center=center))
 
         self._draw_harbors(screen, visible_harbors=visible_harbors)

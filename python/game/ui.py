@@ -203,12 +203,13 @@ def _draw_build_status(screen, x, y, width, label_font, detail_font, item):
 
 
 def _get_hex_vertices(tile):
+    radius = getattr(tile, "radius", HEX_RADIUS)
     vertices = []
     for index in range(6):
         angle_deg = 60 * index - 30
         angle_rad = math.pi / 180 * angle_deg
-        vertex_x = tile.x + HEX_RADIUS * math.cos(angle_rad)
-        vertex_y = tile.y + HEX_RADIUS * math.sin(angle_rad)
+        vertex_x = tile.x + radius * math.cos(angle_rad)
+        vertex_y = tile.y + radius * math.sin(angle_rad)
         vertices.append((int(vertex_x), int(vertex_y)))
     return vertices
 
@@ -314,7 +315,7 @@ def draw_board_highlights(
 
     for tile in tile_highlights:
         distance = math.hypot(mouse_x - tile.x, mouse_y - tile.y)
-        if distance <= HEX_RADIUS and distance < best_distance:
+        if distance <= getattr(tile, "radius", HEX_RADIUS) and distance < best_distance:
             best_distance = distance
             hover_text = "ここへ盗賊を移動"
 

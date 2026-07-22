@@ -30,7 +30,9 @@ from game.bank import BANK_RESOURCE_COUNT, RESOURCE_TYPES
 from game.building import BuildingType
 from game.constants import MAX_VICTORY_POINT_TARGET, MIN_VICTORY_POINT_TARGET
 from game.hex_tile import get_token_pip_count
+from game.resource_ledger import ResourceLedgerError
 from game.resources import ResourceType
+from game.variant import VariantConfig
 
 
 DEFAULT_GAME_COUNT = 20
@@ -436,6 +438,7 @@ def _prepare_game(
     player_count: int,
     victory_target: int,
     personalities: Iterable[str] | None = None,
+    variant_config: VariantConfig | None = None,
 ) -> _HeadlessCatanGame:
     personality_lineup = normalise_personalities(personalities, player_count)
     random.seed(match_seed)
@@ -444,6 +447,7 @@ def _prepare_game(
         board_seed=board_seed,
         ai_player_count=0,
         ai_action_delay_ms=0,
+        variant_config=variant_config,
     )
     game.ai_player_count = max(0, player_count - 1)
     game.configure_players(
@@ -573,6 +577,12 @@ def _validate_completed_state(game: _HeadlessCatanGame) -> tuple[str, ...]:
     errors = []
     players = set(game.players)
 
+    for player in game.players:
+        try:
+            player.resource_ledger.available_map()
+        except ResourceLedgerError as exc:
+            errors.append(f"{player.name}: resource ledger {exc}")
+
     for resource_type in RESOURCE_TYPES:
         total = game.bank.available(resource_type) + sum(
             player.resources[resource_type] for player in game.players
@@ -636,6 +646,7 @@ def run_match(
     max_turns: int = DEFAULT_MAX_TURNS,
     max_action_steps: int = DEFAULT_MAX_ACTION_STEPS,
     personalities: Iterable[str] | None = None,
+    variant_config: VariantConfig | None = None,
 ) -> MatchResult:
     """Run one deterministic AI-only match with no presentation delays.
 
@@ -657,6 +668,8 @@ def run_match(
         max_action_steps=max_action_steps,
     )
     personality_lineup = normalise_personalities(personalities, player_count)
+    if variant_config is not None and not isinstance(variant_config, VariantConfig):
+        raise TypeError("variant_config must be a VariantConfig")
 
     # Game rules currently use the stdlib random module for dice, stealing,
     # and the development deck.  Serialize simulations and restore caller
@@ -671,6 +684,7 @@ def run_match(
                 player_count=player_count,
                 victory_target=victory_target,
                 personalities=personality_lineup,
+                variant_config=variant_config,
             )
             action_steps = 0
             reason = "stalled"

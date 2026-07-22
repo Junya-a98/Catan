@@ -1,4 +1,5 @@
 import base64
+import hashlib
 import json
 import re
 
@@ -10,6 +11,7 @@ from game.game_board import GameBoard
 from game.house_rules import HouseRules
 from game.lan_lobby import (
     DEFAULT_SEAT_RESERVATION_SECONDS,
+    MAX_LOBBY_MEMBERS,
     LobbyAuthenticationError,
     LobbyCapacityError,
     LobbyPermissionError,
@@ -293,6 +295,41 @@ def test_player_capacity_counts_reserved_seats_but_never_spectators():
         room.join_player(display_name="Too Late", connection_id="conn-late")
 
 
+def test_lobby_member_limit_accepts_exact_boundary_and_rejects_atomically():
+    room, _host, _clock, tokens = make_room(player_count=2)
+    for index in range(MAX_LOBBY_MEMBERS - 1):
+        room.join_spectator(
+            display_name=f"Viewer {index}",
+            connection_id=f"conn-viewer-{index}",
+        )
+
+    assert len(room._members) == MAX_LOBBY_MEMBERS
+    assert room.public_snapshot()["spectators"] == MAX_LOBBY_MEMBERS - 1
+    revision_before = room.revision
+    token_calls_before = tokens.calls
+    authority_before = room.to_authority_document(wall_clock_ms=1_000_000)
+
+    attempts = (
+        lambda: room.join_spectator(
+            display_name="Viewer Over Limit",
+            connection_id="conn-viewer-over-limit",
+        ),
+        lambda: room.join_player(
+            display_name="Player Over Limit",
+            connection_id="conn-player-over-limit",
+        ),
+    )
+    for attempt in attempts:
+        with pytest.raises(LobbyCapacityError, match="membership limit"):
+            attempt()
+        assert room.revision == revision_before
+        assert tokens.calls == token_calls_before
+        assert (
+            room.to_authority_document(wall_clock_ms=1_000_000)
+            == authority_before
+        )
+
+
 def test_only_host_can_start_after_every_seat_is_connected_and_ready():
     room, host, _clock, _tokens = make_room(player_count=3)
     second = room.join_player(display_name="Second", connection_id="conn-second")
@@ -379,6 +416,196 @@ def test_reconnect_token_restores_same_member_seat_and_ready_state():
             reconnect_token=player.reconnect_token,
             connection_id="conn-hijack",
         )
+
+
+def test_rotating_reconnect_replaces_current_and_retains_presented_token_as_previous():
+    room, _host, clock, tokens = make_room(player_count=2)
+    player = room.join_player(display_name="Player", connection_id="conn-old")
+    original_token = player.reconnect_token
+    room.disconnect("conn-old")
+    revision_before = room.revision
+
+    rotated = room.reconnect_rotating(
+        reconnect_token=original_token,
+        connection_id="conn-new",
+        previous_token_grace_seconds=30.0,
+    )
+
+    assert rotated.member_id == player.member_id
+    assert rotated.seat == player.seat
+    assert rotated.reconnect_token is not None
+    assert rotated.reconnect_token != original_token
+    assert rotated.revision == room.revision == revision_before + 1
+    member = room._members[player.member_id]
+    assert (
+        member.reconnect_token_hash
+        == hashlib.sha256(rotated.reconnect_token.encode("ascii")).hexdigest()
+    )
+    assert (
+        member.previous_reconnect_token_hash
+        == hashlib.sha256(original_token.encode("ascii")).hexdigest()
+    )
+    assert member.previous_reconnect_token_expires_at == clock.value + 30.0
+    assert tokens.calls == 3
+
+
+def test_previous_token_rotation_retry_keeps_original_absolute_grace_deadline():
+    room, _host, clock, _tokens = make_room(player_count=2)
+    player = room.join_player(display_name="Player", connection_id="conn-old")
+    original_token = player.reconnect_token
+    room.disconnect("conn-old")
+    first = room.reconnect_rotating(
+        reconnect_token=original_token,
+        connection_id="conn-first",
+        previous_token_grace_seconds=30.0,
+    )
+    original_deadline = room._members[
+        player.member_id
+    ].previous_reconnect_token_expires_at
+    room.disconnect("conn-first")
+    clock.advance(10.0)
+
+    retry = room.reconnect_rotating(
+        reconnect_token=original_token,
+        connection_id="conn-retry",
+        previous_token_grace_seconds=300.0,
+    )
+
+    assert retry.reconnect_token is not None
+    assert retry.reconnect_token != first.reconnect_token
+    member = room._members[player.member_id]
+    assert (
+        member.previous_reconnect_token_hash
+        == hashlib.sha256(original_token.encode("ascii")).hexdigest()
+    )
+    assert member.previous_reconnect_token_expires_at == original_deadline
+    assert member.previous_reconnect_token_expires_at == clock.value + 20.0
+
+
+def test_expired_previous_rotation_token_is_rejected_while_current_token_works():
+    room, _host, clock, _tokens = make_room(player_count=2)
+    player = room.join_player(display_name="Player", connection_id="conn-old")
+    original_token = player.reconnect_token
+    room.disconnect("conn-old")
+    rotated = room.reconnect_rotating(
+        reconnect_token=original_token,
+        connection_id="conn-first",
+        previous_token_grace_seconds=5.0,
+    )
+    room.disconnect("conn-first")
+    clock.advance(5.0)
+
+    with pytest.raises(LobbyAuthenticationError, match="expired reconnect token"):
+        room.reconnect_rotating(
+            reconnect_token=original_token,
+            connection_id="conn-expired",
+        )
+
+    current = room.reconnect_rotating(
+        reconnect_token=rotated.reconnect_token,
+        connection_id="conn-current",
+        previous_token_grace_seconds=7.0,
+    )
+    assert current.member_id == player.member_id
+    assert current.reconnect_token not in {None, rotated.reconnect_token}
+
+
+def test_confirming_current_rotation_revokes_previous_and_is_idempotent():
+    room, _host, _clock, _tokens = make_room(player_count=2)
+    player = room.join_player(display_name="Player", connection_id="conn-old")
+    original_token = player.reconnect_token
+    room.disconnect("conn-old")
+    rotated = room.reconnect_rotating(
+        reconnect_token=original_token,
+        connection_id="conn-new",
+    )
+    revision_before = room.revision
+
+    assert (
+        room.confirm_reconnect_rotation(
+            connection_id="conn-new",
+            reconnect_token=rotated.reconnect_token,
+        )
+        is True
+    )
+    assert room.revision == revision_before
+    member = room._members[player.member_id]
+    assert member.previous_reconnect_token_hash is None
+    assert member.previous_reconnect_token_expires_at is None
+    assert (
+        room.confirm_reconnect_rotation(
+            connection_id="conn-new",
+            reconnect_token=rotated.reconnect_token,
+        )
+        is False
+    )
+    assert room.revision == revision_before
+
+    room.disconnect("conn-new")
+    with pytest.raises(LobbyAuthenticationError, match="expired reconnect token"):
+        room.reconnect_rotating(
+            reconnect_token=original_token,
+            connection_id="conn-previous",
+        )
+
+
+def test_rotation_confirmation_rejects_previous_token_without_mutating_state():
+    room, _host, _clock, _tokens = make_room(player_count=2)
+    player = room.join_player(display_name="Player", connection_id="conn-old")
+    original_token = player.reconnect_token
+    room.disconnect("conn-old")
+    rotated = room.reconnect_rotating(
+        reconnect_token=original_token,
+        connection_id="conn-new",
+    )
+    member = room._members[player.member_id]
+    previous_hash = member.previous_reconnect_token_hash
+    previous_deadline = member.previous_reconnect_token_expires_at
+
+    with pytest.raises(LobbyAuthenticationError, match="expired reconnect token"):
+        room.confirm_reconnect_rotation(
+            connection_id="conn-new",
+            reconnect_token=original_token,
+        )
+
+    assert member.previous_reconnect_token_hash == previous_hash
+    assert member.previous_reconnect_token_expires_at == previous_deadline
+    assert (
+        room.confirm_reconnect_rotation(
+            connection_id="conn-new",
+            reconnect_token=rotated.reconnect_token,
+        )
+        is True
+    )
+
+
+def test_lan_reconnect_keeps_the_original_token_stable_across_repeated_disconnects():
+    room, _host, clock, tokens = make_room(player_count=2)
+    player = room.join_player(display_name="Player", connection_id="conn-old")
+    original_token = player.reconnect_token
+    room.disconnect("conn-old")
+
+    first = room.reconnect(
+        reconnect_token=original_token,
+        connection_id="conn-first",
+    )
+    room.disconnect("conn-first")
+    clock.advance(1.0)
+    second = room.reconnect(
+        reconnect_token=original_token,
+        connection_id="conn-second",
+    )
+
+    assert first.reconnect_token is None
+    assert second.reconnect_token is None
+    member = room._members[player.member_id]
+    assert (
+        member.reconnect_token_hash
+        == hashlib.sha256(original_token.encode("ascii")).hexdigest()
+    )
+    assert member.previous_reconnect_token_hash is None
+    assert member.previous_reconnect_token_expires_at is None
+    assert tokens.calls == 2
 
 
 def test_expired_reservations_are_pruned_once_and_token_cannot_reconnect():
