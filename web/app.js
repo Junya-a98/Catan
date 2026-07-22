@@ -233,6 +233,7 @@ const elements = Object.fromEntries(
     "create-form",
     "join-form",
     "invite-prefill-note",
+    "decline-claimed-invitation",
     "create-room-protection",
     "invite-only-room",
     "open-room",
@@ -826,6 +827,15 @@ function invitationPublicMetadata(
   { requireToken = false, requireInvitationId = false } = {},
 ) {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const allowedKeys = new Set([
+    "room_code",
+    "role",
+    "issued_at_ms",
+    "expires_at_ms",
+    ...(requireToken ? ["token"] : []),
+    ...(requireInvitationId ? ["invitation_id"] : []),
+  ]);
+  if (!Object.keys(value).every((key) => allowedKeys.has(key))) return null;
   const roomCode = normalizeInvitationRoomCode(value.room_code);
   const role = INVITATION_ROLES.has(value.role) ? value.role : null;
   const expiresAtMs = normalizeInvitationExpiry(value.expires_at_ms);
@@ -1149,6 +1159,7 @@ function syncClaimedInvitationForm() {
   const playerRole = elements["join-player-role"];
   const spectatorRole = elements["join-spectator-role"];
   const note = elements["invite-prefill-note"];
+  const decline = elements["decline-claimed-invitation"];
   if (!form || !roomCodeInput || !playerRole || !spectatorRole || !note) return;
   const invitation = state.claimedInvitation;
   const claimed = Boolean(invitation);
@@ -1156,6 +1167,7 @@ function syncClaimedInvitationForm() {
   playerRole.disabled = claimed;
   spectatorRole.disabled = claimed;
   form.classList.toggle("invitation-claimed", claimed);
+  if (decline) decline.hidden = !claimed;
   if (!claimed) return;
   roomCodeInput.value = invitation.room_code;
   playerRole.checked = invitation.role === "player";
@@ -1199,6 +1211,9 @@ function clearClaimedInvitation({ preserveRoomCode = true } = {}) {
     note.textContent = "招待コードを入力しました。表示名と参加方法を確認してから参加してください。";
     note.hidden = !normalizeInvitationRoomCode(roomCodeInput?.value);
   }
+  if (elements["decline-claimed-invitation"]) {
+    elements["decline-claimed-invitation"].hidden = true;
+  }
 }
 
 async function claimCapturedInvitation(captured, request = api) {
@@ -1223,6 +1238,36 @@ async function claimCapturedInvitation(captured, request = api) {
   } finally {
     token = null;
     body = null;
+  }
+}
+
+async function resumeFriendInvitationFromCookie(request = api) {
+  const document = await request("/api/invitations/resume", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: "{}",
+  });
+  return invitationPublicMetadata(document?.invitation);
+}
+
+async function declineClaimedInvitation(request = api) {
+  if (!state.claimedInvitation) return false;
+  const button = elements["decline-claimed-invitation"];
+  if (button) button.disabled = true;
+  try {
+    await request("/api/invitations/claim", {
+      method: "DELETE",
+      headers: { "Content-Type": "application/json" },
+      body: "{}",
+    });
+    clearClaimedInvitation({ preserveRoomCode: true });
+    showToast("招待を使わず、通常の参加方法へ戻りました。");
+    return true;
+  } catch (_error) {
+    showToast("招待を破棄できませんでした。通信を確認してもう一度お試しください。", true);
+    return false;
+  } finally {
+    if (button) button.disabled = false;
   }
 }
 
@@ -1688,6 +1733,7 @@ async function confirmRoomResumeAfterWelcome(document, request = api) {
 }
 
 async function startBrowserSession({
+  allowInvitationResume = true,
   allowRoomResume = true,
   resetStaleRoom = false,
 } = {}) {
@@ -1695,7 +1741,16 @@ async function startBrowserSession({
   const document = await api("/api/session", { method: "POST" });
   processEvents(document.events || [], { animateLive: false });
   await confirmRoomResumeAfterWelcome(document);
-  if (!state.welcome && allowRoomResume) {
+  let restoredInvitation = null;
+  if (
+    !state.welcome
+    && allowInvitationResume
+    && roomAccessTransportAllowed()
+  ) {
+    restoredInvitation = await resumeFriendInvitationFromCookie();
+    if (restoredInvitation) applyClaimedInvitation(restoredInvitation);
+  }
+  if (!state.welcome && !restoredInvitation && allowRoomResume) {
     await resumeRoomFromCookie();
   }
   connectWebSocket();
@@ -7138,6 +7193,9 @@ elements["join-form"].addEventListener("submit", async (event) => {
     if (!handleRoomAccessThrownError(error)) showToast(error.message, true);
   }
 });
+elements["decline-claimed-invitation"].addEventListener("click", () => {
+  void declineClaimedInvitation();
+});
 
 elements["room-access-form"].addEventListener("submit", async (event) => {
   event.preventDefault();
@@ -7354,6 +7412,7 @@ async function initialise() {
   const invitationCode = applyInvitationFromLocation();
   try {
     await startBrowserSession({
+      allowInvitationResume: !capturedInvitation.present,
       allowRoomResume: !invitationCode && !capturedInvitation.present,
     });
     if (capturedInvitation.present) {

@@ -1,9 +1,11 @@
 import json
 
+import pytest
+
 from game.lan_controller import LanServerController
 from game.network_protocol import NETWORK_PROTOCOL_VERSION, build_game_command
 from game.server_state import SQLiteRoomAuthorityStore
-from game.web_gateway import WebGateway
+from game.web_gateway import WebGateway, WebGatewayError
 
 
 PASSPHRASE = "persistent protected harbor room"
@@ -52,6 +54,99 @@ def _member_id(gateway, controller, browser_token):
 
 def _paths(tmp_path):
     return tmp_path / "authority.sqlite3", tmp_path / "authority.key"
+
+
+def test_friend_claim_resumes_in_a_new_gateway_and_consumes_once(tmp_path):
+    database, key = _paths(tmp_path)
+    store_a = SQLiteRoomAuthorityStore(database, key_path=key)
+    try:
+        controller_a = _new_controller(store_a)
+        gateway_a = _new_gateway(controller_a)
+        host = gateway_a.open_session(client_key="127.0.0.1")
+        created = gateway_a.handle(
+            host,
+            _message(
+                "create_room",
+                display_name="Persistent Host",
+                settings={
+                    "player_count": 2,
+                    "victory_target": 10,
+                    "board_mode": "constrained",
+                    "board_seed": 4242,
+                },
+            ),
+            client_key="127.0.0.1",
+        )
+        room_code = _session_welcome(created)["room_code"]
+        invitation = gateway_a.issue_friend_invitation(
+            host,
+            role="player",
+            client_key="127.0.0.1",
+            protected_room_access_allowed=True,
+        )
+        guest = gateway_a.open_session(client_key="127.0.0.2")
+        claimed = gateway_a.claim_friend_invitation(
+            guest,
+            room_code=room_code,
+            invite_token=invitation["token"],
+            client_key="127.0.0.2",
+            protected_room_access_allowed=True,
+        )
+        credential = gateway_a.friend_invitation_claim_credential(
+            guest,
+            client_key="127.0.0.2",
+        )
+        assert credential is not None
+        claim_token = credential.claim_token
+        assert claim_token not in json.dumps(claimed)
+        assert invitation["token"] not in repr(gateway_a._sessions[guest])
+        assert claim_token not in repr(gateway_a._sessions[guest])
+    finally:
+        store_a.close()
+
+    store_b = SQLiteRoomAuthorityStore(database, key_path=key)
+    try:
+        controller_b = _new_controller(store_b, wall_clock_ms=WALL_CLOCK_MS + 1_000)
+        gateway_b = _new_gateway(controller_b)
+        guest_b = gateway_b.open_session(client_key="127.0.0.2")
+        restored = gateway_b.resume_friend_invitation_claim(
+            guest_b,
+            room_code=room_code,
+            claim_token=claim_token,
+            client_key="127.0.0.2",
+            protected_room_access_allowed=True,
+        )
+        assert restored == claimed
+        assert claim_token not in json.dumps(restored)
+
+        joined = gateway_b.handle(
+            guest_b,
+            _message(
+                "join_room",
+                room_code=room_code,
+                display_name="Restarted Guest",
+            ),
+            client_key="127.0.0.2",
+            protected_room_access_allowed=True,
+        )
+        assert _session_welcome(joined)["seat_index"] == 1
+        assert gateway_b.friend_invitation_claim_credential(
+            guest_b,
+            client_key="127.0.0.2",
+        ) is None
+
+        replay = gateway_b.open_session(client_key="127.0.0.3")
+        with pytest.raises(WebGatewayError) as consumed:
+            gateway_b.resume_friend_invitation_claim(
+                replay,
+                room_code=room_code,
+                claim_token=claim_token,
+                client_key="127.0.0.3",
+                protected_room_access_allowed=True,
+            )
+        assert getattr(consumed.value, "code", None) == "authentication_failed"
+    finally:
+        store_b.close()
 
 
 def test_protected_waiting_room_reconnects_through_reopened_store(tmp_path):

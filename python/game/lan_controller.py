@@ -36,6 +36,7 @@ from game.friend_invitation import (
     FriendInvitationBook,
     FriendInvitationCapacityError,
     FriendInvitationClaim,
+    FriendInvitationClaimGrant,
     FriendInvitationError,
     FriendInvitationGrant,
     FriendInvitationNotFoundError,
@@ -376,9 +377,7 @@ class LanServerController:
             ControllerRoomAuthority(
                 lobby=lobby_document,
                 match=match,
-                friend_invitations=(
-                    context.friend_invitations.to_authority_document()
-                ),
+                friend_invitations=(context.friend_invitations.to_authority_document()),
             )
         )
 
@@ -520,9 +519,7 @@ class LanServerController:
                     for member in normalized_authority["lobby"]["members"]
                     if member["reservation_expires_at_ms"] is not None
                 )
-                normalized_expiry = max(
-                    (record.expires_at_ms, *reservation_deadlines)
-                )
+                normalized_expiry = max((record.expires_at_ms, *reservation_deadlines))
                 normalized = self._state_store.update_room(
                     record.room_id,
                     expected_generation=record.generation,
@@ -573,9 +570,7 @@ class LanServerController:
         match = authority.match
         if match is None:
             if lobby.phase is not RoomPhase.WAITING:
-                raise ControllerPersistenceError(
-                    "started lobby has no persisted match"
-                )
+                raise ControllerPersistenceError("started lobby has no persisted match")
             return context
         if lobby.phase is not RoomPhase.STARTED:
             raise ControllerPersistenceError("waiting lobby contains a match")
@@ -640,15 +635,14 @@ class LanServerController:
         """Ensure a valid save cannot override the public room contract."""
 
         players = tuple(getattr(game, "players", ()))
-        expected_ai = (False,) * (
-            settings.player_count - settings.ai_player_count
-        ) + (True,) * settings.ai_player_count
+        expected_ai = (False,) * (settings.player_count - settings.ai_player_count) + (
+            True,
+        ) * settings.ai_player_count
         actual_ai = tuple(bool(getattr(player, "is_ai", False)) for player in players)
         if (
             len(players) != settings.player_count
             or actual_ai != expected_ai
-            or getattr(game, "victory_point_target", None)
-            != settings.victory_target
+            or getattr(game, "victory_point_target", None) != settings.victory_target
             or getattr(game, "board_mode", None) != settings.board_mode
             or getattr(game, "board_seed", None) != settings.board_seed
             or getattr(game, "custom_map_spec", None) != settings.custom_map
@@ -796,15 +790,11 @@ class LanServerController:
         try:
             for room_code, context in tuple(self._rooms.items()):
                 invitations_before = deepcopy(context.friend_invitations)
-                if context.friend_invitations.prune_expired(
-                    now_ms=self._now_ms()
-                ):
+                if context.friend_invitations.prune_expired(now_ms=self._now_ms()):
                     try:
                         self._persist_existing_context(
                             context,
-                            preserve_expires_at_ms=(
-                                context.authority_expires_at_ms
-                            ),
+                            preserve_expires_at_ms=(context.authority_expires_at_ms),
                         )
                     except Exception:
                         context.friend_invitations = invitations_before
@@ -928,9 +918,7 @@ class LanServerController:
                         "対局開始後はプレイヤーを招待できません。",
                     )
                 if context.lobby.is_full:
-                    raise LanControllerError(
-                        "room_full", "プレイヤー席が満員です。"
-                    )
+                    raise LanControllerError("room_full", "プレイヤー席が満員です。")
             invitations_before = deepcopy(context.friend_invitations)
             grant = context.friend_invitations.issue(
                 role,
@@ -975,9 +963,125 @@ class LanServerController:
                 ) from exc
             raise
         except FriendInvitationError as exc:
+            raise LanControllerError("invalid_request", "招待情報が不正です。") from exc
+
+    def begin_friend_invitation_claim(
+        self,
+        room_code: str,
+        invite_token: object,
+    ) -> FriendInvitationClaimGrant:
+        """Persist a restart-safe claim while keeping the raw invite private."""
+
+        context: _RoomContext | None = None
+        invitations_before: FriendInvitationBook | None = None
+        try:
+            if self._persistence_failed:
+                raise self._persistence_unavailable()
+            try:
+                context = self._room(room_code)
+            except LanControllerError as exc:
+                if exc.code == "room_not_found":
+                    raise FriendInvitationAuthenticationError(
+                        "friend invitation could not be verified"
+                    ) from exc
+                raise
+            invitations_before = deepcopy(context.friend_invitations)
+            claim = context.friend_invitations.begin_claim(
+                invite_token,
+                now_ms=self._now_ms(),
+            )
+            self._persist_existing_context(
+                context,
+                preserve_expires_at_ms=context.authority_expires_at_ms,
+            )
+            return claim
+        except FriendInvitationAuthenticationError as exc:
+            if context is not None and invitations_before is not None:
+                context.friend_invitations = invitations_before
             raise LanControllerError(
-                "invalid_request", "招待情報が不正です。"
+                "authentication_failed", "認証情報を確認できませんでした。"
             ) from exc
+        except FriendInvitationError as exc:
+            if context is not None and invitations_before is not None:
+                context.friend_invitations = invitations_before
+            raise LanControllerError("invalid_request", "招待情報が不正です。") from exc
+        except Exception:
+            if context is not None and invitations_before is not None:
+                context.friend_invitations = invitations_before
+            raise
+
+    def inspect_friend_invitation_claim(
+        self,
+        room_code: str,
+        claim_token: object,
+    ) -> FriendInvitationClaim:
+        """Return persisted claim scope without consuming its invitation."""
+
+        try:
+            if self._persistence_failed:
+                raise self._persistence_unavailable()
+            context = self._room(room_code)
+            return context.friend_invitations.inspect_claim(
+                claim_token,
+                now_ms=self._now_ms(),
+            )
+        except FriendInvitationAuthenticationError as exc:
+            raise LanControllerError(
+                "authentication_failed", "認証情報を確認できませんでした。"
+            ) from exc
+        except LanControllerError as exc:
+            if exc.code == "room_not_found":
+                raise LanControllerError(
+                    "authentication_failed", "認証情報を確認できませんでした。"
+                ) from exc
+            raise
+        except FriendInvitationError as exc:
+            raise LanControllerError("invalid_request", "招待情報が不正です。") from exc
+
+    def release_friend_invitation_claim(
+        self,
+        room_code: str,
+        claim_token: object,
+    ) -> FriendInvitationClaim:
+        """Persistently release one abandoned claim without revoking its invite."""
+
+        context: _RoomContext | None = None
+        invitations_before: FriendInvitationBook | None = None
+        try:
+            if self._persistence_failed:
+                raise self._persistence_unavailable()
+            try:
+                context = self._room(room_code)
+            except LanControllerError as exc:
+                if exc.code == "room_not_found":
+                    raise FriendInvitationAuthenticationError(
+                        "friend invitation could not be verified"
+                    ) from exc
+                raise
+            invitations_before = deepcopy(context.friend_invitations)
+            claim = context.friend_invitations.release_claim(
+                claim_token,
+                now_ms=self._now_ms(),
+            )
+            self._persist_existing_context(
+                context,
+                preserve_expires_at_ms=context.authority_expires_at_ms,
+            )
+            return claim
+        except FriendInvitationAuthenticationError as exc:
+            if context is not None and invitations_before is not None:
+                context.friend_invitations = invitations_before
+            raise LanControllerError(
+                "authentication_failed", "認証情報を確認できませんでした。"
+            ) from exc
+        except FriendInvitationError as exc:
+            if context is not None and invitations_before is not None:
+                context.friend_invitations = invitations_before
+            raise LanControllerError("invalid_request", "招待情報が不正です。") from exc
+        except Exception:
+            if context is not None and invitations_before is not None:
+                context.friend_invitations = invitations_before
+            raise
 
     def list_friend_invitations(
         self,
@@ -996,9 +1100,7 @@ class LanServerController:
             context.lobby.require_host(connection_key)
             invitations_before = deepcopy(context.friend_invitations)
             count_before = context.friend_invitations.invitation_count
-            invitations = context.friend_invitations.list_active(
-                now_ms=self._now_ms()
-            )
+            invitations = context.friend_invitations.list_active(now_ms=self._now_ms())
             if context.friend_invitations.invitation_count != count_before:
                 self._persist_existing_context(
                     context,
@@ -1037,10 +1139,7 @@ class LanServerController:
                 invitation_id,
                 now_ms=self._now_ms(),
             )
-            self._persist_existing_context(
-                context,
-                preserve_expires_at_ms=context.authority_expires_at_ms,
-            )
+            self._persist_existing_context(context)
             return revoked
         except (LobbyError, FriendInvitationError) as exc:
             if context is not None and invitations_before is not None:
@@ -1069,9 +1168,7 @@ class LanServerController:
             context.lobby.require_host(connection_key)
             invitations_before = deepcopy(context.friend_invitations)
             count_before = context.friend_invitations.invitation_count
-            revoked_count = context.friend_invitations.revoke_all(
-                now_ms=self._now_ms()
-            )
+            revoked_count = context.friend_invitations.revoke_all(now_ms=self._now_ms())
             if count_before:
                 self._persist_existing_context(
                     context,
@@ -1103,10 +1200,10 @@ class LanServerController:
         context: _RoomContext | None = None
         lobby_before: LobbyRoom | None = None
         invitations_before: FriendInvitationBook | None = None
+        if self._persistence_failed:
+            raise self._persistence_unavailable()
+        self._require_unattached(connection_key)
         try:
-            if self._persistence_failed:
-                raise self._persistence_unavailable()
-            self._require_unattached(connection_key)
             try:
                 context = self._room(room_code)
             except LanControllerError as exc:
@@ -1119,9 +1216,8 @@ class LanServerController:
                 invite_token,
                 now_ms=self._now_ms(),
             )
-            if (
-                type(expected_room_id) is not str
-                or not secrets.compare_digest(claim.room_id, expected_room_id)
+            if type(expected_room_id) is not str or not secrets.compare_digest(
+                claim.room_id, expected_room_id
             ):
                 raise FriendInvitationAuthenticationError(
                     "friend invitation could not be verified"
@@ -1131,6 +1227,86 @@ class LanServerController:
             consumed = context.friend_invitations.consume(
                 invite_token,
                 now_ms=self._now_ms(),
+            )
+            if consumed.role == MemberRole.PLAYER.value:
+                grant = context.lobby.join_player_authorized(
+                    display_name=display_name,
+                    connection_id=connection_key,
+                )
+            elif consumed.role == MemberRole.SPECTATOR.value:
+                grant = context.lobby.join_spectator_authorized(
+                    display_name=display_name,
+                    connection_id=connection_key,
+                )
+            else:  # pragma: no cover - domain validation establishes this.
+                raise FriendInvitationError("friend invitation role is invalid")
+            self._attach(connection_key, context.lobby.room_code, grant)
+            outbound = self._welcome_and_broadcast(
+                context,
+                connection_key,
+                grant,
+            )
+            self._persist_existing_context(context)
+            return outbound
+        except (LobbyError, FriendInvitationError) as exc:
+            self._sessions.pop(connection_key, None)
+            if context is not None and lobby_before is not None:
+                context.lobby = lobby_before
+            if context is not None and invitations_before is not None:
+                context.friend_invitations = invitations_before
+            code, detail = self._public_error(exc)
+            raise LanControllerError(code, detail) from exc
+        except Exception:
+            self._sessions.pop(connection_key, None)
+            if context is not None and lobby_before is not None:
+                context.lobby = lobby_before
+            if context is not None and invitations_before is not None:
+                context.friend_invitations = invitations_before
+            raise
+
+    def join_room_with_friend_claim(
+        self,
+        connection_id: str | int,
+        *,
+        room_code: str,
+        display_name: str,
+        claim_token: object,
+        expected_room_id: str,
+    ) -> tuple[OutboundMessage, ...]:
+        """Atomically consume a persisted claim and attach its server-owned role."""
+
+        connection_key = self._connection_key(connection_id)
+        context: _RoomContext | None = None
+        lobby_before: LobbyRoom | None = None
+        invitations_before: FriendInvitationBook | None = None
+        if self._persistence_failed:
+            raise self._persistence_unavailable()
+        self._require_unattached(connection_key)
+        try:
+            try:
+                context = self._room(room_code)
+            except LanControllerError as exc:
+                if exc.code == "room_not_found":
+                    raise FriendInvitationAuthenticationError(
+                        "friend invitation could not be verified"
+                    ) from exc
+                raise
+            now_ms = self._now_ms()
+            claim = context.friend_invitations.inspect_claim(
+                claim_token,
+                now_ms=now_ms,
+            )
+            if type(expected_room_id) is not str or not secrets.compare_digest(
+                claim.room_id, expected_room_id
+            ):
+                raise FriendInvitationAuthenticationError(
+                    "friend invitation could not be verified"
+                )
+            lobby_before = deepcopy(context.lobby)
+            invitations_before = deepcopy(context.friend_invitations)
+            consumed = context.friend_invitations.consume_claim(
+                claim_token,
+                now_ms=now_ms,
             )
             if consumed.role == MemberRole.PLAYER.value:
                 grant = context.lobby.join_player_authorized(
@@ -1352,9 +1528,7 @@ class LanServerController:
                 raise self._persistence_unavailable()
             session = self._require_session(connection_key)
             if session.room_code != room_code:
-                raise LobbyAuthenticationError(
-                    "invalid or expired reconnect token"
-                )
+                raise LobbyAuthenticationError("invalid or expired reconnect token")
             context = self._rooms[session.room_code]
             lobby_before = deepcopy(context.lobby)
             changed = context.lobby.confirm_reconnect_rotation(
@@ -1955,10 +2129,7 @@ class LanServerController:
             if archived_revision is not None:
                 context.replay_blocked = True
             return
-        if (
-            archived_revision is not None
-            and archived_revision > context.game_revision
-        ):
+        if archived_revision is not None and archived_revision > context.game_revision:
             raise ControllerPersistenceError(
                 "persisted replay is ahead of room authority"
             )
@@ -2013,8 +2184,7 @@ class LanServerController:
             "room_closed",
             code="persistence_unavailable",
             message=(
-                "対局状態を安全に保存できません。サーバー再起動後に"
-                "再接続してください。"
+                "対局状態を安全に保存できません。サーバー再起動後に再接続してください。"
             ),
         )
         sessions = tuple(

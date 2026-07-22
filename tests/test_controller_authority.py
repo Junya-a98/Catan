@@ -14,6 +14,11 @@ from game.controller_authority import (
     decode_controller_room_authority,
     encode_controller_room_authority,
 )
+from game.friend_invitation import (
+    FRIEND_INVITATION_VERSION,
+    LEGACY_FRIEND_INVITATION_VERSION,
+    FriendInvitationBook,
+)
 from game.network_protocol import NETWORK_PROTOCOL_VERSION
 
 
@@ -118,6 +123,26 @@ def test_exact_legacy_v1_document_decodes_without_invitation_authority():
     assert restored.friend_invitations is None
 
 
+def test_nested_invitation_v1_is_canonically_migrated_without_controller_bump():
+    book = FriendInvitationBook("12345678123456781234567812345678")
+    book.issue("player", now_ms=1_000, ttl_seconds=300)
+    invitation_authority = book.to_authority_document()
+    invitation_authority["version"] = LEGACY_FRIEND_INVITATION_VERSION
+    invitation_authority["invitations"][0].pop("claim_token_digests")
+    document = encode_controller_room_authority(
+        ControllerRoomAuthority(
+            lobby=authority(with_match=False).lobby,
+            friend_invitations=invitation_authority,
+        )
+    )
+
+    assert document["version"] == CONTROLLER_AUTHORITY_VERSION
+    assert document["friend_invitations"]["version"] == FRIEND_INVITATION_VERSION
+    assert document["friend_invitations"]["invitations"][0]["claim_token_digests"] == []
+    restored = decode_controller_room_authority(document)
+    assert restored.friend_invitations == document["friend_invitations"]
+
+
 @pytest.mark.parametrize(
     ("path", "value"),
     [
@@ -206,9 +231,7 @@ def test_decode_rejects_accepted_response_with_error_fields_and_rejected_without
 
 def test_decode_rejects_cached_response_from_a_future_game_revision():
     document = encode_controller_room_authority(authority())
-    document["match"]["command_states"][0]["records"][0]["response"][
-        "revision"
-    ] = 4
+    document["match"]["command_states"][0]["records"][0]["response"]["revision"] = 4
 
     with pytest.raises(ControllerAuthorityError):
         decode_controller_room_authority(document)

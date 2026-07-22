@@ -170,7 +170,7 @@ DBには手札、発展カード、未公開バリアント状態、入室creden
 
 新規Web roomは「期限付き招待リンクのみ」が既定です。hostは待機室でplayer用またはspectator用を選び、相手ごとに1時間・1回限りのURL（`https://catan-box.local:8765/?room=ABC123#invite=...`）を発行します。roleはURL parameterではなくserver authorityへ固定し、受け手がroleを改ざんしても変更できません。browserはsession作成前にfragmentをURLから消去し、raw bearerをDOM、storage、event、replayへ残しません。hostは未使用招待のroleと期限だけを一覧し、誤送信したリンクを個別または一括で取り消せます。発行・一覧・取消・claimはloopbackまたは検証可能なHTTPS / WSSだけで許可します。
 
-authorityへ保存するのはSHA-256 token digest、再利用されないroom instance ID、role、発行・失効時刻だけです。claimでは消費せずserver-side browser sessionへ一時保持し、member追加とauthority commitに成功した時だけ一度消費します。同時利用では一人だけが成功します。招待はroomごとに最大32件で、期限切れをpruneし、使用済み・期限切れ・取消済み・改ざん・別roomは同じ認証失敗として返します。管理一覧へはbearerでない128-bit ID、role、発行・失効時刻だけを返します。server restart後も未使用digestは復元しますが、claimからjoinまでの短い間にrestartした場合は、secretをbrowserへ永続化しない設計上、新しいリンクが必要です。
+authorityへ保存するのは、元の招待tokenと一時claim credentialを用途分離したSHA-256 digest、再利用されないroom instance ID、role、発行・失効時刻だけです。生のtokenは保存しません。browserが招待リンクを確認すると、元のbearerを別の256-bit claimへ交換し、host-only `HttpOnly; SameSite=Strict; Path=/api` cookieへ保持します。1招待につき最大8 claimで全claimが元の期限を共有し、member追加とauthority commitに成功した時だけ招待と兄弟claimを一度に消費します。同時利用では一人だけが成功し、hostの取消でも関連claimをすべて失効します。招待はroomごとに最大32件で、期限切れをpruneし、使用済み・期限切れ・取消済み・改ざん・別roomは同じ認証失敗として返します。管理一覧へはbearerでない128-bit ID、role、発行・失効時刻だけを返します。`--state-db` を使えばclaim後・join前のserver restartでも同じbrowser cookieから公開metadataを復元でき、画面の「この招待を使わない」から自分のclaimだけを解放できます。
 
 6文字codeだけのopen roomも明示的に選択できます。この場合は `/?room=ABC123` がフォーム入力を補助しますが、自動参加せず、認証情報にもなりません。`room` はASCII英数字6文字だけを受け付け、小文字は大文字へ正規化し、不正値はURLから除去します。
 
@@ -184,6 +184,7 @@ authorityへ保存するのはSHA-256 token digest、再利用されないroom i
 - `#invite=` を持たないcode-only URLは入力補助だけです。期限付き招待URLのfragmentは一回限りの認証bearerなので、各友人へ別々に送り、SNSや公開場所へ掲載しません。role、部屋パスフレーズ、再接続token、session情報はURLへ含めません。
 - 送信先を間違えた場合は待機室の「未使用の招待」から直ちに取り消します。全員が入室した後は、残っている未使用招待を一括で取り消します。
 - 招待bearerの平文は発行response以外へ永続化せず、authorityにはdigest、room instance、role、有効期限だけを保存します。member追加と同じ永続transactionに成功したときだけ消費します。
+- browser用claimの平文もauthority、JSON、WebSocket、DOM、browser storage、replayへ残しません。claim cookieはJavaScriptから読めず、参加成功・失効・明示解放時に削除します。同じbrowser profileで保留できる招待は実質1件です。
 - 入室パスフレーズのsalt、派生値、KDF parameterはauthority内だけに置き、公開snapshotには保護の有無だけを含めます。認証処理には接続元・全体双方の試行回数上限を適用します。
 - LAN clientには安定した再接続tokenを本人へ一度だけ返し、LANの再接続ではcurrent tokenだけを受理してローテーションしません。Webではserverが直接host-only HttpOnly cookieへ設定してJSON / WebSocket / browser storageへ出さず、復帰ごとに新tokenへローテーションします。新cookieの受領確認までは提示された旧tokenを最大120秒だけ併存させ、`POST /api/resume/confirm` 後に失効します。authorityはtokenのSHA-256 hashだけを保持します。
 - token、hash、member ID、transport connection IDは公開ロビーsnapshotへ含めません。

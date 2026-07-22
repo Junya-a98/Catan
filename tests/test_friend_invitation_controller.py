@@ -68,9 +68,7 @@ def test_host_issues_and_inspects_role_scoped_invite_without_mutating_membership
 def test_only_host_can_issue_and_player_invite_stops_after_match_start():
     controller = LanServerController(wall_clock_ms=lambda: WALL_CLOCK_MS)
     room_code = create_protected_room(controller, player_count=2)
-    player = controller.issue_friend_invitation(
-        "host", role="player", ttl_seconds=300
-    )
+    player = controller.issue_friend_invitation("host", role="player", ttl_seconds=300)
     controller.join_room_with_friend_invitation(
         "guest",
         room_code=room_code,
@@ -79,22 +77,21 @@ def test_only_host_can_issue_and_player_invite_stops_after_match_start():
         expected_room_id=player.room_id,
     )
     with pytest.raises(LanControllerError) as denied:
-        controller.issue_friend_invitation(
-            "guest", role="spectator", ttl_seconds=300
-        )
+        controller.issue_friend_invitation("guest", role="spectator", ttl_seconds=300)
     assert denied.value.code == "forbidden"
 
     controller.handle("host", message("set_ready", ready=True))
     controller.handle("guest", message("set_ready", ready=True))
     controller.handle("host", message("start_game"))
     with pytest.raises(LanControllerError) as late_player:
-        controller.issue_friend_invitation(
-            "host", role="player", ttl_seconds=300
-        )
+        controller.issue_friend_invitation("host", role="player", ttl_seconds=300)
     assert late_player.value.code == "invalid_state"
-    assert controller.issue_friend_invitation(
-        "host", role="spectator", ttl_seconds=300
-    ).role == "spectator"
+    assert (
+        controller.issue_friend_invitation(
+            "host", role="spectator", ttl_seconds=300
+        ).role
+        == "spectator"
+    )
 
 
 def test_invitation_bypasses_hidden_passphrase_once_and_server_owns_role():
@@ -128,9 +125,7 @@ def test_invitation_bypasses_hidden_passphrase_once_and_server_owns_role():
 def test_room_instance_mismatch_and_code_reuse_style_attack_fail_generically():
     controller = LanServerController(wall_clock_ms=lambda: WALL_CLOCK_MS)
     room_code = create_protected_room(controller)
-    grant = controller.issue_friend_invitation(
-        "host", role="player", ttl_seconds=300
-    )
+    grant = controller.issue_friend_invitation("host", role="player", ttl_seconds=300)
 
     with pytest.raises(LanControllerError) as mismatch:
         controller.join_room_with_friend_invitation(
@@ -172,9 +167,7 @@ def test_join_and_consumption_roll_back_together_on_persistence_failure(tmp_path
         wall_clock_ms=lambda: WALL_CLOCK_MS,
     )
     room_code = create_protected_room(first)
-    grant = first.issue_friend_invitation(
-        "host", role="player", ttl_seconds=300
-    )
+    grant = first.issue_friend_invitation("host", role="player", ttl_seconds=300)
 
     fault.fail_updates = True
     with pytest.raises(LanControllerError) as failed:
@@ -193,7 +186,10 @@ def test_join_and_consumption_roll_back_together_on_persistence_failure(tmp_path
         state_store=store_b,
         wall_clock_ms=lambda: WALL_CLOCK_MS + 1_000,
     )
-    assert restored.inspect_friend_invitation(room_code, grant.token).room_id == grant.room_id
+    assert (
+        restored.inspect_friend_invitation(room_code, grant.token).room_id
+        == grant.room_id
+    )
     joined = restored.join_room_with_friend_invitation(
         "guest-restored",
         room_code=room_code,
@@ -232,9 +228,7 @@ def test_expired_invites_are_pruned_and_persisted_without_extending_room_ttl(tmp
 def test_host_lists_and_revokes_token_free_invitations_in_canonical_order():
     controller = LanServerController(wall_clock_ms=lambda: WALL_CLOCK_MS)
     room_code = create_protected_room(controller)
-    player = controller.issue_friend_invitation(
-        "host", role="player", ttl_seconds=300
-    )
+    player = controller.issue_friend_invitation("host", role="player", ttl_seconds=300)
     spectator = controller.issue_friend_invitation(
         "host", role="spectator", ttl_seconds=600
     )
@@ -292,9 +286,7 @@ def test_only_host_can_manage_invitations_and_unknown_ids_are_uniform():
 
     for unknown in ("A" * 22, "bad"):
         with pytest.raises(LanControllerError) as missing:
-            controller.revoke_friend_invitation(
-                "host", invitation_id=unknown
-            )
+            controller.revoke_friend_invitation("host", invitation_id=unknown)
         assert missing.value.code == "invitation_not_found"
         assert str(missing.value) == "招待を確認できませんでした。"
 
@@ -313,9 +305,7 @@ def test_revoke_rolls_back_memory_and_durable_authority_on_failure(
         wall_clock_ms=lambda: WALL_CLOCK_MS,
     )
     room_code = create_protected_room(controller)
-    grant = controller.issue_friend_invitation(
-        "host", role="player", ttl_seconds=300
-    )
+    grant = controller.issue_friend_invitation("host", role="player", ttl_seconds=300)
     durable_before = inner.get_room_by_code(room_code)
 
     fault.fail_updates = True
@@ -327,9 +317,12 @@ def test_revoke_rolls_back_memory_and_durable_authority_on_failure(
                 "host", invitation_id=grant.invitation_id
             )
     assert failed.value.code == "persistence_unavailable"
-    assert controller._rooms[room_code].friend_invitations.inspect(
-        grant.token, now_ms=WALL_CLOCK_MS
-    ).invitation_id == grant.invitation_id
+    assert (
+        controller._rooms[room_code]
+        .friend_invitations.inspect(grant.token, now_ms=WALL_CLOCK_MS)
+        .invitation_id
+        == grant.invitation_id
+    )
     durable_after = inner.get_room_by_code(room_code)
     assert durable_after.generation == durable_before.generation
     assert durable_after.authority == durable_before.authority
@@ -394,9 +387,7 @@ def test_stale_controller_revoke_fails_closed_under_generation_cas(tmp_path):
     host_welcome = welcome(created)
     room_code = host_welcome["room_code"]
     reconnect_token = host_welcome["reconnect_token"]
-    grant = first.issue_friend_invitation(
-        "host", role="spectator", ttl_seconds=300
-    )
+    grant = first.issue_friend_invitation("host", role="spectator", ttl_seconds=300)
 
     # Restoring the same room advances its durable generation, deliberately
     # making the first controller stale before it attempts the revocation.
@@ -416,15 +407,217 @@ def test_stale_controller_revoke_fails_closed_under_generation_cas(tmp_path):
     assert welcome(reconnected)["role"] == "host"
 
     with pytest.raises(LanControllerError) as stale:
-        first.revoke_friend_invitation(
-            "host", invitation_id=grant.invitation_id
-        )
+        first.revoke_friend_invitation("host", invitation_id=grant.invitation_id)
     assert stale.value.code == "persistence_unavailable"
-    assert first._rooms[room_code].friend_invitations.inspect(
-        grant.token, now_ms=WALL_CLOCK_MS + 1_000
-    ).invitation_id == grant.invitation_id
-    assert [item.invitation_id for item in second.list_friend_invitations(
-        "host-restored"
-    )] == [grant.invitation_id]
+    assert (
+        first._rooms[room_code]
+        .friend_invitations.inspect(grant.token, now_ms=WALL_CLOCK_MS + 1_000)
+        .invitation_id
+        == grant.invitation_id
+    )
+    assert [
+        item.invitation_id for item in second.list_friend_invitations("host-restored")
+    ] == [grant.invitation_id]
+    store_b.close()
+    store_a.close()
+
+
+def test_restart_safe_claim_persists_and_can_join_after_controller_restart(tmp_path):
+    database = tmp_path / "authority.sqlite3"
+    key = tmp_path / "authority.key"
+    first_store = SQLiteRoomAuthorityStore(database, key_path=key)
+    first = LanServerController(
+        state_store=first_store,
+        wall_clock_ms=lambda: WALL_CLOCK_MS,
+    )
+    room_code = create_protected_room(first)
+    invitation = first.issue_friend_invitation("host", role="player", ttl_seconds=300)
+    claim = first.begin_friend_invitation_claim(room_code, invitation.token)
+    durable = first_store.get_room_by_code(room_code)
+    claim_digests = durable.authority["friend_invitations"]["invitations"][0][
+        "claim_token_digests"
+    ]
+    assert len(claim_digests) == 1
+    assert claim.claim_token not in str(durable.authority)
+    first_store.close()
+
+    restored_store = SQLiteRoomAuthorityStore(database, key_path=key)
+    restored = LanServerController(
+        state_store=restored_store,
+        wall_clock_ms=lambda: WALL_CLOCK_MS + 1_000,
+    )
+    assert (
+        restored.inspect_friend_invitation_claim(room_code, claim.claim_token).room_id
+        == invitation.room_id
+    )
+    joined = restored.join_room_with_friend_claim(
+        "guest-restored",
+        room_code=room_code,
+        display_name="Guest",
+        claim_token=claim.claim_token,
+        expected_room_id=claim.room_id,
+    )
+    assert welcome(joined)["role"] == "player"
+    with pytest.raises(LanControllerError) as replayed:
+        restored.inspect_friend_invitation_claim(room_code, claim.claim_token)
+    assert replayed.value.code == "authentication_failed"
+    restored_store.close()
+
+
+def test_claim_begin_and_release_preserve_room_ttl_and_release_keeps_invite(tmp_path):
+    now = {"value": WALL_CLOCK_MS}
+    store = SQLiteRoomAuthorityStore(tmp_path / "authority.sqlite3")
+    controller = LanServerController(
+        state_store=store,
+        wall_clock_ms=lambda: now["value"],
+    )
+    room_code = create_protected_room(controller)
+    invitation = controller.issue_friend_invitation(
+        "host", role="spectator", ttl_seconds=300
+    )
+    before = store.get_room_by_code(room_code)
+
+    now["value"] += 10_000
+    claim = controller.begin_friend_invitation_claim(room_code, invitation.token)
+    after_claim = store.get_room_by_code(room_code)
+    assert after_claim.expires_at_ms == before.expires_at_ms
+
+    now["value"] += 10_000
+    released = controller.release_friend_invitation_claim(room_code, claim.claim_token)
+    assert released.invitation_id == invitation.invitation_id
+    after_release = store.get_room_by_code(room_code)
+    assert after_release.expires_at_ms == before.expires_at_ms
+    assert (
+        controller.inspect_friend_invitation(room_code, invitation.token).role
+        == "spectator"
+    )
+    with pytest.raises(LanControllerError) as missing_claim:
+        controller.inspect_friend_invitation_claim(room_code, claim.claim_token)
+    assert missing_claim.value.code == "authentication_failed"
+    store.close()
+
+
+@pytest.mark.parametrize("operation", ("begin", "release", "join"))
+def test_claim_mutations_roll_back_on_persistence_failure(tmp_path, operation):
+    database = tmp_path / f"authority-{operation}.sqlite3"
+    inner = SQLiteRoomAuthorityStore(database)
+    fault = FailingUpdateStore(inner)
+    controller = LanServerController(
+        state_store=fault,
+        wall_clock_ms=lambda: WALL_CLOCK_MS,
+    )
+    room_code = create_protected_room(controller)
+    invitation = controller.issue_friend_invitation(
+        "host", role="spectator", ttl_seconds=300
+    )
+    claim = None
+    if operation != "begin":
+        claim = controller.begin_friend_invitation_claim(room_code, invitation.token)
+    durable_before = inner.get_room_by_code(room_code)
+    memory_before = controller._rooms[
+        room_code
+    ].friend_invitations.to_authority_document()
+    fault.fail_updates = True
+
+    with pytest.raises(LanControllerError) as failed:
+        if operation == "begin":
+            controller.begin_friend_invitation_claim(room_code, invitation.token)
+        elif operation == "release":
+            controller.release_friend_invitation_claim(room_code, claim.claim_token)
+        else:
+            controller.join_room_with_friend_claim(
+                "guest",
+                room_code=room_code,
+                display_name="Guest",
+                claim_token=claim.claim_token,
+                expected_room_id=claim.room_id,
+            )
+    assert failed.value.code == "persistence_unavailable"
+    assert (
+        controller._rooms[room_code].friend_invitations.to_authority_document()
+        == memory_before
+    )
+    durable_after = inner.get_room_by_code(room_code)
+    assert durable_after.generation == durable_before.generation
+    assert durable_after.authority == durable_before.authority
+    assert "guest" not in controller._sessions
+    inner.close()
+
+
+def test_existing_session_is_not_removed_by_raw_or_claim_join_attempt():
+    controller = LanServerController(wall_clock_ms=lambda: WALL_CLOCK_MS)
+    room_code = create_protected_room(controller)
+    raw = controller.issue_friend_invitation("host", role="spectator", ttl_seconds=300)
+    claim = controller.begin_friend_invitation_claim(room_code, raw.token)
+
+    with pytest.raises(LanControllerError) as raw_rejected:
+        controller.join_room_with_friend_invitation(
+            "host",
+            room_code=room_code,
+            display_name="Duplicate",
+            invite_token=raw.token,
+            expected_room_id=raw.room_id,
+        )
+    assert raw_rejected.value.code == "already_joined"
+    assert "host" in controller._sessions
+
+    with pytest.raises(LanControllerError) as claim_rejected:
+        controller.join_room_with_friend_claim(
+            "host",
+            room_code=room_code,
+            display_name="Duplicate",
+            claim_token=claim.claim_token,
+            expected_room_id=claim.room_id,
+        )
+    assert claim_rejected.value.code == "already_joined"
+    assert "host" in controller._sessions
+    assert controller.list_friend_invitations("host")[0].invitation_id == (
+        raw.invitation_id
+    )
+
+
+def test_persisted_claim_has_one_cross_controller_cas_winner(tmp_path):
+    database = tmp_path / "authority.sqlite3"
+    key = tmp_path / "authority.key"
+    store_a = SQLiteRoomAuthorityStore(database, key_path=key)
+    stale = LanServerController(
+        state_store=store_a,
+        wall_clock_ms=lambda: WALL_CLOCK_MS,
+    )
+    room_code = create_protected_room(stale)
+    invitation = stale.issue_friend_invitation(
+        "host", role="spectator", ttl_seconds=300
+    )
+    claim = stale.begin_friend_invitation_claim(room_code, invitation.token)
+
+    # Restore advances the generation.  The restored controller commits the
+    # successful join; the stale writer must fail its CAS and roll back.
+    store_b = SQLiteRoomAuthorityStore(database, key_path=key)
+    winner = LanServerController(
+        state_store=store_b,
+        wall_clock_ms=lambda: WALL_CLOCK_MS + 1_000,
+    )
+    joined = winner.join_room_with_friend_claim(
+        "winner",
+        room_code=room_code,
+        display_name="Winner",
+        claim_token=claim.claim_token,
+        expected_room_id=claim.room_id,
+    )
+    assert welcome(joined)["role"] == "spectator"
+
+    with pytest.raises(LanControllerError) as lost:
+        stale.join_room_with_friend_claim(
+            "loser",
+            room_code=room_code,
+            display_name="Loser",
+            claim_token=claim.claim_token,
+            expected_room_id=claim.room_id,
+        )
+    assert lost.value.code == "persistence_unavailable"
+    assert "loser" not in stale._sessions
+
+    durable = store_b.get_room_by_code(room_code)
+    assert durable.authority["friend_invitations"]["invitations"] == []
     store_b.close()
     store_a.close()

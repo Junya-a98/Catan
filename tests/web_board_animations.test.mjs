@@ -171,6 +171,8 @@ function loadAnimationFunctions() {
     applyClaimedInvitation,
     clearClaimedInvitation,
     claimCapturedInvitation,
+    resumeFriendInvitationFromCookie,
+    declineClaimedInvitation,
     deliverInvitationURL,
     copyRoleInvitationLink,
     browserHostname,
@@ -399,7 +401,7 @@ test("invitation controls are accessible and retain the original room-code copy"
   assert.match(cssSource, /@media \(max-width: 440px\)[\s\S]*\.invitation-list-item\s*\{[\s\S]*grid-template-columns: 1fr/);
 });
 
-test("invitation handling runs before cookie resume and never submits a join", () => {
+test("raw invitation wins, then claim-cookie resume runs before room resume", () => {
   assert.match(
     appSource,
     /async function initialise\(\) \{\s*const capturedInvitation = captureInvitationTokenFromLocation\(\);/,
@@ -408,9 +410,21 @@ test("invitation handling runs before cookie resume and never submits a join", (
     appSource.indexOf("const capturedInvitation = captureInvitationTokenFromLocation();")
       < appSource.indexOf('sessionStorage.removeItem("catan-reconnect")'),
   );
-  assert.match(appSource, /allowRoomResume: !invitationCode && !capturedInvitation\.present/);
+  assert.match(appSource, /allowInvitationResume: !capturedInvitation\.present/);
+  assert.match(
+    appSource,
+    /allowRoomResume: !invitationCode && !capturedInvitation\.present/,
+  );
   assert.match(appSource, /await claimCapturedInvitation\(capturedInvitation\)/);
-  assert.match(appSource, /if \(!state\.welcome && allowRoomResume\)/);
+  assert.match(
+    appSource,
+    /if \(\s*!state\.welcome\s*&& allowInvitationResume\s*&& roomAccessTransportAllowed\(\)\s*\)/,
+  );
+  assert.match(appSource, /if \(!state\.welcome && !restoredInvitation && allowRoomResume\)/);
+  assert.ok(
+    appSource.indexOf("await resumeFriendInvitationFromCookie()")
+      < appSource.indexOf("await resumeRoomFromCookie()"),
+  );
   assert.doesNotMatch(
     appSource.slice(
       appSource.indexOf("function applyInvitationFromLocation"),
@@ -418,6 +432,52 @@ test("invitation handling runs before cookie resume and never submits a join", (
     ),
     /sendMessage|join_room|requestSubmit|\.submit\(/,
   );
+});
+
+test("claim-cookie resume and explicit decline are token-free", async () => {
+  const calls = [];
+  const invitation = await animation.resumeFriendInvitationFromCookie(
+    async (path, options) => {
+      calls.push([path, options.method, options.body]);
+      return {
+        api_version: 1,
+        invitation: {
+          room_code: "ABC123",
+          role: "player",
+          issued_at_ms: 1_999_996_400_000,
+          expires_at_ms: 2_000_000_000_000,
+        },
+      };
+    },
+  );
+  assert.deepEqual(calls, [["/api/invitations/resume", "POST", "{}"]]);
+  assert.equal(invitation.room_code, "ABC123");
+  assert.equal(Object.hasOwn(invitation, "token"), false);
+  assert.equal(
+    await animation.resumeFriendInvitationFromCookie(async () => ({
+      api_version: 1,
+      invitation: {
+        room_code: "ABC123",
+        role: "player",
+        expires_at_ms: 2_000_000_000_000,
+        claim_token: "S".repeat(43),
+      },
+    })),
+    null,
+  );
+
+  animation.applyClaimedInvitation(invitation);
+  assert.equal(animation.elements["decline-claimed-invitation"].hidden, false);
+  const declined = await animation.declineClaimedInvitation(
+    async (path, options) => {
+      calls.push([path, options.method, options.body]);
+      return { api_version: 1, cleared: true };
+    },
+  );
+  assert.equal(declined, true);
+  assert.equal(animation.state.claimedInvitation, null);
+  assert.equal(animation.elements["decline-claimed-invitation"].hidden, true);
+  assert.deepEqual(calls.at(-1), ["/api/invitations/claim", "DELETE", "{}"]);
 });
 
 test("claim sends the bearer once, clears the captured reference, and accepts token-free metadata", async () => {

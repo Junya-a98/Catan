@@ -56,11 +56,14 @@ PYTHONPATH=python python python/web_main.py \
 2. 待機室から、友人ごとにplayer用またはspectator用のリンクを1本発行します。
 3. リンクを公開SNSではなく、本人との私的な経路で送ります。同じリンクを複数人へ転送しません。
 4. 誤送信した場合は「未使用の招待」からそのリンクを取り消します。全員が参加したら残りを一括で取り消して開始します。
-5. 再読み込みや一時切断は、同じbrowserのHttpOnly再接続cookieで復帰できます。
+5. 受け手がリンクを開くと、生の招待はJavaScriptから読めない一時claim cookieへ交換されます。参加をやめる場合は「この招待を使わない」を押します。
+6. `--state-db` を指定していれば、リンク確認後・入室前にserverを再起動しても、同じbrowserで再読み込みすると招待画面へ戻れます。入室後の再読み込みや一時切断も、別のHttpOnly再接続cookieで同じ席へ復帰できます。
+
+同じbrowser profileではclaim cookieを共有するため、同時に複数の招待を保留しません。複数席を1台で確認する場合は、別browser、別profile、またはprivate windowを使います。
 
 ## 対象外
 
-これは一台のホストと少人数の友人向けalphaです。account認証、public matchmaking、NAT越えrelay、複数host共有session/rate limit、証明書自動更新、DDoS対策はありません。Tailscale Funnelやrouterのport開放で一般Internetへ出すと、このsecurity boundaryを外れるため使用しないでください。`--internet-public` は引き続き起動を拒否します。
+これは一台のホストと少人数の友人向けalphaです。account認証、public matchmaking、NAT越えrelay、複数host共有session/rate limit、証明書自動更新、DDoS対策はありません。claim発行直後にHTTP response自体が失われた場合、そのclaim digestは招待期限まで残ることがありますが、1招待8件の上限があります。また入室の永続commit直後にresponseとcookieの両方を受け取れず、そのままserverも再起動した場合の席credential再配布は今後の課題です。Tailscale Funnelやrouterのport開放で一般Internetへ出すと、このsecurity boundaryを外れるため使用しないでください。`--internet-public` は引き続き起動を拒否します。
 
 参考:
 

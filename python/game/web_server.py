@@ -8,9 +8,11 @@ import ipaddress
 import json
 from pathlib import Path
 import re
+import secrets
 import socket
 import ssl
 import threading
+import time
 from collections.abc import Iterable
 from typing import Any
 from urllib.parse import urlsplit
@@ -30,6 +32,7 @@ DEFAULT_WEB_PORT = 8765
 MAX_WEB_REQUEST_BYTES = 512 * 1024
 WEB_SESSION_COOKIE = "catan_web_session"
 WEB_ROOM_RESUME_COOKIE = "catan_room_resume"
+WEB_FRIEND_CLAIM_COOKIE = "catan_friend_claim"
 WEB_ROOM_RESUME_COOKIE_MAX_AGE_SECONDS = 7 * 24 * 60 * 60
 MAX_WEB_COOKIE_HEADER_BYTES = 8 * 1024
 WEBSOCKET_EVENT_PUSH_SECONDS = 0.2
@@ -87,6 +90,9 @@ _DNS_LABEL_PATTERN = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?")
 _WEB_SESSION_TOKEN_PATTERN = re.compile(r"[A-Za-z0-9_-]{20,128}\Z")
 _WEB_ROOM_RESUME_VALUE_PATTERN = re.compile(
     r"v1\.([ABCDEFGHJKLMNPQRSTUVWXYZ23456789]{6})\.([A-Za-z0-9_-]{43,128})\Z"
+)
+_WEB_FRIEND_CLAIM_VALUE_PATTERN = re.compile(
+    r"v1\.([ABCDEFGHJKLMNPQRSTUVWXYZ23456789]{6})\.([A-Za-z0-9_-]{43})\Z"
 )
 _WEBSOCKET_FORBIDDEN_MEMBERSHIP_MESSAGES = frozenset(
     {
@@ -524,6 +530,26 @@ class CatanWebRequestHandler(BaseHTTPRequestHandler):
                     return
                 self._claim_friend_invitation()
                 return
+            if path == "/api/invitations/resume" and method == "POST":
+                if not self._valid_request_origin(require_origin=True):
+                    self._json_error(
+                        HTTPStatus.FORBIDDEN,
+                        "cross_site_request",
+                        "同一originから操作してください。",
+                    )
+                    return
+                self._resume_friend_invitation()
+                return
+            if path == "/api/invitations/claim" and method == "DELETE":
+                if not self._valid_request_origin(require_origin=True):
+                    self._json_error(
+                        HTTPStatus.FORBIDDEN,
+                        "cross_site_request",
+                        "同一originから操作してください。",
+                    )
+                    return
+                self._clear_friend_invitation_claim()
+                return
             if path == "/api/resume" and method == "POST":
                 if not self._valid_request_origin(require_origin=True):
                     self._json_error(
@@ -565,18 +591,105 @@ class CatanWebRequestHandler(BaseHTTPRequestHandler):
                         "Web版の再接続はHttpOnly復帰Cookieから行ってください。",
                         status=403,
                     )
-                events = self.catan_server.gateway.handle(
-                    token,
-                    message,
-                    client_key=self._client_key(),
-                    protected_room_access_allowed=(
-                        self.catan_server.protected_room_access_allowed(
-                            self._client_key()
-                        )
-                    ),
+                claim_cookie, claim_cookie_malformed = (
+                    self._friend_invitation_claim_credential()
                 )
+                claim_join_shape = (
+                    message.get("type") == "join_room"
+                    and "role" not in message
+                )
+                if claim_join_shape and claim_cookie_malformed:
+                    self._json_error(
+                        HTTPStatus.FORBIDDEN,
+                        "authentication_failed",
+                        "招待情報を確認できませんでした。",
+                        extra_headers=(
+                            ("Set-Cookie", self._expired_friend_claim_cookie()),
+                        ),
+                    )
+                    return
+                joining_from_claim = claim_join_shape and claim_cookie is not None
+                if joining_from_claim:
+                    assert claim_cookie is not None
+                    claim_room_code, claim_token = claim_cookie
+                    try:
+                        pending_claim = (
+                            self.catan_server.gateway.friend_invitation_claim_credential(
+                                token,
+                                client_key=self._client_key(),
+                            )
+                        )
+                        if (
+                            pending_claim is None
+                            or pending_claim.room_code != claim_room_code
+                            or not secrets.compare_digest(
+                                pending_claim.claim_token,
+                                claim_token,
+                            )
+                        ):
+                            self.catan_server.gateway.resume_friend_invitation_claim(
+                                token,
+                                room_code=claim_room_code,
+                                claim_token=claim_token,
+                                client_key=self._client_key(),
+                                protected_room_access_allowed=(
+                                    self.catan_server.protected_room_access_allowed(
+                                        self._client_key()
+                                    )
+                                ),
+                            )
+                    except WebGatewayError as exc:
+                        if exc.code not in _DEFINITIVE_RESUME_ERROR_CODES:
+                            raise
+                        self._json_error(
+                            exc.status,
+                            exc.code,
+                            str(exc),
+                            retry_after_seconds=exc.retry_after_seconds,
+                            extra_headers=(
+                                ("Set-Cookie", self._expired_friend_claim_cookie()),
+                            ),
+                        )
+                        return
+                    finally:
+                        claim_token = None
+                try:
+                    events = self.catan_server.gateway.handle(
+                        token,
+                        message,
+                        client_key=self._client_key(),
+                        protected_room_access_allowed=(
+                            self.catan_server.protected_room_access_allowed(
+                                self._client_key()
+                            )
+                        ),
+                    )
+                except WebGatewayError as exc:
+                    if joining_from_claim and exc.code in _DEFINITIVE_RESUME_ERROR_CODES:
+                        self.catan_server.gateway.clear_friend_invitation_claim(
+                            token,
+                            client_key=self._client_key(),
+                        )
+                        self._json_error(
+                            exc.status,
+                            exc.code,
+                            str(exc),
+                            retry_after_seconds=exc.retry_after_seconds,
+                            extra_headers=(
+                                ("Set-Cookie", self._expired_friend_claim_cookie()),
+                            ),
+                        )
+                        return
+                    raise
                 message_type = message.get("type")
-                extra_headers: tuple[tuple[str, str], ...] = ()
+                extra_headers: tuple[tuple[str, str], ...] = (
+                    (("Set-Cookie", self._expired_friend_claim_cookie()),)
+                    if (
+                        message_type == "join_room"
+                        and (claim_cookie is not None or claim_cookie_malformed)
+                    )
+                    else ()
+                )
                 if message_type in {"create_room", "join_room"} and any(
                     event.get("type") == "session_welcome" for event in events
                 ):
@@ -586,6 +699,7 @@ class CatanWebRequestHandler(BaseHTTPRequestHandler):
                     )
                     if credential is not None:
                         extra_headers = (
+                            *extra_headers,
                             (
                                 "Set-Cookie",
                                 self._room_resume_cookie(
@@ -597,7 +711,10 @@ class CatanWebRequestHandler(BaseHTTPRequestHandler):
                 elif message_type == "leave_room" and not any(
                     event.get("type") == "request_error" for event in events
                 ):
-                    extra_headers = (("Set-Cookie", self._expired_resume_cookie()),)
+                    extra_headers = (
+                        *extra_headers,
+                        ("Set-Cookie", self._expired_resume_cookie()),
+                    )
                 self._event_response(events, extra_headers=extra_headers)
                 return
             self._json_error(
@@ -792,13 +909,29 @@ class CatanWebRequestHandler(BaseHTTPRequestHandler):
                 "invalid_request",
                 "招待確認のfieldが不正です。",
             )
-        invitation = self.catan_server.gateway.claim_friend_invitation(
+        room_code = document["room_code"]
+        invite_token = document.pop("token")
+        try:
+            invitation = self.catan_server.gateway.claim_friend_invitation(
+                token,
+                room_code=room_code,
+                invite_token=invite_token,
+                client_key=self._client_key(),
+                protected_room_access_allowed=protected,
+            )
+        finally:
+            invite_token = None
+            document.clear()
+        credential = self.catan_server.gateway.friend_invitation_claim_credential(
             token,
-            room_code=document["room_code"],
-            invite_token=document["token"],
             client_key=self._client_key(),
-            protected_room_access_allowed=protected,
         )
+        if credential is None or credential.room_code != invitation["room_code"]:
+            raise WebGatewayError(
+                "claim_cookie_failed",
+                "招待の復帰情報を安全に保存できませんでした。",
+                status=500,
+            )
         self._json_response(
             HTTPStatus.OK,
             {
@@ -813,6 +946,135 @@ class CatanWebRequestHandler(BaseHTTPRequestHandler):
                     )
                 },
             },
+            extra_headers=(
+                (
+                    "Set-Cookie",
+                    self._friend_claim_cookie(
+                        credential.room_code,
+                        credential.claim_token,
+                        credential.expires_at_ms,
+                    ),
+                ),
+            ),
+        )
+
+    def _resume_friend_invitation(self) -> None:
+        """Restore an unconsumed invitation claim after a process restart."""
+
+        protected = self.catan_server.protected_room_access_allowed(
+            self._client_key()
+        )
+        if not protected:
+            raise WebGatewayError(
+                "secure_transport_required",
+                "友人招待はHTTPSまたは同一端末で利用してください。",
+                status=403,
+            )
+        document = self._read_json_object()
+        if document:
+            raise WebGatewayError(
+                "invalid_request",
+                "招待復帰のfieldが不正です。",
+            )
+        parsed, malformed = self._friend_invitation_claim_credential()
+        if malformed:
+            self._json_response(
+                HTTPStatus.OK,
+                {"api_version": WEB_API_VERSION, "invitation": None},
+                extra_headers=(
+                    ("Set-Cookie", self._expired_friend_claim_cookie()),
+                ),
+            )
+            return
+        token = self._required_session_token()
+        if parsed is None:
+            self._json_response(
+                HTTPStatus.OK,
+                {"api_version": WEB_API_VERSION, "invitation": None},
+            )
+            return
+        room_code, claim_token = parsed
+        try:
+            invitation = self.catan_server.gateway.resume_friend_invitation_claim(
+                token,
+                room_code=room_code,
+                claim_token=claim_token,
+                client_key=self._client_key(),
+                protected_room_access_allowed=protected,
+            )
+        except WebGatewayError as exc:
+            if exc.code not in _DEFINITIVE_RESUME_ERROR_CODES:
+                raise
+            self._json_response(
+                HTTPStatus.OK,
+                {"api_version": WEB_API_VERSION, "invitation": None},
+                extra_headers=(
+                    ("Set-Cookie", self._expired_friend_claim_cookie()),
+                ),
+            )
+            return
+        finally:
+            claim_token = None
+        self._json_response(
+            HTTPStatus.OK,
+            {
+                "api_version": WEB_API_VERSION,
+                "invitation": {
+                    key: invitation[key]
+                    for key in (
+                        "room_code",
+                        "role",
+                        "issued_at_ms",
+                        "expires_at_ms",
+                    )
+                },
+            },
+        )
+
+    def _clear_friend_invitation_claim(self) -> None:
+        token = self._required_session_token()
+        protected = self.catan_server.protected_room_access_allowed(
+            self._client_key()
+        )
+        if not protected:
+            raise WebGatewayError(
+                "secure_transport_required",
+                "友人招待はHTTPSまたは同一端末で利用してください。",
+                status=403,
+            )
+        document = self._read_json_object()
+        if document:
+            raise WebGatewayError(
+                "invalid_request",
+                "招待破棄のfieldが不正です。",
+            )
+        parsed, _malformed = self._friend_invitation_claim_credential()
+        if parsed is None:
+            self.catan_server.gateway.clear_friend_invitation_claim(
+                token,
+                client_key=self._client_key(),
+            )
+        else:
+            room_code, claim_token = parsed
+            try:
+                self.catan_server.gateway.release_friend_invitation_claim(
+                    token,
+                    room_code=room_code,
+                    claim_token=claim_token,
+                    client_key=self._client_key(),
+                    protected_room_access_allowed=protected,
+                )
+            finally:
+                claim_token = None
+        self._json_response(
+            HTTPStatus.OK,
+            {
+                "api_version": WEB_API_VERSION,
+                "cleared": True,
+            },
+            extra_headers=(
+                ("Set-Cookie", self._expired_friend_claim_cookie()),
+            ),
         )
 
     def _resume_room(self) -> None:
@@ -1090,6 +1352,30 @@ class CatanWebRequestHandler(BaseHTTPRequestHandler):
     def _end_session(self) -> None:
         token = self._session_token()
         if token is not None:
+            parsed, _malformed = self._friend_invitation_claim_credential()
+            if parsed is not None and self.catan_server.gateway.has_session(
+                token,
+                client_key=self._client_key(),
+            ):
+                room_code, claim_token = parsed
+                try:
+                    self.catan_server.gateway.release_friend_invitation_claim(
+                        token,
+                        room_code=room_code,
+                        claim_token=claim_token,
+                        client_key=self._client_key(),
+                        protected_room_access_allowed=(
+                            self.catan_server.protected_room_access_allowed(
+                                self._client_key()
+                            )
+                        ),
+                    )
+                except WebGatewayError:
+                    # Closing the browser session is authoritative here; its
+                    # bounded claim will still expire on the domain deadline.
+                    pass
+                finally:
+                    claim_token = None
             self.catan_server.gateway.close_session(
                 token,
                 client_key=self._client_key(),
@@ -1104,6 +1390,7 @@ class CatanWebRequestHandler(BaseHTTPRequestHandler):
                     f"{'; Secure' if self.catan_server.tls_enabled else ''}; "
                     "Max-Age=0",
                 ),
+                ("Set-Cookie", self._expired_friend_claim_cookie()),
             ),
         )
 
@@ -1208,6 +1495,20 @@ class CatanWebRequestHandler(BaseHTTPRequestHandler):
             return None, True
         return (match.group(1), match.group(2)), False
 
+    def _friend_invitation_claim_credential(
+        self,
+    ) -> tuple[tuple[str, str] | None, bool]:
+        value, malformed = self._strict_cookie_value(
+            WEB_FRIEND_CLAIM_COOKIE,
+            _WEB_FRIEND_CLAIM_VALUE_PATTERN,
+        )
+        if value is None:
+            return None, malformed
+        match = _WEB_FRIEND_CLAIM_VALUE_PATTERN.fullmatch(value)
+        if match is None:  # Defensive: strict parser already checked this.
+            return None, True
+        return (match.group(1), match.group(2)), False
+
     def _strict_cookie_value(
         self,
         name: str,
@@ -1259,6 +1560,51 @@ class CatanWebRequestHandler(BaseHTTPRequestHandler):
         secure = "; Secure" if self.catan_server.tls_enabled else ""
         return (
             f"{WEB_ROOM_RESUME_COOKIE}=; Path=/; HttpOnly; SameSite=Strict"
+            f"{secure}; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT"
+        )
+
+    def _friend_claim_cookie(
+        self,
+        room_code: str,
+        claim_token: str,
+        expires_at_ms: int,
+    ) -> str:
+        value = f"v1.{room_code}.{claim_token}"
+        if _WEB_FRIEND_CLAIM_VALUE_PATTERN.fullmatch(value) is None:
+            raise WebGatewayError(
+                "invalid_claim_credential",
+                "招待の復帰情報をCookieへ保存できませんでした。",
+                status=500,
+            )
+        if type(expires_at_ms) is not int:
+            raise WebGatewayError(
+                "invalid_claim_credential",
+                "招待の復帰期限を確認できませんでした。",
+                status=500,
+            )
+        remaining_ms = expires_at_ms - int(time.time() * 1000)
+        if remaining_ms <= 0:
+            raise WebGatewayError(
+                "authentication_failed",
+                "招待情報を確認できませんでした。",
+                status=403,
+            )
+        # A ceiling keeps a just-issued cookie from losing nearly a full
+        # second.  Domain validation remains authoritative at the exact expiry.
+        max_age = min(
+            WEB_ROOM_RESUME_COOKIE_MAX_AGE_SECONDS,
+            max(1, (remaining_ms + 999) // 1000),
+        )
+        secure = "; Secure" if self.catan_server.tls_enabled else ""
+        return (
+            f"{WEB_FRIEND_CLAIM_COOKIE}={value}; Path=/api; HttpOnly; "
+            f"SameSite=Strict{secure}; Max-Age={max_age}"
+        )
+
+    def _expired_friend_claim_cookie(self) -> str:
+        secure = "; Secure" if self.catan_server.tls_enabled else ""
+        return (
+            f"{WEB_FRIEND_CLAIM_COOKIE}=; Path=/api; HttpOnly; SameSite=Strict"
             f"{secure}; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT"
         )
 
@@ -1367,12 +1713,13 @@ class CatanWebRequestHandler(BaseHTTPRequestHandler):
         message: str,
         *,
         retry_after_seconds: int | None = None,
+        extra_headers: tuple[tuple[str, str], ...] = (),
     ) -> None:
         error: dict[str, Any] = {"code": code, "message": message}
-        headers: tuple[tuple[str, str], ...] = ()
+        headers = extra_headers
         if retry_after_seconds is not None:
             error["retry_after_seconds"] = retry_after_seconds
-            headers = (("Retry-After", str(retry_after_seconds)),)
+            headers = (*headers, ("Retry-After", str(retry_after_seconds)))
         self._json_response(
             status,
             {
@@ -1665,6 +2012,7 @@ __all__ = (
     "DEFAULT_WEB_PORT",
     "DEFAULT_WEB_STATIC_ROOT",
     "MAX_WEB_REQUEST_BYTES",
+    "WEB_FRIEND_CLAIM_COOKIE",
     "WEB_ROOM_RESUME_COOKIE",
     "WEB_ROOM_RESUME_COOKIE_MAX_AGE_SECONDS",
     "WEB_SESSION_COOKIE",

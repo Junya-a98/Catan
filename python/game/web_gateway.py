@@ -101,9 +101,11 @@ class _RoomResumeCredential:
 
 @dataclass(frozen=True)
 class _PendingFriendInvitation:
-    """One inspected bearer held only behind a browser's HttpOnly session.
+    """One restart-safe claim held only behind a browser's HttpOnly session.
 
-    The raw bearer must never be reflected into events, bootstrap state, or a
+    The original invitation bearer is exchanged before this object is made.
+    Only the separately generated claim capability may remain process-local;
+    neither bearer may be reflected into events, bootstrap state, or a
     diagnostic representation.  Its public scope is copied separately so a
     later join cannot substitute another room instance or member role.
     """
@@ -113,7 +115,7 @@ class _PendingFriendInvitation:
     role: str
     issued_at_ms: int
     expires_at_ms: int
-    invite_token: str = field(repr=False)
+    claim_token: str = field(repr=False)
 
 
 @dataclass(frozen=True)
@@ -492,7 +494,7 @@ class WebGateway:
         client_key: str | None = None,
         protected_room_access_allowed: bool = False,
     ) -> dict[str, Any]:
-        """Inspect without consuming and retain the bearer server-side only."""
+        """Exchange a raw invite for a restart-safe claim capability."""
 
         self._require_protected_invitation_transport(
             protected_room_access_allowed
@@ -503,8 +505,9 @@ class WebGateway:
                 client_key=client_key,
                 action="claim_friend_invitation",
             )
+            self._require_unattached_invitation_session(session)
             try:
-                claim = self.controller.inspect_friend_invitation(
+                claim = self.controller.begin_friend_invitation_claim(
                     room_code,
                     invite_token,
                 )
@@ -524,7 +527,75 @@ class WebGateway:
                 role=claim.role,
                 issued_at_ms=claim.issued_at_ms,
                 expires_at_ms=claim.expires_at_ms,
-                invite_token=invite_token,
+                claim_token=claim.claim_token,
+            )
+            session.pending_friend_invitation = pending
+            return self._public_friend_invitation(pending)
+
+    def friend_invitation_claim_credential(
+        self,
+        token: str,
+        *,
+        client_key: str | None = None,
+    ) -> _PendingFriendInvitation | None:
+        """Return a private copy for the HTTP-only claim cookie boundary."""
+
+        with self._lock:
+            session = self._require_session(token, client_key)
+            pending = session.pending_friend_invitation
+            if pending is None:
+                return None
+            return _PendingFriendInvitation(
+                room_code=pending.room_code,
+                room_id=pending.room_id,
+                role=pending.role,
+                issued_at_ms=pending.issued_at_ms,
+                expires_at_ms=pending.expires_at_ms,
+                claim_token=pending.claim_token,
+            )
+
+    def resume_friend_invitation_claim(
+        self,
+        token: str,
+        *,
+        room_code: str,
+        claim_token: str,
+        client_key: str | None = None,
+        protected_room_access_allowed: bool = False,
+    ) -> dict[str, Any]:
+        """Restore one pending invite from its persistent HttpOnly bearer."""
+
+        self._require_protected_invitation_transport(
+            protected_room_access_allowed
+        )
+        with self._lock:
+            session = self._invitation_session(
+                token,
+                client_key=client_key,
+                action="resume_friend_invitation_claim",
+            )
+            self._require_unattached_invitation_session(session)
+            try:
+                claim = self.controller.inspect_friend_invitation_claim(
+                    room_code,
+                    claim_token,
+                )
+            except LanControllerError as exc:
+                if exc.code in {"authentication_failed", "room_not_found"}:
+                    session.pending_friend_invitation = None
+                    raise WebGatewayError(
+                        "authentication_failed",
+                        "招待情報を確認できませんでした。",
+                        status=403,
+                    ) from exc
+                raise self._controller_web_error(exc) from exc
+            pending = _PendingFriendInvitation(
+                room_code=room_code,
+                room_id=claim.room_id,
+                role=claim.role,
+                issued_at_ms=claim.issued_at_ms,
+                expires_at_ms=claim.expires_at_ms,
+                claim_token=claim_token,
             )
             session.pending_friend_invitation = pending
             return self._public_friend_invitation(pending)
@@ -540,6 +611,39 @@ class WebGateway:
         with self._lock:
             session = self._require_session(token, client_key)
             session.pending_friend_invitation = None
+
+    def release_friend_invitation_claim(
+        self,
+        token: str,
+        *,
+        room_code: str,
+        claim_token: str,
+        client_key: str | None = None,
+        protected_room_access_allowed: bool = False,
+    ) -> bool:
+        """Release one persistent claim while retaining its parent invite."""
+
+        self._require_protected_invitation_transport(
+            protected_room_access_allowed
+        )
+        with self._lock:
+            session = self._invitation_session(
+                token,
+                client_key=client_key,
+                action="release_friend_invitation_claim",
+            )
+            try:
+                self.controller.release_friend_invitation_claim(
+                    room_code,
+                    claim_token,
+                )
+            except LanControllerError as exc:
+                if exc.code in {"authentication_failed", "room_not_found"}:
+                    session.pending_friend_invitation = None
+                    return False
+                raise self._controller_web_error(exc) from exc
+            session.pending_friend_invitation = None
+            return True
 
     def handle(
         self,
@@ -733,6 +837,28 @@ class WebGateway:
             self._consume_shared_message_limits(session, limit_message)
         else:
             self._consume_message_limit(session, limit_message, now)
+            if self._is_protected_room_attempt(limit_message):
+                self._consume_client_limit(
+                    self._protected_room_attempt_times,
+                    session.client_key,
+                    now,
+                    self.rate_limits.protected_room_attempts_per_client,
+                    code="room_access_rate_limited",
+                    message=(
+                        "入室保護の試行回数が多すぎます。表示された時間を待って"
+                        "から再試行してください。"
+                    ),
+                )
+                self._consume_window(
+                    self._protected_room_attempt_times_global,
+                    now,
+                    self.rate_limits.protected_room_attempts_global,
+                    code="room_access_rate_limited",
+                    message=(
+                        "入室保護の試行が集中しています。表示された時間を待って"
+                        "から再試行してください。"
+                    ),
+                )
         return session
 
     def _join_with_pending_friend_invitation(
@@ -764,11 +890,11 @@ class WebGateway:
                 status=403,
             )
         try:
-            return self.controller.join_room_with_friend_invitation(
+            return self.controller.join_room_with_friend_claim(
                 session.connection_id,
                 room_code=pending.room_code,
                 display_name=message["display_name"],
-                invite_token=pending.invite_token,
+                claim_token=pending.claim_token,
                 expected_room_id=pending.room_id,
             )
         except LanControllerError as exc:
@@ -806,6 +932,17 @@ class WebGateway:
                 status=409,
             )
         return room_code
+
+    @staticmethod
+    def _require_unattached_invitation_session(session: _BrowserSession) -> None:
+        """Never let an invite claim replace an established membership."""
+
+        if "session_welcome" in session.latest:
+            raise WebGatewayError(
+                "invalid_state",
+                "参加中の部屋を退出してから招待を確認してください。",
+                status=409,
+            )
 
     @staticmethod
     def _public_friend_invitation(
@@ -1211,6 +1348,8 @@ class WebGateway:
             "join_room",
             "reconnect_room",
             "claim_friend_invitation",
+            "resume_friend_invitation_claim",
+            "release_friend_invitation_claim",
         }:
             rules.append(
                 _RateLimitRule(
@@ -1333,6 +1472,8 @@ class WebGateway:
             "join_room",
             "reconnect_room",
             "claim_friend_invitation",
+            "resume_friend_invitation_claim",
+            "release_friend_invitation_claim",
         }:
             self._consume_client_limit(
                 self._room_attempt_times,
@@ -1408,7 +1549,12 @@ class WebGateway:
     @staticmethod
     def _is_protected_room_attempt(message: Mapping[str, Any]) -> bool:
         message_type = message.get("type")
-        return message_type == "join_room" or (
+        return message_type in {
+            "join_room",
+            "claim_friend_invitation",
+            "resume_friend_invitation_claim",
+            "release_friend_invitation_claim",
+        } or (
             message_type == "create_room"
             and ("passphrase" in message or message.get("invite_only") is True)
         )

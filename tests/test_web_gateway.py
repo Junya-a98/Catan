@@ -307,6 +307,19 @@ def test_friend_invitation_claim_is_server_side_and_role_is_authoritative():
     assert invite_token not in json.dumps(claimed, ensure_ascii=False)
     assert invite_token not in repr(gateway._sessions[guest])
     assert gateway.bootstrap(guest, client_key="127.0.0.2") == ()
+    claim_credential = gateway.friend_invitation_claim_credential(
+        guest,
+        client_key="127.0.0.2",
+    )
+    assert claim_credential is not None
+    assert claim_credential.claim_token not in repr(gateway._sessions[guest])
+    assert claim_credential.claim_token not in json.dumps(claimed)
+    assert claim_credential.claim_token not in json.dumps(
+        gateway.bootstrap(guest, client_key="127.0.0.2")
+    )
+    assert claim_credential.claim_token not in json.dumps(
+        gateway.poll(guest, client_key="127.0.0.2")
+    )
 
     joined = gateway.handle(
         guest,
@@ -326,6 +339,7 @@ def test_friend_invitation_claim_is_server_side_and_role_is_authoritative():
     assert welcome["reconnect_token"] is None
     assert gateway._sessions[guest].pending_friend_invitation is None
     assert invite_token not in json.dumps(joined, ensure_ascii=False)
+    assert claim_credential.claim_token not in json.dumps(joined, ensure_ascii=False)
 
 
 def test_friend_invitation_tamper_expiry_and_transport_fail_closed():
@@ -415,6 +429,89 @@ def test_only_host_can_issue_and_manual_join_clears_a_pending_invitation():
         )
     assert forbidden.value.status == 403
     assert forbidden.value.code == "forbidden"
+
+
+def test_joined_browser_cannot_replace_its_membership_with_an_invitation_claim():
+    gateway = WebGateway()
+    host = gateway.open_session()
+    room_code, _events = create_room(gateway, host)
+    invitation = gateway.issue_friend_invitation(
+        host,
+        role="spectator",
+        protected_room_access_allowed=True,
+    )
+
+    with pytest.raises(WebGatewayError) as attached:
+        gateway.claim_friend_invitation(
+            host,
+            room_code=room_code,
+            invite_token=invitation["token"],
+            protected_room_access_allowed=True,
+        )
+    assert attached.value.code == "invalid_state"
+    assert next(
+        event
+        for event in gateway.bootstrap(host)
+        if event["type"] == "session_welcome"
+    )["role"] == "host"
+
+    # Rejection happened before the authority exchange; another browser can
+    # still use the exact invitation normally.
+    guest = gateway.open_session(client_key="127.0.0.2")
+    claimed = gateway.claim_friend_invitation(
+        guest,
+        room_code=room_code,
+        invite_token=invitation["token"],
+        client_key="127.0.0.2",
+        protected_room_access_allowed=True,
+    )
+    assert claimed["role"] == "spectator"
+
+
+def test_friend_claim_resume_charges_protected_client_attempt_budget():
+    gateway = WebGateway(
+        rate_limits=WebRateLimits(
+            protected_room_attempts_per_client=2,
+            protected_room_attempts_global=20,
+        )
+    )
+    host = gateway.open_session()
+    room_code, _events = create_room(gateway, host)
+    invitation = gateway.issue_friend_invitation(
+        host,
+        role="spectator",
+        protected_room_access_allowed=True,
+    )
+    guest = gateway.open_session(client_key="127.0.0.2")
+    gateway.claim_friend_invitation(
+        guest,
+        room_code=room_code,
+        invite_token=invitation["token"],
+        client_key="127.0.0.2",
+        protected_room_access_allowed=True,
+    )
+    credential = gateway.friend_invitation_claim_credential(
+        guest,
+        client_key="127.0.0.2",
+    )
+    assert credential is not None
+    gateway.resume_friend_invitation_claim(
+        guest,
+        room_code=room_code,
+        claim_token=credential.claim_token,
+        client_key="127.0.0.2",
+        protected_room_access_allowed=True,
+    )
+    with pytest.raises(WebGatewayError) as limited:
+        gateway.resume_friend_invitation_claim(
+            guest,
+            room_code=room_code,
+            claim_token=credential.claim_token,
+            client_key="127.0.0.2",
+            protected_room_access_allowed=True,
+        )
+    assert limited.value.code == "room_access_rate_limited"
+    assert limited.value.status == 429
 
 
 def test_host_can_list_and_revoke_invitations_without_exposing_bearers():

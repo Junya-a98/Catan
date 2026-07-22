@@ -5,7 +5,10 @@ import threading
 
 import pytest
 
+from game.lan_controller import LanControllerError, LanServerController
 from game.network_protocol import NETWORK_PROTOCOL_VERSION, build_game_command
+from game.server_state import SQLiteRoomAuthorityStore
+from game.web_gateway import WebGateway, WebRateLimits
 import game.web_server as web_server_module
 from game.web_server import create_web_server
 from game.websocket_transport import (
@@ -755,6 +758,568 @@ def test_http_friend_invitation_claim_and_join_keep_bearer_server_side(web_serve
     assert invite_token not in replay_payload.decode("utf-8")
 
 
+def test_http_friend_claim_cookie_restores_after_session_loss_and_clears_on_join(
+    web_server,
+):
+    host_cookie = session_cookie(web_server)
+    _response, _payload, host_welcome = create_http_room(web_server, host_cookie)
+    origin = same_origin(web_server)
+    protected_headers = {
+        "Content-Type": "application/json",
+        "Origin": origin,
+        "Sec-Fetch-Site": "same-origin",
+    }
+    response, payload = request(
+        web_server,
+        "POST",
+        "/api/invitations",
+        body=json.dumps({"role": "player"}),
+        headers={**protected_headers, "Cookie": host_cookie},
+    )
+    invitation = json.loads(payload)["invitation"]
+    assert response.status == 200
+
+    first_guest_cookie = session_cookie(web_server)
+    response, payload = request(
+        web_server,
+        "POST",
+        "/api/invitations/claim",
+        body=json.dumps(
+            {
+                "room_code": host_welcome["room_code"],
+                "token": invitation["token"],
+            }
+        ),
+        headers={**protected_headers, "Cookie": first_guest_cookie},
+    )
+    assert response.status == 200
+    assert invitation["token"] not in payload.decode("utf-8")
+    claim_set_cookie = response_cookie(response, "catan_friend_claim")
+    assert claim_set_cookie is not None
+    assert "Path=/api" in claim_set_cookie
+    assert "HttpOnly" in claim_set_cookie
+    assert "SameSite=Strict" in claim_set_cookie
+    assert "Secure" not in claim_set_cookie
+    max_age = next(
+        int(part.partition("=")[2])
+        for part in claim_set_cookie.split(";")
+        if part.strip().startswith("Max-Age=")
+    )
+    assert 3599 <= max_age <= 3600
+    claim_cookie = claim_set_cookie.split(";", 1)[0]
+    claim_token = claim_cookie.rpartition(".")[2]
+    assert claim_token not in payload.decode("utf-8")
+
+    first_guest_token = first_guest_cookie.partition("=")[2]
+    web_server.gateway.close_session(
+        first_guest_token,
+        client_key="127.0.0.1",
+    )
+    restarted_guest_cookie = session_cookie(web_server)
+    browser_cookies = f"{restarted_guest_cookie}; {claim_cookie}"
+    response, payload = request(
+        web_server,
+        "POST",
+        "/api/invitations/resume",
+        body="{}",
+        headers={**protected_headers, "Cookie": browser_cookies},
+    )
+    assert response.status == 200
+    restored = json.loads(payload)["invitation"]
+    assert restored == {
+        key: invitation[key]
+        for key in ("room_code", "role", "issued_at_ms", "expires_at_ms")
+    }
+    assert claim_token not in payload.decode("utf-8")
+    assert invitation["token"] not in payload.decode("utf-8")
+
+    response, payload = request(
+        web_server,
+        "POST",
+        "/api/message",
+        body=json.dumps(
+            {
+                "type": "join_room",
+                "protocol_version": NETWORK_PROTOCOL_VERSION,
+                "room_code": host_welcome["room_code"],
+                "display_name": "Restarted Browser",
+            }
+        ),
+        headers={**protected_headers, "Cookie": browser_cookies},
+    )
+    assert response.status == 200
+    assert any(
+        event["type"] == "session_welcome"
+        for event in json.loads(payload)["events"]
+    )
+    expired_claim = response_cookie(response, "catan_friend_claim")
+    room_resume = response_cookie(response, "catan_room_resume")
+    assert expired_claim is not None and "Max-Age=0" in expired_claim
+    assert "Path=/api" in expired_claim
+    assert room_resume is not None and "Max-Age=604800" in room_resume
+    assert claim_token not in payload.decode("utf-8")
+
+
+def test_http_friend_claim_survives_new_server_with_persistent_authority(tmp_path):
+    database = tmp_path / "friend-claim-authority.sqlite3"
+    key = tmp_path / "friend-claim-authority.key"
+    store_a = SQLiteRoomAuthorityStore(database, key_path=key)
+    server_a = create_web_server(
+        "127.0.0.1",
+        0,
+        gateway=WebGateway(controller=LanServerController(state_store=store_a)),
+    )
+    thread_a = threading.Thread(target=server_a.serve_forever, daemon=True)
+    thread_a.start()
+    try:
+        origin_a = same_origin(server_a)
+        host_cookie = session_cookie(server_a)
+        _response, _payload, welcome = create_http_room(server_a, host_cookie)
+        response, payload = request(
+            server_a,
+            "POST",
+            "/api/invitations",
+            body=json.dumps({"role": "player"}),
+            headers={
+                "Content-Type": "application/json",
+                "Cookie": host_cookie,
+                "Origin": origin_a,
+            },
+        )
+        invitation = json.loads(payload)["invitation"]
+        assert response.status == 200
+        guest_cookie = session_cookie(server_a)
+        response, payload = request(
+            server_a,
+            "POST",
+            "/api/invitations/claim",
+            body=json.dumps(
+                {"room_code": welcome["room_code"], "token": invitation["token"]}
+            ),
+            headers={
+                "Content-Type": "application/json",
+                "Cookie": guest_cookie,
+                "Origin": origin_a,
+            },
+        )
+        assert response.status == 200
+        claim_set_cookie = response_cookie(response, "catan_friend_claim")
+        assert claim_set_cookie is not None
+        claim_cookie = claim_set_cookie.split(";", 1)[0]
+        claim_token = claim_cookie.rpartition(".")[2]
+        assert claim_token not in payload.decode("utf-8")
+    finally:
+        server_a.shutdown()
+        server_a.server_close()
+        thread_a.join(timeout=2)
+        store_a.close()
+
+    store_b = SQLiteRoomAuthorityStore(database, key_path=key)
+    server_b = create_web_server(
+        "127.0.0.1",
+        0,
+        gateway=WebGateway(controller=LanServerController(state_store=store_b)),
+    )
+    thread_b = threading.Thread(target=server_b.serve_forever, daemon=True)
+    thread_b.start()
+    try:
+        origin_b = same_origin(server_b)
+        restarted_session = session_cookie(server_b)
+        cookies = f"{restarted_session}; {claim_cookie}"
+        response, payload = request(
+            server_b,
+            "POST",
+            "/api/invitations/resume",
+            body="{}",
+            headers={
+                "Content-Type": "application/json",
+                "Cookie": cookies,
+                "Origin": origin_b,
+            },
+        )
+        assert response.status == 200
+        assert json.loads(payload)["invitation"]["room_code"] == welcome["room_code"]
+        assert claim_token not in payload.decode("utf-8")
+
+        response, payload = request(
+            server_b,
+            "POST",
+            "/api/message",
+            body=json.dumps(
+                {
+                    "type": "join_room",
+                    "protocol_version": NETWORK_PROTOCOL_VERSION,
+                    "room_code": welcome["room_code"],
+                    "display_name": "Restarted Friend",
+                }
+            ),
+            headers={
+                "Content-Type": "application/json",
+                "Cookie": cookies,
+                "Origin": origin_b,
+            },
+        )
+        assert response.status == 200
+        joined = next(
+            event
+            for event in json.loads(payload)["events"]
+            if event["type"] == "session_welcome"
+        )
+        assert joined["seat_index"] == 1
+        assert "Max-Age=0" in response_cookie(response, "catan_friend_claim")
+        assert response_cookie(response, "catan_room_resume") is not None
+    finally:
+        server_b.shutdown()
+        server_b.server_close()
+        thread_b.join(timeout=2)
+        store_b.close()
+
+
+def test_http_friend_claim_can_be_released_and_host_revocation_expires_it(
+    web_server,
+):
+    host_cookie = session_cookie(web_server)
+    _response, _payload, welcome = create_http_room(web_server, host_cookie)
+    origin = same_origin(web_server)
+    headers = {
+        "Content-Type": "application/json",
+        "Origin": origin,
+        "Sec-Fetch-Site": "same-origin",
+    }
+    response, payload = request(
+        web_server,
+        "POST",
+        "/api/invitations",
+        body=json.dumps({"role": "spectator"}),
+        headers={**headers, "Cookie": host_cookie},
+    )
+    assert response.status == 200
+    invitation = json.loads(payload)["invitation"]
+
+    guest_cookie = session_cookie(web_server)
+    response, _payload = request(
+        web_server,
+        "POST",
+        "/api/invitations/claim",
+        body=json.dumps(
+            {"room_code": welcome["room_code"], "token": invitation["token"]}
+        ),
+        headers={**headers, "Cookie": guest_cookie},
+    )
+    first_claim = response_cookie(response, "catan_friend_claim")
+    assert first_claim is not None
+    first_claim_cookie = first_claim.split(";", 1)[0]
+
+    response, payload = request(
+        web_server,
+        "DELETE",
+        "/api/invitations/claim",
+        body="{}",
+        headers={
+            **headers,
+            "Cookie": f"{guest_cookie}; {first_claim_cookie}",
+        },
+    )
+    assert response.status == 200
+    assert json.loads(payload) == {"api_version": 1, "cleared": True}
+    assert "Max-Age=0" in response_cookie(response, "catan_friend_claim")
+
+    # Releasing a browser claim deliberately leaves the host's parent invite
+    # usable, so the recipient can open the same link in another browser.
+    second_guest = session_cookie(web_server)
+    response, _payload = request(
+        web_server,
+        "POST",
+        "/api/invitations/claim",
+        body=json.dumps(
+            {"room_code": welcome["room_code"], "token": invitation["token"]}
+        ),
+        headers={**headers, "Cookie": second_guest},
+    )
+    assert response.status == 200
+    second_claim = response_cookie(response, "catan_friend_claim")
+    assert second_claim is not None
+    second_claim_cookie = second_claim.split(";", 1)[0]
+
+    response, _payload = request(
+        web_server,
+        "DELETE",
+        "/api/invitations",
+        body=json.dumps({"invitation_id": invitation["invitation_id"]}),
+        headers={**headers, "Cookie": host_cookie},
+    )
+    assert response.status == 200
+
+    web_server.gateway.close_session(
+        second_guest.partition("=")[2],
+        client_key="127.0.0.1",
+    )
+    resumed_session = session_cookie(web_server)
+    response, payload = request(
+        web_server,
+        "POST",
+        "/api/invitations/resume",
+        body="{}",
+        headers={
+            **headers,
+            "Cookie": f"{resumed_session}; {second_claim_cookie}",
+        },
+    )
+    assert response.status == 200
+    assert json.loads(payload) == {"api_version": 1, "invitation": None}
+    assert "Max-Age=0" in response_cookie(response, "catan_friend_claim")
+
+
+@pytest.mark.parametrize(
+    ("failure_kind", "expected_status", "expected_code"),
+    [
+        ("rate_limit", 429, "room_access_rate_limited"),
+        ("persistence", 503, "persistence_unavailable"),
+        ("room_full", 409, "room_full"),
+    ],
+)
+def test_transient_friend_join_failure_keeps_claim_cookie(
+    web_server,
+    monkeypatch,
+    failure_kind,
+    expected_status,
+    expected_code,
+):
+    host_cookie = session_cookie(web_server)
+    _response, _payload, welcome = create_http_room(web_server, host_cookie)
+    origin = same_origin(web_server)
+    headers = {
+        "Content-Type": "application/json",
+        "Origin": origin,
+        "Sec-Fetch-Site": "same-origin",
+    }
+    response, payload = request(
+        web_server,
+        "POST",
+        "/api/invitations",
+        body=json.dumps({"role": "player"}),
+        headers={**headers, "Cookie": host_cookie},
+    )
+    invitation = json.loads(payload)["invitation"]
+    assert response.status == 200
+
+    guest_cookie = session_cookie(web_server)
+    response, _payload = request(
+        web_server,
+        "POST",
+        "/api/invitations/claim",
+        body=json.dumps(
+            {"room_code": welcome["room_code"], "token": invitation["token"]}
+        ),
+        headers={**headers, "Cookie": guest_cookie},
+    )
+    claim_set_cookie = response_cookie(response, "catan_friend_claim")
+    assert response.status == 200
+    assert claim_set_cookie is not None
+    claim_cookie = claim_set_cookie.split(";", 1)[0]
+    guest_token = guest_cookie.partition("=")[2]
+
+    if failure_kind == "rate_limit":
+        # The successful claim already used the single protected attempt.
+        web_server.gateway.rate_limits = WebRateLimits(
+            protected_room_attempts_per_client=1,
+            protected_room_attempts_global=30,
+        )
+    elif failure_kind == "persistence":
+        def unavailable(*_args, **_kwargs):
+            raise LanControllerError(
+                "persistence_unavailable",
+                "対局データを保存できませんでした。",
+            )
+
+        monkeypatch.setattr(
+            web_server.gateway.controller,
+            "join_room_with_friend_claim",
+            unavailable,
+        )
+    else:
+        filler_cookie = session_cookie(web_server)
+        response, filler_payload = request(
+            web_server,
+            "POST",
+            "/api/message",
+            body=json.dumps(
+                {
+                    "type": "join_room",
+                    "protocol_version": NETWORK_PROTOCOL_VERSION,
+                    "room_code": welcome["room_code"],
+                    "display_name": "Filler",
+                    "role": "player",
+                }
+            ),
+            headers={**headers, "Cookie": filler_cookie},
+        )
+        assert response.status == 200
+        assert any(
+            event["type"] == "session_welcome"
+            for event in json.loads(filler_payload)["events"]
+        )
+
+    response, payload = request(
+        web_server,
+        "POST",
+        "/api/message",
+        body=json.dumps(
+            {
+                "type": "join_room",
+                "protocol_version": NETWORK_PROTOCOL_VERSION,
+                "room_code": welcome["room_code"],
+                "display_name": "Invited Guest",
+            }
+        ),
+        headers={
+            **headers,
+            "Cookie": f"{guest_cookie}; {claim_cookie}",
+        },
+    )
+    assert response.status == expected_status
+    assert json.loads(payload)["error"]["code"] == expected_code
+    assert response_cookie(response, "catan_friend_claim") is None
+    assert web_server.gateway.friend_invitation_claim_credential(
+        guest_token,
+        client_key="127.0.0.1",
+    ) is not None
+
+
+def test_new_raw_invitation_overwrites_existing_claim_only_after_success(web_server):
+    host_cookie = session_cookie(web_server)
+    _response, _payload, welcome = create_http_room(web_server, host_cookie)
+    guest_cookie = session_cookie(web_server)
+    origin = same_origin(web_server)
+    headers = {
+        "Content-Type": "application/json",
+        "Origin": origin,
+        "Sec-Fetch-Site": "same-origin",
+    }
+
+    invitations = []
+    for role in ("player", "spectator"):
+        response, payload = request(
+            web_server,
+            "POST",
+            "/api/invitations",
+            body=json.dumps({"role": role}),
+            headers={**headers, "Cookie": host_cookie},
+        )
+        assert response.status == 200
+        invitations.append(json.loads(payload)["invitation"])
+
+    response, _payload = request(
+        web_server,
+        "POST",
+        "/api/invitations/claim",
+        body=json.dumps(
+            {
+                "room_code": welcome["room_code"],
+                "token": invitations[0]["token"],
+            }
+        ),
+        headers={**headers, "Cookie": guest_cookie},
+    )
+    first_set_cookie = response_cookie(response, "catan_friend_claim")
+    assert response.status == 200
+    assert first_set_cookie is not None
+    first_claim_cookie = first_set_cookie.split(";", 1)[0]
+
+    tampered = f"{invitations[1]['token'][:-1]}!"
+    response, payload = request(
+        web_server,
+        "POST",
+        "/api/invitations/claim",
+        body=json.dumps({"room_code": welcome["room_code"], "token": tampered}),
+        headers={
+            **headers,
+            "Cookie": f"{guest_cookie}; {first_claim_cookie}",
+        },
+    )
+    assert response.status == 403
+    assert json.loads(payload)["error"]["code"] == "authentication_failed"
+    assert response_cookie(response, "catan_friend_claim") is None
+
+    # A failed raw URL did not disturb the previously verified claim.
+    response, payload = request(
+        web_server,
+        "POST",
+        "/api/invitations/resume",
+        body="{}",
+        headers={
+            **headers,
+            "Cookie": f"{guest_cookie}; {first_claim_cookie}",
+        },
+    )
+    assert response.status == 200
+    assert json.loads(payload)["invitation"]["role"] == "player"
+
+    # A valid new raw URL has priority and atomically replaces the browser's
+    # single host-only claim cookie with the new role-bound capability.
+    response, payload = request(
+        web_server,
+        "POST",
+        "/api/invitations/claim",
+        body=json.dumps(
+            {
+                "room_code": welcome["room_code"],
+                "token": invitations[1]["token"],
+            }
+        ),
+        headers={
+            **headers,
+            "Cookie": f"{guest_cookie}; {first_claim_cookie}",
+        },
+    )
+    assert response.status == 200
+    assert json.loads(payload)["invitation"]["role"] == "spectator"
+    second_set_cookie = response_cookie(response, "catan_friend_claim")
+    assert second_set_cookie is not None
+    second_claim_cookie = second_set_cookie.split(";", 1)[0]
+    assert second_claim_cookie != first_claim_cookie
+    assert "Max-Age=" in second_set_cookie
+
+
+@pytest.mark.parametrize(
+    "claim_cookie",
+    [
+        "catan_friend_claim=broken",
+        (
+            "catan_friend_claim=v1.ABC234."
+            + "A" * 43
+            + "; catan_friend_claim=v1.ABC234."
+            + "B" * 43
+        ),
+        "catan_friend_claim=" + "A" * 9000,
+    ],
+)
+def test_http_friend_claim_resume_rejects_malformed_or_ambiguous_cookie(
+    web_server,
+    claim_cookie,
+):
+    cookie = session_cookie(web_server)
+    origin = same_origin(web_server)
+    response, payload = request(
+        web_server,
+        "POST",
+        "/api/invitations/resume",
+        body="{}",
+        headers={
+            "Content-Type": "application/json",
+            "Cookie": f"{cookie}; {claim_cookie}",
+            "Origin": origin,
+            "Sec-Fetch-Site": "same-origin",
+        },
+    )
+    assert response.status == 200
+    assert json.loads(payload) == {"api_version": 1, "invitation": None}
+    expired = response_cookie(response, "catan_friend_claim")
+    assert expired is not None
+    assert "Max-Age=0" in expired
+    assert "Path=/api" in expired
+
+
 def test_http_host_can_list_revoke_and_revoke_all_friend_invitations(web_server):
     host_cookie = session_cookie(web_server)
     _response, _payload, host_welcome = create_http_room(web_server, host_cookie)
@@ -883,6 +1448,8 @@ def test_http_host_can_list_revoke_and_revoke_all_friend_invitations(web_server)
             "/api/invitations/claim",
             {"room_code": "ABC234", "token": "A" * 43},
         ),
+        ("POST", "/api/invitations/resume", {}),
+        ("DELETE", "/api/invitations/claim", {}),
     ],
 )
 def test_friend_invitation_endpoints_require_explicit_same_origin(
@@ -970,11 +1537,31 @@ def test_friend_invitation_http_schema_transport_and_authority_fail_closed(
     assert response.status == 403
     assert json.loads(payload)["error"]["code"] == "secure_transport_required"
 
+    for method, path in (
+        ("POST", "/api/invitations/resume"),
+        ("DELETE", "/api/invitations/claim"),
+    ):
+        response, payload = request(
+            web_server,
+            method,
+            path,
+            body="{}",
+            headers={
+                "Content-Type": "application/json",
+                "Cookie": host_cookie,
+                "Origin": origin,
+            },
+        )
+        assert response.status == 403
+        assert json.loads(payload)["error"]["code"] == "secure_transport_required"
+
 
 @pytest.mark.parametrize(
     "method, path, body",
     [
         ("POST", "/api/invitations/list", {"page": 1}),
+        ("POST", "/api/invitations/resume", {"room_code": "ABC234"}),
+        ("DELETE", "/api/invitations/claim", {"all": True}),
         ("DELETE", "/api/invitations", {}),
         ("DELETE", "/api/invitations", {"all": False}),
         (
@@ -2132,6 +2719,48 @@ def test_tls_transport_uses_https_origin_wss_health_and_secure_cookie(monkeypatc
         assert "HttpOnly" in cookie
         assert "SameSite=Strict" in cookie
         assert "Secure" in cookie
+
+        host_cookie = cookie.split(";", 1)[0]
+        _create_response, _create_payload, welcome = create_http_room(
+            server,
+            host_cookie,
+        )
+        response, invitation_payload = request(
+            server,
+            "POST",
+            "/api/invitations",
+            body=json.dumps({"role": "spectator"}),
+            headers={
+                "Content-Type": "application/json",
+                "Cookie": host_cookie,
+                "Host": authority,
+                "Origin": f"https://{authority}",
+            },
+        )
+        assert response.status == 200
+        invitation = json.loads(invitation_payload)["invitation"]
+        guest_cookie = session_cookie(server)
+        response, _claim_payload = request(
+            server,
+            "POST",
+            "/api/invitations/claim",
+            body=json.dumps(
+                {"room_code": welcome["room_code"], "token": invitation["token"]}
+            ),
+            headers={
+                "Content-Type": "application/json",
+                "Cookie": guest_cookie,
+                "Host": authority,
+                "Origin": f"https://{authority}",
+            },
+        )
+        assert response.status == 200
+        claim_cookie = response_cookie(response, "catan_friend_claim")
+        assert claim_cookie is not None
+        assert "Path=/api" in claim_cookie
+        assert "HttpOnly" in claim_cookie
+        assert "SameSite=Strict" in claim_cookie
+        assert "Secure" in claim_cookie
 
         response, payload = request(
             server,
